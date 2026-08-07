@@ -1,0 +1,1105 @@
+from datetime import date, datetime
+from enum import StrEnum
+from typing import Any, ClassVar, Literal
+from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+class TaskStatus(StrEnum):
+    TODO = "todo"
+    DOING = "doing"
+    DONE = "done"
+
+
+class AgentStatus(StrEnum):
+    WAITING = "waiting"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    WARNING = "warning"
+    FAILED = "failed"
+
+
+class MemberProfile(BaseModel):
+    id: int
+    name: str
+    role: str
+    avatar: str
+    color: str
+    preferences: list[str]
+    constraints: list[str]
+    availability: str
+    age_group: str = "成年人"
+    notes: str = ""
+    is_account_linked: bool = False
+
+
+class MemberProfileCreate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    name: str = Field(min_length=1, max_length=80)
+    relationship: str = Field(default="成员", min_length=1, max_length=30)
+    age_group: str = Field(default="成年人", min_length=1, max_length=30)
+    preferences: list[str] = Field(default_factory=list, max_length=20)
+    constraints: list[str] = Field(default_factory=list, max_length=20)
+    availability: str = Field(default="待补充", min_length=1, max_length=200)
+    notes: str = Field(default="", max_length=500)
+    avatar: str = Field(default="我", min_length=1, max_length=8)
+    color: str = Field(default="#46705d", pattern=r"^#[0-9A-Fa-f]{6}$")
+
+
+class MemberProfileUpdate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    name: str | None = Field(default=None, min_length=1, max_length=80)
+    relationship: str | None = Field(default=None, min_length=1, max_length=30)
+    age_group: str | None = Field(default=None, min_length=1, max_length=30)
+    preferences: list[str] | None = Field(default=None, max_length=20)
+    constraints: list[str] | None = Field(default=None, max_length=20)
+    availability: str | None = Field(default=None, min_length=1, max_length=200)
+    notes: str | None = Field(default=None, max_length=500)
+    avatar: str | None = Field(default=None, min_length=1, max_length=8)
+    color: str | None = Field(default=None, pattern=r"^#[0-9A-Fa-f]{6}$")
+
+    @model_validator(mode="after")
+    def ensure_update_has_values(self) -> "MemberProfileUpdate":
+        if not self.model_fields_set:
+            raise ValueError("至少提供一个需要修改的字段")
+        return self
+
+
+class CalendarEvent(BaseModel):
+    id: int
+    title: str
+    member: str
+    day: str
+    time: str
+    category: str
+    conflict: bool = False
+    start_at: datetime | None = None
+    end_at: datetime | None = None
+    timezone: str = "Asia/Shanghai"
+    location: str = ""
+    notes: str = ""
+    participant_ids: list[int] = Field(default_factory=list)
+    participants: list["CalendarParticipant"] = Field(default_factory=list)
+    recurrence: "CalendarRecurrenceRule" = Field(default_factory=lambda: CalendarRecurrenceRule())
+    occurrence_start_at: datetime | None = None
+    occurrence_end_at: datetime | None = None
+
+
+class CalendarParticipant(BaseModel):
+    member_id: int
+    name: str
+    role: str
+    avatar: str
+    color: str
+
+
+class CalendarRecurrenceRule(BaseModel):
+    type: Literal["none", "daily", "weekly", "monthly"] = "none"
+    interval: int = Field(default=1, ge=1, le=52)
+    days_of_week: list[int] = Field(default_factory=list, max_length=7)
+    until: datetime | None = None
+    count: int | None = Field(default=None, ge=1, le=500)
+
+    @model_validator(mode="after")
+    def validate_days(self) -> "CalendarRecurrenceRule":
+        if any(day < 0 or day > 6 for day in self.days_of_week):
+            raise ValueError("days_of_week must contain values from 0 to 6")
+        if self.type != "weekly" and self.days_of_week:
+            raise ValueError("days_of_week is only supported for weekly recurrence")
+        return self
+
+
+class CalendarEventCreate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    title: str = Field(min_length=1, max_length=120)
+    start_at: datetime
+    end_at: datetime
+    participant_ids: list[int] = Field(min_length=1, max_length=30)
+    category: str = Field(default="personal", min_length=1, max_length=40)
+    location: str = Field(default="", max_length=120)
+    notes: str = Field(default="", max_length=500)
+    timezone: str = Field(default="Asia/Shanghai", min_length=1, max_length=64)
+    recurrence: CalendarRecurrenceRule = Field(default_factory=CalendarRecurrenceRule)
+    is_all_day: bool = False
+
+    @model_validator(mode="after")
+    def ensure_time_order(self) -> "CalendarEventCreate":
+        if self.end_at <= self.start_at:
+            raise ValueError("end_at must be after start_at")
+        return self
+
+
+class CalendarEventUpdate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    title: str | None = Field(default=None, min_length=1, max_length=120)
+    start_at: datetime | None = None
+    end_at: datetime | None = None
+    participant_ids: list[int] | None = Field(default=None, min_length=1, max_length=30)
+    category: str | None = Field(default=None, min_length=1, max_length=40)
+    location: str | None = Field(default=None, max_length=120)
+    notes: str | None = Field(default=None, max_length=500)
+    timezone: str | None = Field(default=None, min_length=1, max_length=64)
+    recurrence: CalendarRecurrenceRule | None = None
+    is_all_day: bool | None = None
+
+    @model_validator(mode="after")
+    def ensure_update_is_valid(self) -> "CalendarEventUpdate":
+        if not self.model_fields_set:
+            raise ValueError("at least one field is required")
+        if self.start_at is not None and self.end_at is not None and self.end_at <= self.start_at:
+            raise ValueError("end_at must be after start_at")
+        return self
+
+
+class CalendarConflictCheckRequest(BaseModel):
+    start_at: datetime
+    end_at: datetime
+    participant_ids: list[int] = Field(min_length=1, max_length=30)
+    recurrence: CalendarRecurrenceRule = Field(default_factory=CalendarRecurrenceRule)
+    exclude_event_id: int | None = None
+
+    @model_validator(mode="after")
+    def ensure_time_order(self) -> "CalendarConflictCheckRequest":
+        if self.end_at <= self.start_at:
+            raise ValueError("end_at must be after start_at")
+        return self
+
+
+class CalendarConflict(BaseModel):
+    event_id: int
+    title: str
+    start_at: datetime
+    end_at: datetime
+    participant_ids: list[int]
+    participants: list[str]
+
+
+class CalendarConflictCheckResponse(BaseModel):
+    has_conflict: bool
+    conflicts: list[CalendarConflict]
+
+
+class CalendarOccurrenceExceptionCreate(BaseModel):
+    occurrence_start_at: datetime
+    action: Literal["cancel", "modify"] = "cancel"
+    override: dict[str, object] = Field(default_factory=dict)
+
+
+class CalendarOccurrenceException(BaseModel):
+    id: int
+    event_id: int
+    occurrence_start_at: datetime
+    action: str
+    override: dict[str, object]
+
+
+class CalendarAlternativeSlot(BaseModel):
+    start_at: datetime
+    end_at: datetime
+    participant_ids: list[int]
+    label: str
+
+
+class CalendarAgentConflict(BaseModel):
+    event_ids: list[int]
+    titles: list[str]
+    start_at: datetime
+    end_at: datetime
+    participant_ids: list[int]
+    participants: list[str]
+    message: str
+
+
+class CalendarAgentResult(BaseModel):
+    status: Literal["clear", "conflict"]
+    has_conflict: bool
+    checked_event_count: int
+    affected_member_ids: list[int] = Field(default_factory=list)
+    conflicts: list[CalendarAgentConflict] = Field(default_factory=list)
+    alternative_slots: list[CalendarAlternativeSlot] = Field(default_factory=list)
+
+
+class MealAgentResult(BaseModel):
+    strategy: str
+    constraints_applied: list[str]
+    excluded_ingredients: list[str]
+    preferred_tags: list[str]
+    max_duration_minutes: int = Field(ge=5, le=240)
+
+
+class ShoppingAgentResult(BaseModel):
+    strategy: str
+    merge_keys: list[str]
+    preferred_categories: list[str]
+    purchase_windows: list[str]
+
+
+class TaskAssignmentCandidate(BaseModel):
+    member_id: int
+    member_name: str
+    availability: str
+    priority: int = Field(ge=1)
+
+
+class TaskAgentResult(BaseModel):
+    strategy: str
+    fairness_rule: str
+    candidates: list[TaskAssignmentCandidate]
+    default_duration_minutes: int = Field(ge=5, le=240)
+
+
+class BudgetAgentResult(BaseModel):
+    strategy: str
+    limit: float = Field(gt=0)
+    reserve: float = Field(ge=0)
+    warning_threshold_percent: int = Field(ge=1, le=100)
+    category_limits: dict[str, float]
+
+
+class DomainAgentBundle(BaseModel):
+    meal: MealAgentResult
+    shopping: ShoppingAgentResult
+    task: TaskAgentResult
+    budget: BudgetAgentResult
+    merged_constraints: list[str]
+
+
+class TaskItem(BaseModel):
+    id: int
+    title: str
+    assignee: str
+    duration: int
+    due: str
+    status: TaskStatus
+    category: str
+    assignee_member_id: int | None = None
+    scheduled_start_at: datetime | None = None
+    scheduled_end_at: datetime | None = None
+    recurrence_type: str = "none"
+    recurrence_interval: int = 1
+
+
+class TaskItemCreate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    title: str = Field(min_length=1, max_length=120)
+    assignee: str = Field(default="待分配", min_length=1, max_length=80)
+    duration: int = Field(default=15, ge=1, le=1440)
+    due: str = Field(default="待安排", min_length=1, max_length=50)
+    status: TaskStatus = TaskStatus.TODO
+    category: str = Field(default="日常", min_length=1, max_length=40)
+    assignee_member_id: int | None = None
+    scheduled_start_at: datetime | None = None
+    scheduled_end_at: datetime | None = None
+    recurrence_type: Literal["none", "daily", "weekly", "monthly"] = "none"
+    recurrence_interval: int = Field(default=1, ge=1, le=52)
+
+    @model_validator(mode="after")
+    def ensure_time_order(self) -> "TaskItemCreate":
+        if (
+            self.scheduled_start_at is not None
+            and self.scheduled_end_at is not None
+            and self.scheduled_end_at <= self.scheduled_start_at
+        ):
+            raise ValueError("scheduled_end_at must be after scheduled_start_at")
+        return self
+
+
+class TaskItemUpdate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    title: str | None = Field(default=None, min_length=1, max_length=120)
+    assignee: str | None = Field(default=None, min_length=1, max_length=80)
+    duration: int | None = Field(default=None, ge=1, le=1440)
+    due: str | None = Field(default=None, min_length=1, max_length=50)
+    status: TaskStatus | None = None
+    category: str | None = Field(default=None, min_length=1, max_length=40)
+    assignee_member_id: int | None = None
+    scheduled_start_at: datetime | None = None
+    scheduled_end_at: datetime | None = None
+    recurrence_type: Literal["none", "daily", "weekly", "monthly"] | None = None
+    recurrence_interval: int | None = Field(default=None, ge=1, le=52)
+
+    @model_validator(mode="after")
+    def ensure_values(self) -> "TaskItemUpdate":
+        if not self.model_fields_set:
+            raise ValueError("至少提供一个需要修改的字段")
+        if (
+            self.scheduled_start_at is not None
+            and self.scheduled_end_at is not None
+            and self.scheduled_end_at <= self.scheduled_start_at
+        ):
+            raise ValueError("scheduled_end_at must be after scheduled_start_at")
+        return self
+
+
+class MealItem(BaseModel):
+    id: int = 0
+    day: str
+    name: str
+    duration: int
+    cost: float
+    tags: list[str]
+    reason: str
+    ingredients: list[str]
+
+
+class MealItemCreate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    day: str = Field(min_length=1, max_length=10)
+    name: str = Field(min_length=1, max_length=120)
+    duration: int = Field(default=30, ge=1, le=1440)
+    cost: float = Field(default=0, ge=0, le=100000)
+    tags: list[str] = Field(default_factory=list, max_length=20)
+    reason: str = Field(default="", max_length=500)
+    ingredients: list[str] = Field(default_factory=list, max_length=100)
+
+
+class MealItemUpdate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    day: str | None = Field(default=None, min_length=1, max_length=10)
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    duration: int | None = Field(default=None, ge=1, le=1440)
+    cost: float | None = Field(default=None, ge=0, le=100000)
+    tags: list[str] | None = Field(default=None, max_length=20)
+    reason: str | None = Field(default=None, max_length=500)
+    ingredients: list[str] | None = Field(default=None, max_length=100)
+
+    @model_validator(mode="after")
+    def ensure_values(self) -> "MealItemUpdate":
+        if not self.model_fields_set:
+            raise ValueError("至少提供一个需要修改的字段")
+        return self
+
+
+class ShoppingItem(BaseModel):
+    id: int
+    name: str
+    category: str
+    quantity: str
+    price: float
+    source: str
+    purchased: bool = False
+
+
+class ShoppingItemCreate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    name: str = Field(min_length=1, max_length=120)
+    category: str = Field(default="未分类", min_length=1, max_length=40)
+    quantity: str = Field(default="1", min_length=1, max_length=40)
+    price: float = Field(default=0, ge=0, le=100000)
+    source: str = Field(default="手工添加", max_length=100)
+    purchased: bool = False
+
+
+class ShoppingItemUpdate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    category: str | None = Field(default=None, min_length=1, max_length=40)
+    quantity: str | None = Field(default=None, min_length=1, max_length=40)
+    price: float | None = Field(default=None, ge=0, le=100000)
+    source: str | None = Field(default=None, max_length=100)
+    purchased: bool | None = None
+    # 核销反馈：仅在 purchased 由 false → true 时参与闭环回流，不落到 PlanShoppingItem
+    actual_price: float | None = Field(default=None, ge=0, le=100000)
+    verification_note: str | None = Field(default=None, max_length=500)
+
+    #: 反馈字段不是购物条目的持久化列，写回 ORM 前需要剔除
+    FEEDBACK_FIELDS: ClassVar[frozenset[str]] = frozenset({"actual_price", "verification_note"})
+
+    @model_validator(mode="after")
+    def ensure_values(self) -> "ShoppingItemUpdate":
+        if not self.model_fields_set:
+            raise ValueError("至少提供一个需要修改的字段")
+        return self
+
+    def item_changes(self) -> dict[str, Any]:
+        """只返回需要写回购物条目的字段。"""
+        return {
+            key: value
+            for key, value in self.model_dump(exclude_unset=True).items()
+            if key not in self.FEEDBACK_FIELDS
+        }
+
+
+class MealReplacementRequest(BaseModel):
+    feedback: str = Field(min_length=2, max_length=1000)
+    rating: int | None = Field(default=None, ge=1, le=5)
+    tags: list[str] = Field(default_factory=list, max_length=20)
+
+
+class ShoppingMergeResponse(BaseModel):
+    merged_groups: int
+    removed_items: int
+    items: list[ShoppingItem]
+    conversion_notes: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class ExpenseHistoryItem(BaseModel):
+    id: int
+    category: str
+    amount: float
+    occurred_at: datetime
+    note: str
+    plan_id: int | None = None
+    shopping_item_id: int | None = None
+
+
+class ExpenseHistoryResponse(BaseModel):
+    """采购历史查询响应，含明细列表与汇总统计。"""
+
+    items: list[ExpenseHistoryItem]
+    total_amount: float
+    count: int
+    by_category: dict[str, float]
+    categories: list[str]
+
+
+class TaskExpansionItem(BaseModel):
+    """周期任务展开后的单个发生项。"""
+
+    task_id: int
+    title: str
+    assignee: str
+    category: str
+    duration: int
+    recurrence_type: str
+    recurrence_interval: int
+    occurrence_at: datetime
+
+
+class TaskExpansionResponse(BaseModel):
+    """任务自动展开响应。"""
+
+    days: int
+    count: int
+    items: list[TaskExpansionItem]
+
+
+class ExpenseCreate(BaseModel):
+    category: str = Field(default="其他", min_length=1, max_length=40)
+    amount: float = Field(gt=0, le=1000000)
+    occurred_at: datetime
+    note: str = Field(default="", max_length=500)
+    shopping_item_id: int | None = None
+
+
+class Expense(BaseModel):
+    id: int
+    category: str
+    amount: float
+    occurred_at: datetime
+    note: str
+    plan_id: int | None = None
+    shopping_item_id: int | None = None
+
+
+class BudgetAnalytics(BaseModel):
+    limit: float
+    actual_spent: float
+    remaining: float
+    usage_percent: int
+    warning: bool
+    by_category: dict[str, float]
+    monthly_trend: dict[str, float]
+
+
+class TaskAutoAssignResponse(BaseModel):
+    assigned: int
+    skipped: int
+    tasks: list[TaskItem]
+
+
+class TaskCompleteRequest(BaseModel):
+    actual_duration: int = Field(default=0, ge=0, le=1440)
+    notes: str = Field(default="", max_length=500)
+    rating: int | None = Field(default=None, ge=1, le=5)
+
+    def completion_values(self) -> dict[str, Any]:
+        """仅返回 ``TaskCompletion`` 需要的列，评分只参与反馈闭环。"""
+        return {"actual_duration": self.actual_duration, "notes": self.notes}
+
+
+class FeedbackSyncInfo(BaseModel):
+    """执行反馈的回流结果，让前端能直观看到"闭环是否合上"。"""
+
+    feedback_id: int
+    sentiment: Literal["positive", "neutral", "negative"]
+    deviation: float = 0
+    graph_synced: bool = False
+    vector_synced: bool = False
+    notes: list[str] = Field(default_factory=list)
+
+
+class TaskCompletionResponse(BaseModel):
+    id: int
+    task_id: int
+    member_profile_id: int | None = None
+    completed_at: datetime
+    actual_duration: int
+    notes: str
+    feedback: FeedbackSyncInfo | None = None
+
+
+class FeedbackEntry(BaseModel):
+    """``plan_feedback`` 偏差表的对外视图。"""
+
+    id: int
+    feedback_type: str
+    reference_type: str
+    reference_id: int
+    subject: str
+    tags: list[str] = Field(default_factory=list)
+    rating: int | None = None
+    sentiment: str
+    content: str
+    planned_value: float = 0
+    actual_value: float = 0
+    deviation: float = 0
+    source: str
+    synced_to_graph: bool = False
+    synced_to_vector: bool = False
+    created_at: datetime
+
+
+class TasteProfileResponse(BaseModel):
+    """餐食智能体使用的口味画像，同时供前端展示"系统学到了什么"。"""
+
+    liked_tags: list[str] = Field(default_factory=list)
+    disliked_tags: list[str] = Field(default_factory=list)
+    liked_dishes: list[str] = Field(default_factory=list)
+    rejected_dishes: list[str] = Field(default_factory=list)
+    recent_notes: list[str] = Field(default_factory=list)
+    sample_size: int = 0
+
+
+class FeedbackOverviewResponse(BaseModel):
+    """反馈闭环总览：偏差明细 + 情感分布 + 待补偿同步数。"""
+
+    items: list[FeedbackEntry]
+    sentiment_counts: dict[str, int] = Field(default_factory=dict)
+    pending_sync: int = 0
+    taste_profile: TasteProfileResponse
+
+
+class MealReplacementResponse(BaseModel):
+    """餐食替换结果，同时回传"这次反馈被学到了什么"。"""
+
+    meal: MealItem
+    feedback: FeedbackSyncInfo | None = None
+    taste_profile: TasteProfileResponse
+
+
+class RecipeInput(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    description: str = Field(default="", max_length=1000)
+    ingredients: list[str] = Field(default_factory=list, max_length=100)
+    steps: list[str] = Field(default_factory=list, max_length=100)
+    tags: list[str] = Field(default_factory=list, max_length=30)
+    allergens: list[str] = Field(default_factory=list, max_length=30)
+    duration: int = Field(default=30, ge=1, le=1440)
+    estimated_cost: float = Field(default=0, ge=0, le=100000)
+    is_favorite: bool = False
+    servings: int = Field(default=2, ge=1, le=30)
+    nutrition: dict[str, float] = Field(default_factory=dict)
+
+
+class Recipe(RecipeInput):
+    id: int
+
+
+class RecipeUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    description: str | None = Field(default=None, max_length=1000)
+    ingredients: list[str] | None = Field(default=None, max_length=100)
+    steps: list[str] | None = Field(default=None, max_length=100)
+    tags: list[str] | None = Field(default=None, max_length=30)
+    allergens: list[str] | None = Field(default=None, max_length=30)
+    duration: int | None = Field(default=None, ge=1, le=1440)
+    estimated_cost: float | None = Field(default=None, ge=0, le=100000)
+    is_favorite: bool | None = None
+    servings: int | None = Field(default=None, ge=1, le=30)
+    nutrition: dict[str, float] | None = None
+
+    @model_validator(mode="after")
+    def ensure_values(self) -> "RecipeUpdate":
+        if not self.model_fields_set:
+            raise ValueError("至少提供一个需要修改的字段")
+        return self
+
+
+class ChatSessionCreate(BaseModel):
+    title: str = Field(default="新对话", min_length=1, max_length=120)
+
+
+class ChatSessionUpdate(BaseModel):
+    title: str = Field(min_length=1, max_length=120)
+
+
+class ChatMessageCreate(BaseModel):
+    content: str = Field(min_length=2, max_length=4000)
+    budget: float = Field(default=500, gt=0, le=100000)
+
+
+class ChatMessageResponse(BaseModel):
+    id: int
+    role: Literal["user", "assistant", "system"]
+    content: str
+    run_id: str | None = None
+    created_at: datetime
+
+
+class ChatSessionSummary(BaseModel):
+    id: UUID
+    title: str
+    status: str
+    last_run_id: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ChatSessionDetail(ChatSessionSummary):
+    messages: list[ChatMessageResponse]
+
+
+class BackgroundKnowledgeJobCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    category: str = Field(default="个人知识", min_length=1, max_length=50)
+    content: str = Field(min_length=20, max_length=500000)
+    idempotency_key: str | None = Field(default=None, max_length=64)
+    priority: str = Field(default="normal", max_length=20)
+
+
+class BackgroundJobResponse(BaseModel):
+    id: UUID
+    kind: str
+    status: str
+    result: dict[str, object]
+    error_message: str
+    created_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    idempotency_key: str | None = None
+    priority: str = "normal"
+
+
+class QueueStats(BaseModel):
+    """Celery 队列监控指标。"""
+    name: str = Field(description="队列名称")
+    depth: int = Field(ge=0, description="待处理消息数")
+    routing_key: str = Field(default="", description="路由键")
+
+
+class CeleryStatsResponse(BaseModel):
+    """Celery 运行时监控快照。"""
+    broker_connected: bool = Field(description="broker 是否可达")
+    queues: list[QueueStats] = Field(default_factory=list)
+    status_counts: dict[str, int] = Field(
+        default_factory=dict, description="后台任务按状态计数"
+    )
+    recent_jobs: list[BackgroundJobResponse] = Field(default_factory=list)
+    dead_letter_count: int = Field(ge=0, description="死信任务数")
+    result_expires: int = Field(description="结果过期秒数")
+    active_queues: list[str] = Field(default_factory=list)
+
+
+class DeadLetterItem(BaseModel):
+    """死信任务详情。"""
+    id: UUID
+    kind: str
+    error_message: str
+    priority: str = "normal"
+    created_at: datetime
+    finished_at: datetime | None = None
+
+
+class KnowledgeDocument(BaseModel):
+    id: str | int
+    name: str
+    category: str
+    status: str
+    chunks: int
+    updated_at: date
+
+
+class KnowledgeTextRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    category: str = Field(default="个人知识", min_length=1, max_length=50)
+    content: str = Field(min_length=20, max_length=500_000)
+    user_id: int = 1
+
+
+class KnowledgeSearchRequest(BaseModel):
+    query: str = Field(min_length=2, max_length=1000)
+    user_id: int = 1
+    top_k: int = Field(default=4, ge=1, le=20)
+
+
+class VectorSearchHit(BaseModel):
+    document_id: str
+    document_name: str
+    category: str
+    content: str
+    chunk_index: int
+    score: float
+
+
+class GraphSearchHit(BaseModel):
+    subject: str
+    relation: str
+    target: str
+    detail: str
+
+
+class RetrievalDiagnostics(BaseModel):
+    chroma: str
+    neo4j: str
+    embedding: str = "Chroma DefaultEmbeddingFunction (ONNX MiniLM-L6-v2)"
+    rerank: str = "disabled"
+
+
+class KnowledgeSearchResponse(BaseModel):
+    query: str
+    vector_hits: list[VectorSearchHit]
+    graph_hits: list[GraphSearchHit]
+    elapsed_ms: int
+    diagnostics: RetrievalDiagnostics
+
+
+class AIServiceStatus(BaseModel):
+    rag_enabled: bool
+    llm_mode: str
+    langgraph: str
+    chroma: str
+    neo4j: str
+    collection: str
+    documents: int
+    chunks: int
+    llm_provider: str
+    llm_model: str
+    llm_configured: bool
+    redis: str = "unknown"
+    celery: str = "configured"
+    embedding: str = "内置轻量语义模型"
+    reranker: str = "未启用二阶段精排"
+
+
+class SyncConsistencyResponse(BaseModel):
+    """Chroma 与 Neo4j 检索索引的同步一致性快照。"""
+
+    chroma_status: str = Field(description="知识库(Chroma)连通状态")
+    neo4j_status: str = Field(description="关系图谱(Neo4j)连通状态")
+    chroma_documents: int = Field(description="Chroma 中文档数量")
+    chroma_chunks: int = Field(description="Chroma 中知识片段数量")
+    neo4j_documents: int = Field(description="Neo4j 中 Document 节点数量")
+    neo4j_entities: int = Field(description="Neo4j 中 KnowledgeEntity 数量")
+    missing_in_neo4j: list[str] = Field(
+        default_factory=list, description="仅存在于 Chroma、图谱未同步的文档名"
+    )
+    orphan_in_neo4j: list[str] = Field(
+        default_factory=list, description="仅存在于 Neo4j、Chroma 缺失的孤儿文档名"
+    )
+    consistent: bool = Field(description="两份索引是否一致")
+    notes: list[str] = Field(default_factory=list, description="一致性说明")
+
+
+# ---------- Graph RAG 检索质量离线评测 ----------
+
+
+class RagEvalCase(BaseModel):
+    """单条评测用例：自然语言 query 及期望命中的文档/实体类型。"""
+
+    query: str = Field(min_length=2, max_length=1000)
+    expected_documents: list[str] = Field(
+        default_factory=list, description="期望在 top_k 向量命中中出现的文档名"
+    )
+    expected_entity_kinds: list[str] = Field(
+        default_factory=list, description="期望在图谱命中关系中出现的实体类型"
+    )
+
+
+class RagEvalResult(BaseModel):
+    """单条用例的评测结果。"""
+
+    query: str
+    recall_at_k: float = Field(ge=0, le=1, description="Recall@k（命中/期望）")
+    ndcg_at_k: float = Field(ge=0, le=1, description="nDCG@k 位置折扣增益")
+    hit_document_names: list[str] = Field(default_factory=list)
+    hit_entity_kinds: list[str] = Field(default_factory=list)
+
+
+class RagEvalResponse(BaseModel):
+    """离线检索质量评测报告。"""
+
+    evaluated_at: str
+    embedding: str = Field(description="当前语义向量模型标识")
+    reranker: str = Field(description="二阶段精排模型标识")
+    top_k: int
+    case_count: int
+    mean_recall_at_k: float = Field(ge=0, le=1)
+    mean_ndcg_at_k: float = Field(ge=0, le=1)
+    results: list[RagEvalResult] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
+class LLMSmokeResponse(BaseModel):
+    status: str
+    provider: str
+    model: str
+    latency_ms: int
+    message: str
+
+
+class AgentStep(BaseModel):
+    name: str
+    label: str
+    status: AgentStatus
+    duration_ms: int
+    summary: str
+    output: dict[str, object]
+
+
+class AgentRun(BaseModel):
+    id: UUID
+    request: str
+    status: AgentStatus
+    started_at: datetime
+    finished_at: datetime | None = None
+    duration_ms: int
+    steps: list[AgentStep]
+    error_message: str = ""
+    error_type: str = ""
+    failed_step: str = ""
+    checkpoint: dict[str, object] = Field(default_factory=dict)
+
+
+class BudgetSummary(BaseModel):
+    limit: float
+    estimated: float
+    saved: float
+    usage_percent: int
+    categories: dict[str, float]
+
+
+class BudgetUpdate(BaseModel):
+    limit: float | None = Field(default=None, gt=0, le=1000000)
+    estimated: float | None = Field(default=None, ge=0, le=1000000)
+    categories: dict[str, float] | None = None
+
+    @model_validator(mode="after")
+    def ensure_values(self) -> "BudgetUpdate":
+        if not self.model_fields_set:
+            raise ValueError("至少提供一个需要修改的字段")
+        if self.categories is not None and any(value < 0 for value in self.categories.values()):
+            raise ValueError("预算分类金额不能为负数")
+        return self
+
+
+class Dashboard(BaseModel):
+    user_name: str
+    greeting: str
+    date_label: str
+    today_events: list[CalendarEvent]
+    tasks: list[TaskItem]
+    tonight_meal: MealItem
+    budget: BudgetSummary
+    notices: list[str]
+    week_progress: int
+
+
+class PlanningRequest(BaseModel):
+    prompt: str = Field(min_length=5, max_length=1000)
+    budget: float = Field(default=500, gt=0, le=100000)
+    user_id: int = 1
+
+
+class PlanningResponse(BaseModel):
+    run_id: UUID
+    summary: str
+    meals: list[MealItem]
+    shopping: list[ShoppingItem]
+    tasks: list[TaskItem]
+    budget: BudgetSummary
+    conflicts: list[str]
+    suggestions: list[str]
+    calendar: CalendarAgentResult
+    domain: DomainAgentBundle
+    sources: list[str]
+    trace: list[AgentStep]
+
+
+class ChatTurnResponse(BaseModel):
+    session: ChatSessionSummary
+    user_message: ChatMessageResponse
+    assistant_message: ChatMessageResponse
+    plan: PlanningResponse
+
+
+class WeeklyPlanSummary(BaseModel):
+    """计划列表视图 — 不含子项详情"""
+
+    id: int
+    status: str
+    version: int
+    is_active: bool
+    parent_plan_id: int | None = None
+    prompt: str
+    budget: float
+    summary: str
+    created_at: datetime
+    meal_count: int = 0
+    task_count: int = 0
+    shopping_count: int = 0
+
+
+class WeeklyPlanDetail(BaseModel):
+    """计划详情视图 — 含所有子项"""
+
+    id: int
+    status: str
+    version: int
+    is_active: bool
+    parent_plan_id: int | None = None
+    prompt: str
+    budget: float
+    summary: str
+    conflicts: list[str]
+    suggestions: list[str]
+    run_id: str | None = None
+    created_at: datetime
+    updated_at: datetime
+    meals: list[MealItem]
+    shopping: list[ShoppingItem]
+    tasks: list[TaskItem]
+    budget_record: BudgetSummary | None = None
+
+
+# ---------- 营养目标求解 ----------
+
+
+class NutrientEntry(BaseModel):
+    """单个营养素的达成情况。"""
+
+    target: float
+    actual: float
+    percent: float = Field(description="达成百分比，0-200 区间")
+    satisfied: bool = Field(description="是否达成目标（>=90% 视为达成）")
+
+
+class NutritionReport(BaseModel):
+    """营养目标求解报告。"""
+
+    targets: dict[str, float] = Field(description="每日营养目标")
+    actual: dict[str, float] = Field(description="计划餐食营养合计")
+    nutrients: dict[str, NutrientEntry] = Field(default_factory=dict)
+    overall_percent: float = Field(ge=0, description="整体达成百分比")
+    satisfied: bool = Field(description="整体是否达标")
+    calibrated_meals: int = Field(description="命中菜谱的餐数")
+    uncalibrated_meals: int = Field(description="未命中菜谱、按食材估算的餐数")
+    member_count: int
+    meal_count: int
+
+
+# ---------- 领域智能体评测 ----------
+
+
+class AgentMetricDetail(BaseModel):
+    """单个智能体的评测明细。"""
+
+    score: float = Field(ge=0, le=100, description="0-100 分")
+    metrics: dict[str, Any] = Field(default_factory=dict, description="原始指标键值")
+    issues: list[str] = Field(default_factory=list, description="扣分原因")
+
+
+class AgentEvaluation(BaseModel):
+    """领域智能体评测结果。"""
+
+    overall_score: float = Field(ge=0, le=100, description="加权综合评分")
+    scores: dict[str, float] = Field(
+        default_factory=dict, description="各智能体评分: meal/shopping/task/budget"
+    )
+    details: dict[str, AgentMetricDetail] = Field(default_factory=dict)
+    issues: list[str] = Field(default_factory=list, description="全局问题清单")
+    prompt_versions: dict[str, str] = Field(
+        default_factory=dict, description="评测时各智能体所用提示词版本"
+    )
+
+
+# ---------- 提示词版本管理 ----------
+
+
+class PromptVersionInfo(BaseModel):
+    """提示词版本信息。"""
+
+    name: str
+    version: str
+    system_message: str
+    instruction: str
+    changelog: str = ""
+    released_at: str = "2026-08-05"
+    is_active: bool = False
+
+
+class PromptRegistryResponse(BaseModel):
+    """提示词注册表响应。"""
+
+    agents: dict[str, list[PromptVersionInfo]]
+    active_versions: dict[str, str]
+
+
+# ---------- 库存管理 ----------
+
+
+class InventoryEntry(BaseModel):
+    """库存项视图。"""
+
+    id: int
+    name: str
+    category: str
+    quantity: str
+    quantity_value: float
+    unit: str
+    low_stock_threshold: float
+    note: str = ""
+    is_low_stock: bool = False
+
+
+class InventoryAdjustRequest(BaseModel):
+    """库存调整请求：delta 为正入库、为负出库。"""
+
+    name: str = Field(min_length=1, max_length=120)
+    category: str = Field(default="未分类", min_length=1, max_length=40)
+    delta: float = Field(description="正数入库，负数出库")
+    unit: str = Field(default="个", min_length=1, max_length=20)
+    quantity: str | None = Field(default=None, max_length=40, description="可选显示数量")
+    low_stock_threshold: float | None = Field(default=None, ge=0)
+    note: str = Field(default="", max_length=500)
+
+
+class InventoryResponse(BaseModel):
+    """库存列表响应，含低库存预警。"""
+
+    items: list[InventoryEntry]
+    count: int
+    low_stock_count: int
+
+
+# ---------- 计划归档 ----------
+
+
+class ArchivedPlanResponse(BaseModel):
+    """归档操作响应。"""
+
+    id: int
+    status: str
+    is_active: bool
+    archived_at: datetime

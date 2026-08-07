@@ -1,0 +1,102 @@
+services:
+  backend:
+    build:
+      context: ./backend
+    env_file:
+      - .env
+    environment:
+      APP_ENV: production
+      DATABASE_URL: mysql+aiomysql://${MYSQL_USER:-solochef}:${MYSQL_PASSWORD:-solochef_password}@mysql:3306/${MYSQL_DB:-solochef}
+      REDIS_URL: redis://redis:6379/0
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-solochef_password}
+      CHROMA_HOST: chroma
+      CHROMA_PORT: 8000
+      CHROMA_COLLECTION: solochef_knowledge
+      RAG_ENABLED: "true"
+    ports: ["8000:8000"]
+    depends_on:
+      redis:
+        condition: service_started
+      chroma:
+        condition: service_started
+      neo4j:
+        condition: service_started
+      mysql:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: ./backend
+    command: ["celery", "-A", "app.worker.celery_app", "worker", "--loglevel=INFO", "--concurrency=2"]
+    env_file:
+      - .env
+    environment:
+      APP_ENV: production
+      DATABASE_URL: mysql+aiomysql://${MYSQL_USER:-solochef}:${MYSQL_PASSWORD:-solochef_password}@mysql:3306/${MYSQL_DB:-solochef}
+      REDIS_URL: redis://redis:6379/0
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-solochef_password}
+      CHROMA_HOST: chroma
+      CHROMA_PORT: 8000
+      CHROMA_COLLECTION: solochef_knowledge
+      RAG_ENABLED: "true"
+    depends_on:
+      redis:
+        condition: service_started
+      chroma:
+        condition: service_started
+      mysql:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+    ports: ["5173:80"]
+    depends_on:
+      backend:
+        condition: service_started
+
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    command: --default-authentication-plugin=mysql_native_password --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DB:-solochef}
+      MYSQL_USER: ${MYSQL_USER:-solochef}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-solochef_password}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-solochef_root}
+    ports: ["3306:3306"]
+    volumes: [mysql_data:/var/lib/mysql]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD:-solochef_root}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    volumes: [redis_data:/data]
+
+  neo4j:
+    image: neo4j:5-community
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-solochef_password}
+    ports: ["7474:7474", "7687:7687"]
+    volumes: [neo4j_data:/data]
+
+  chroma:
+    image: chromadb/chroma:1.5.9
+    restart: unless-stopped
+    ports: ["8001:8000"]
+    volumes: [chroma_data:/data]
+
+volumes:
+  mysql_data:
+  redis_data:
+  neo4j_data:
+  chroma_data:

@@ -1,0 +1,672 @@
+# SoloChef 个人项目分析报告
+
+> **文档版本**：v6.0
+> **编制日期**：2026-08-07
+> **项目定位**：SoloChef — AI 独居膳食与采买规划师
+> **评估方法**：逐文件通读后端源码（`backend/app`，54 个 Python 源文件）、前端工程（`frontend/src`，26 个源文件）、`docker-compose.yml`、Dockerfile、Alembic 迁移、PRD 与 UI 设计文档；所有结论均标注代码出处（文件 + 类/函数名），可直接复核
+> **核心结论**：后端工程化基础与 AI/RAG 能力较完整（pytest 51 passed / ruff / mypy 全绿），但**营养目标尚未形成 API 闭环**（`NutritionGoal` 表存在却无 CRUD 端点、TDEE 公式仅有注释未实现）、**前端仍是 CasaMind 家庭事务壳**。作为个人项目，剩余开发周期压缩至 **1-2 天**：Day 1 补后端营养目标闭环 + 前端去家庭化骨架，Day 2 补前端营养可视化 + 验证收尾，完成全部开发流程。
+
+---
+
+## 目录
+
+1. [项目概述](#一项目概述)
+2. [项目业务流程图](#二项目业务流程图)
+3. [功能状态说明](#三功能状态说明)
+4. [工作流设计（开发/测试/部署/版本控制/代码审查/CICD）](#四工作流设计)
+5. [Agent 设计流程](#五agent-设计流程)
+6. [RAG（检索增强生成）设计流程](#六rag检索增强生成设计流程)
+7. [下一步计划](#七下一步计划)
+8. [附录](#八附录)
+
+---
+
+## 一、项目概述
+
+### 1.1 定位与边界
+
+SoloChef 由 CasaMind/HomePilot「家庭综合事务规划师」收敛而来（2026-08-07 完成定位切换），面向**独居自炊人群**，细分为增肌 / 减脂 / 健康维护三类目标用户。一句话定位：
+
+> 按营养目标（TDEE + 宏量营养素）约束式生成每日三餐与精确购物清单，并通过执行反馈持续学习个人口味、预算与达标情况的 AI 应用。
+
+**明确不做**（MVP 边界，写入 PRD 第 1/5 节）：家庭协同、任务看板、完整日历、通用知识库问答、外部同步、商超实时比价、真实下单、剩余食材利用。
+
+### 1.2 技术栈总览
+
+| 层级 | 选型 | 代码出处 |
+|---|---|---|
+| 前端 | Vue 3.5 + TypeScript + Vite 7 + Pinia 3 + vue-router 4 + ECharts 6 + axios | `frontend/package.json` |
+| 后端框架 | FastAPI 0.115+ / Pydantic v2 / SQLAlchemy 2.x（async）/ Loguru | `backend/pyproject.toml` |
+| AI 编排 | LangGraph（StateGraph）+ LangChain（langchain-openai ChatOpenAI） | `backend/app/ai/workflow.py` |
+| LLM | DeepSeek（`deepseek-chat`，OpenAI 兼容协议，可换 base_url），demo 确定性生成器兜底 | `backend/app/ai/llm.py` |
+| 主业务库 | MySQL 8（aiomysql 异步驱动）；测试用 SQLite（aiosqlite）；Alembic 迁移 | `backend/app/core/config.py`、`backend/alembic/versions/0001_initial_solochef.py` |
+| 图数据库 | Neo4j 5 Community（官方异步驱动） | `backend/app/services/graph_store.py` |
+| 向量库 | Chroma 1.5.9（HttpClient，cosine HNSW） | `backend/app/services/vector_store.py` |
+| 嵌入/精排 | BGE-M3（sentence-transformers，1024 维，本地加载）↔ 内置 ONNX MiniLM-L6-v2（384 维）双轨；bge-reranker-v2-m3（FlagEmbedding）二阶段精排 | `backend/app/services/embeddings.py`、`reranker.py` |
+| 缓存/队列 | Redis 7（缓存、限流、SSE 事件日志、幂等键、分布式锁）+ Celery 5（4 队列 + beat 定时清理 + 死信） | `backend/app/services/runtime.py`、`backend/app/worker.py` |
+| 认证 | JWT（access 30min / refresh 7d，token_version 失效控制）+ 阿里云短信验证码登录 | `backend/app/api/auth_router.py`、`backend/app/core/security.py` |
+| 部署 | docker-compose 7 服务（backend / worker / frontend / mysql / redis / neo4j / chroma），前端 nginx 反代 | `docker-compose.yml`、`backend/Dockerfile`、`frontend/Dockerfile` |
+
+### 1.3 验证基线（2026-08-07 复核）
+
+| 验证项 | 命令 | 结果 |
+|---|---|---|
+| 后端单元/接口测试 | `uv run pytest --cache-clear`（需 `DATABASE_URL=sqlite+aiosqlite:///:memory:`） | **51 passed**（`test_api.py` 907 行 + `test_rag.py` 419 行 + `test_graph_rag_quality.py` 169 行） |
+| 代码风格 | `uv run ruff check app tests`（E/F/I/UP/B/SIM，行宽 100） | All checks passed |
+| 静态类型 | `uv run mypy app`（严格模式 `disallow_untyped_defs`） | Success，54 source files |
+| 前端构建 | `npm run build`（含 `vue-tsc -b` 类型检查） | 通过，`frontend/dist/` 产物存在 |
+
+---
+
+## 二、项目业务流程图
+
+### 2.1 图 1：用户操作流程图（端到端主旅程）
+
+描述真实用户在系统中的完整操作路径。标注 **[未实现]** 的节点为当前尚未落地的断点（详见第三章）。
+
+```mermaid
+flowchart TD
+    A([开始]) --> B[注册 / 登录]
+    B --> C[录入身体数据与偏好]
+    C --> D["营养目标计算 BMR/TDEE  [未实现]"]
+    D --> E[(保存画像与营养目标)]
+    E --> F[发起规划请求]
+    F --> G[LangGraph 工作流生成计划]
+    G --> H["预览: 三餐 + 购物 + 预算 + 校验"]
+    H --> I{用户确认?}
+    I -- 调整 --> F
+    I -- 保存 --> J[(计划落库)]
+    J --> K[执行: 做饭 / 采购 / 核销]
+    K --> L{换菜?}
+    L -- 是 --> M[换菜 + 反馈回流]
+    L -- 否 --> N[采购核销 + 反馈回流]
+    M --> O[(反馈偏差表)]
+    N --> O
+    O --> P[反馈回流: 图谱 + 向量 + 口味画像]
+    P --> Q[(Neo4j + Chroma)]
+    Q -. 下轮检索注入 .-> G
+    P --> R([下次规划自动学习])
+```
+
+**关键断点说明**：`C → D → E` 一段目前只有数据表（`UserProfile` / `NutritionGoal`，`models/identity.py`）而无 API 与计算实现——全代码库检索不到 Mifflin-St Jeor 的任何实现（仅模型 docstring 提及），也没有任何端点写入这两张表。营养目标当前只能依赖建表默认值（2000 kcal / 120g / 220g / 60g）参与 `/meals/nutrition` 达成报告。
+
+### 2.2 图 2：数据流转流程图
+
+以「生成一周计划」这条最核心的请求为例，展示数据在各基础设施组件间的流转：
+
+```mermaid
+flowchart TD
+    UI[前端 Vue3] -->|REST / SSE| API[FastAPI 鉴权]
+    API --> SVC[服务层编排]
+    SVC --> DB[(MySQL 20 张表)]
+    SVC --> WF[LangGraph 工作流]
+    WF --> KS[知识检索服务]
+    KS --> N4[(Neo4j 图谱)]
+    KS --> CH[(Chroma 向量库)]
+    WF --> LLM[DeepSeek LLM]
+    SVC --> RD[(Redis 缓存/限流/事件)]
+    SVC --> CE[Celery 异步任务]
+    CE --> CH
+    CE --> N4
+    SVC --> FB[反馈回流服务]
+    FB --> DB
+    FB --> N4
+    FB --> CH
+```
+
+**数据一致性设计要点**（代码实证）：
+- 每步 Agent 轨迹实时写入 `agent_runs.checkpoint`（`planning.py::persist_step`），失败可定位到 `failed_step`；
+- 反馈回流失败不阻断主链路，仅置 `synced_to_graph/vector=false`，由 `/feedback/resync` 补偿重放（`feedback_loop.py::replay`）；
+- 知识入库走 Celery 异步 + 幂等键（Redis `idem:{key}`，24h），重复提交直接返回既有 job 结果；
+- 所有跨组件写均为「先 MySQL 落库，后异步回流」的单向数据流，不存在双写不一致窗口。
+
+### 2.3 图 3：核心业务逻辑关系图
+
+展示后端代码层面的模块组织与「计划 → 执行 → 反馈 → 记忆 → 再计划」闭环的逻辑依赖：
+
+```mermaid
+flowchart TD
+    P[规划生成] --> C[计划确认]
+    C --> E[执行与核销]
+    E --> F[反馈捕获]
+    F --> M[记忆沉淀]
+    M --> T[口味画像聚合]
+    T -. 注入下轮 .-> P
+    N[营养达成报告] -.-> C
+    K[知识库检索] -.-> P
+    B[预算分析] -.-> F
+    TR[Agent 轨迹追踪] -.-> P
+    EV[RAG 检索评测] -.-> K
+```
+
+闭环中 `T → P` 的虚线是本项目的差异化关键：口味画像不是一次性入参，而是跨会话累积的长期记忆。
+
+### 2.4 图 4：执行反馈闭环时序图
+
+以「用户对周三晚餐不满意并换菜」为例，展示闭环的精确调用序列（全部可在代码中复核）：
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant API as FastAPI
+    participant DOM as DomainService
+    participant FB as FeedbackLoop
+    participant DB as MySQL
+    participant N4 as Neo4j
+    participant CH as Chroma
+
+    U->>API: POST /meals/{id}/replace (feedback=太辣, rating=2)
+    API->>DOM: replace_meal(user_id, meal_id, feedback)
+    DOM->>DB: 读取菜谱库 + taste_profile
+    alt 有 LLM
+        DOM->>DOM: ChatOpenAI 生成替换候选
+    else 无 LLM
+        DOM->>DOM: 确定性回退: 按口味排序菜谱
+    end
+    DOM->>DB: 替换餐食; 命中菜谱 like_count+1
+    DOM->>FB: capture(FeedbackSignal)
+    FB->>DB: 写入 plan_feedback
+    FB->>N4: 反馈子图 HAS_FEEDBACK/SIGNALS
+    FB->>CH: 滚动反馈文档 窗口30
+    FB->>DB: mark_synced(graph, vector)
+    FB-->>API: FeedbackSyncResult
+    API-->>U: 新餐食 + 口味画像
+```
+
+---
+
+## 三、功能状态说明
+
+### 3.1 总体完成度
+
+| 范围 | 完成度 | 关键依据 |
+|---|---:|---|
+| 后端基础设施（认证/模型/路由/异步/观测） | **90%** | 85+ REST 端点、20 张表、Celery/Redis 全链路、JWT 双 token |
+| AI/Agent 编排 | **75%** | 13 节点工作流可运行、结构化领域智能体双路径、Verifier 确定性校验；但无营养目标硬约束、checkpoint 在 MySQL 下失效 |
+| RAG 检索增强 | **80%** | 双路召回 + 二阶段精排 + 查询改写 + 实体抽取 + 离线评测齐备；种子文档内容仍是家庭向 |
+| 营养目标闭环 | **25%** | 表结构与营养报告服务就绪，但**无画像/目标 API、无 TDEE 计算实现** |
+| 前端产品体验 | **30%** | 13 个视图真实可用、可构建，但品牌/导航/文案/数据模型全是 CasaMind 家庭定位 |
+| 工程化（测试/lint/类型/容器） | **70%** | 三重质量门禁全绿、compose 一键起栈；缺 git 仓库与 CI/CD |
+
+### 3.2 已完成功能模块详表
+
+#### 3.2.1 身份与数据层（实现度 100%）
+
+| 模块 | 关键特性 | 技术实现 |
+|---|---|---|
+| 注册/登录/刷新/登出 | 密码 + 短信双通道；短信登录自动开户（随机密码）；改密/重置密码后全端会话吊销 | `auth_router.py`；`services/auth.py` + `services/sms.py`（阿里云 dysmsapi） |
+| JWT 会话体系 | access 30 分钟 + refresh 7 天；`token_version` 支持全端失效；设备会话列表与单会话吊销（`refresh_sessions` 表） | `core/security.py`；`api/dependencies.py::get_current_context` |
+| 单用户数据隔离 | 全部业务表以 `user_id` 外键隔离；`AuthContext` 请求级注入；`OwnerContext` 语义化写操作守卫 | `api/dependencies.py`；20 张表模型 `models/identity.py` |
+| MySQL 方言适配 | 启动幂等 `create_all` 兜底 + Alembic 初始迁移；JSON 列 `default=list` 跨方言兼容；去 Postgres 专用语法 | `main.py::_create_tables`；`alembic/versions/0001_initial_solochef.py` |
+
+#### 3.2.2 计划与执行域（实现度 85%，家庭语义残留）
+
+| 模块 | 关键特性 | 技术实现 |
+|---|---|---|
+| 周计划生命周期 | 生成 → 确认落库 → 派生新版本 → 版本 diff → 回滚 → 归档；单活跃计划由应用层保证；确认幂等（`uq_weekly_plan_user_run`） | `repositories/planning.py`；`/plans/*` 10 个端点 |
+| 餐食管理 | CRUD + 换菜（LLM/确定性双路径）+ 营养达成报告 + 口味画像面板 | `/meals/*` 8 端点；`services/domain.py::replace_meal`；`services/nutrition.py` |
+| 购物清单 | CRUD + 同类合并（中文单位归一：斤/两/克/升…换算后求和）+ 采购核销自动入库 + 实付价偏差情感判定（±10% 阈值） | `/shopping/*`；`services/unit_conversion.py`；`router.py::_price_sentiment` |
+| 预算与支出 | 预算摘要、支出 CRUD、分类/月度趋势分析、85% 预警、历史区间查询 | `domain.py::budget_analytics`；`/budget/*` 6 端点 |
+| 日程与冲突 | 事件 CRUD + 周期规则（recurrence + occurrence exception 例外表）+ 冲突检测与替代时段搜索 | `repositories/calendar.py`；`calendar_planning.py`（遗留，保留冻结） |
+| 任务与库存 | 任务 CRUD + 单用户自动排程（18:00-21:30 空档扫描）+ 完成耗时回流；库存低水位预警 | `domain.py::auto_assign_tasks`；`/inventory/*`（遗留，保留冻结） |
+
+#### 3.2.3 AI / Agent 能力（实现度 75%）
+
+| 模块 | 关键特性 | 技术实现 |
+|---|---|---|
+| LangGraph 规划工作流 | 13 节点 StateGraph：意图 → 双路并行检索 → 协调 → 5 领域智能体并行 → 领域协调 → 计划生成 → 校验 → 终稿；每步产出带耗时/状态/输出的 `AgentStep` 轨迹 | `ai/workflow.py::SoloChefWorkflow` |
+| 结构化领域智能体 | 餐食/购物/任务/预算四智能体，schema-bound JSON 输出（`response_format=json_object` + Pydantic 校验），LLM 失败自动确定性回退；运行模式串记录提示词版本（`llm:v1.2.0` / `deterministic:v1.2.0` / `deterministic-fallback:v1.2.0`） | `ai/domain_agents.py::StructuredDomainAgentEngine` |
+| 提示词版本注册表 | 四智能体提示词语义化版本管理（meal 已迭代至 v1.2.0，含 taste_profile 输入契约与硬/软约束优先级规则），支持审计、回滚、A/B | `ai/prompts.py`；`/agents/prompts` 端点 |
+| Verifier 确定性校验 | 预算钳制（estimated 超限时压回上限并重算 saved/usage）、忌口词命中（含「不吃辣→辣椒/辣酱/麻辣」等别名展开）、7 天餐食完整性、重复菜品、分类限额+预留≤总额、任务-日程时间重叠 | `workflow.py::_verifier_node` |
+| Agent Run 追踪与恢复 | run 全状态持久化（status/steps/sources/error_type/failed_step/逐步 checkpoint）；失败 run 支持 retry（PostgreSQL 下走 LangGraph 断点续跑，其余方言退化为完整重跑） | `planning.py::{generate,resume}`；`/agents/runs/*` |
+| 智能体离线评测 | 餐食硬约束满足率（70%）+时长合规（30%）、购物食材覆盖率、任务分配率、预算贴合度，加权 35/25/25/15 得综合分 | `ai/evaluation.py::evaluate_plan`；`/agents/evaluate` |
+| 多轮对话流式规划 | 会话 CRUD；SSE 流式（step/token/complete/cancelled/error 五类事件）；`SummaryStreamExtractor` 从 JSON 流中实时抽取 summary 字段逐字输出；断线经 `/chat/sessions/{id}/events?after=` 重放恢复；用户可取消 | `services/conversation.py`；`services/runtime.py`（Redis 事件日志） |
+
+#### 3.2.4 RAG 与知识库（实现度 80%）
+
+| 模块 | 关键特性 | 技术实现 |
+|---|---|---|
+| 向量检索 | 首阶段召回 top_k×3 候选 → bge-reranker-v2-m3 精排回 top_k；user_id 元数据过滤；cosine HNSW | `knowledge.py::retrieve_vector`；`reranker.py` |
+| 嵌入双轨 | BGE-M3（1024 维）与内置 MiniLM（384 维）自动切换，维度隔离到独立 collection（`solochef_knowledge` / `-bge-m3` 后缀）；模型仅本地加载（`local_files_only`），绝不隐式下载 | `embeddings.py`；`vector_store.py::collection_name_for` |
+| 图谱检索 | User/Preference/Constraint/Event/Recipe/Ingredient/Task/Plan/Budget/Document/KnowledgeEntity/FeedbackSignal 12 类节点；QuerySpec 结构化约束 Cypher（关键词+实体类型+关系白名单，LIMIT 40）+ 反馈子图查询（LIMIT 8）合并返回 | `graph_store.py::search` |
+| 知识入库 | 文本/PDF/MD 上传（≤10MB，GB18030 兼容）；中文友好切块（600 字/重叠 100，分隔符含 `。；，`）；同步与 Celery 异步双通道；幂等键防重 | `services/documents.py`；`/knowledge/*`；`worker.py` |
+| 查询改写与实体抽取 | LLM 级（temp 0，枚举白名单约束输出）+ 规则级（关键词映射表）双级降级 | `query_rewriter.py`；`entity_extractor.py` |
+| 检索质量观测 | `/ai/status` 组件心跳；`/admin/rag/sync` Chroma↔Neo4j 一致性快照；`/admin/rag/eval` 5 用例离线评测输出 Recall@k / nDCG@k | `knowledge.py::{status,consistency_report}`；`rag_eval.py` |
+
+#### 3.2.5 执行反馈闭环（实现度 85%）
+
+| 模块 | 关键特性 | 技术实现 |
+|---|---|---|
+| 反馈捕获 | 五类信号（任务完成/餐食替换/餐食评价/采购核销/支出记录）统一 `FeedbackSignal` 规范化；情感判定三级（评分优先 → 中文正负短语计票 → 中性）；口味标签词典抽取 | `feedback_loop.py::{capture,classify_sentiment,extract_taste_tags}` |
+| 双库回流 | 图谱：`(User)-[:HAS_FEEDBACK]->(FeedbackSignal)-[:SIGNALS{polarity}]->(Preference)`；向量：按反馈类型维护固定 document_id 的滚动文档（窗口 30 条自然语言叙述），防知识库刷屏 | `feedback_loop.py::{_push_graph,_push_vector}` |
+| 补偿重放 | 外部依赖失败仅置同步标记，`/feedback/resync` 批量重放；反馈总览含情感分布与待同步数 | `feedback_loop.py::replay`；`/feedback` 端点 |
+| 口味画像学习 | 近 40 条餐食反馈 + 菜谱点赞聚合成净票数正/负标签、喜好/拒绝菜品、近期原话；同时注入 LLM 提示词（v1.2.0 契约）与确定性回退排序 | `repositories/feedback.py::taste_profile`；`domain_agents.py::meal` |
+
+#### 3.2.6 基础设施与前端工程（实现度 70%）
+
+| 模块 | 关键特性 | 技术实现 |
+|---|---|---|
+| 异步任务 | Celery 4 队列隔离（default/knowledge/graph/maintenance）；指数退避重试 ×3 后入死信表；beat 每日 03:00 清理 30 天前终态任务；任务可取消（revoke SIGTERM）；监控快照端点 | `worker.py`；`/admin/celery/stats`、`/jobs/*` |
+| Redis 运行时 | 仪表盘 30s 缓存 + 写操作前缀失效；滑动窗口限流（chat 20 次/分、plan 30 次/分）；SSE 事件日志（1h TTL）；幂等键槽位锁；Redis 不可用时进程内降级 + 5s 熔断 | `services/runtime.py` |
+| 前端工程 | 13 个懒加载视图（chunk 失败自动重试 + 整页重载兜底）；axios 拦截器 401 自动刷新重放；SSE 手解流 + 断线重放（≤3 次）；Pinia 会话持久化 | `frontend/src/router.ts`、`api.ts`、`stores/app.ts` |
+| 容器化 | 7 服务 compose 编排（healthcheck 依赖序）；后端启动先 `alembic upgrade head` 再 uvicorn；前端多阶段构建 + nginx SPA 回退与 /api 反代 | `docker-compose.yml`；`backend/Dockerfile`；`frontend/Dockerfile` |
+
+### 3.3 未实现功能说明
+
+#### 3.3.1 阻断 MVP 闭环的缺口（P0）
+
+| 编号 | 功能 | 具体需求 | 优先级 | 技术难点 | 现状代码证据 |
+|---|---|---|---|---|---|
+| G01 | 用户画像与营养目标 API | 新增 `GET/PUT /profile`、`POST /profile/nutrition-goal`：录入身体数据→按 Mifflin-St Jeor 计算 BMR（男性 10w+6.25h-5a+5；女性 -161）→ ×活动系数得 TDEE → 按目标类型调整热量（增肌 +10%、减脂 -15%）→ 分配 P/C/F 克数 → 落 `nutrition_goals` | **P0** | 公式本身简单，难点在于与现有 verifier/planner 的目标参数贯通及边界校验（极端输入、单位） | `NutritionGoal` 表存在但**无任何写入端点**；全库无 BMR/TDEE 计算实现（仅 `identity.py:98` docstring）；`/meals/nutrition` 只能读到建表默认值 |
+| G02 | 三餐生成的营养硬约束 | Meal Agent 输入注入 `NutritionGoal`；Verifier 增加「全天热量/P/C/F 达成率 ∈ [90%,110%]」确定性校验并给出回修建议 | **P0** | 需要可靠的单餐营养估算（当前仅 10 种食材的粗略表 ×0.5 系数，`nutrition.py::_INGREDIENT_NUTRITION`），否则约束校验形同虚设；依赖 G01 | `workflow.py::_verifier_node` 现有 8 类校验**不含营养项**；`domain_agents.py::meal` 输入无营养目标字段 |
+| G03 | 前端去家庭化 | 品牌/导航/路由/文案改为 SoloChef；删除 `api.families/switchFamily` 调用与 `FamilySummary` 类型；隐藏 members/calendar/tasks/budget/invite 入口 | **P0** | 无技术难度，是工作量与取舍；13 个视图、246 行 api.ts、80+ 端点封装需逐一裁剪 | `frontend/src/router.ts` 13 条路由全为家庭定位；`index.html` 标题仍为 CasaMind |
+| G04 | 配置漂移修复 | `.env` / `.env.example` 从 `postgresql+asyncpg://...casamind` 改为 MySQL/solochef，与 docker-compose、config.py 默认值对齐 | **P0** | 无难度；需顺手补一份环境变量说明 | `.env.example` 55 行仍为 PostgreSQL；测试必须临时覆盖 `DATABASE_URL` 才能跑 |
+| G05 | LangGraph checkpoint 方言适配 | MySQL 下恢复断点续跑：迁移 `PostgresSaver` → `SqliteSaver`/Redis saver，或官方 MySQL saver（社区版） | **P0** | `langgraph-checkpoint-postgres` 与 psycopg 池深度绑定（`checkpoints.py` 整模块为 Postgres 专用）；换 saver 需重新验证 `JsonPlusSerializer` 允许类型清单与 resume 语义 | `planning.py::_configure_checkpointer` 显式 `dialect.name != "postgresql"` 即放弃 checkpoint；MySQL 下 `/agents/runs/{id}/retry` 退化为完整重跑 |
+
+#### 3.3.2 影响可信度的短板（P1）
+
+| 编号 | 功能 | 具体需求 | 优先级 | 技术难点 |
+|---|---|---|---|---|
+| G06 | 食材营养基准库 | 扩充 `_INGREDIENT_NUTRITION`（10 种 → 200+ 种，对齐《中国食物成分表》）；菜谱营养数据结构化；估算标注「未校准」并暴露误差区间 | **P1** | 数据采集与清洗成本高；需要 serving/份量换算体系 |
+| G07 | 食材替换营养联动 | 换菜后重算单餐/全天营养差异并联动更新购物清单增删改，前端展示替换前后对比 | **P1** | 依赖 G06；替换 diff 与购物合并的联动事务设计 |
+| G08 | 购物替代建议真实化 | 当前 `/shopping/{id}/substitutions` 是 4 条硬编码字典（`router.py:1048`），应改为查询图谱 `Ingredient` 替代关系 + 同类营养近似排序 | **P1** | 需在图谱中建模「可替代」关系及替代方向性 |
+| G09 | 种子知识库 SoloChef 化 | `BOOTSTRAP_DOCUMENTS` 3 篇（儿童晚餐/控糖/家务分配）改写为增肌/减脂/快手一人食主题；评测集 `rag_eval.py::EVAL_SET` 同步改写 | **P1** | 内容工程；评测集与种子文档主题需对齐否则 Recall 失真 |
+| G10 | Demo 数据 SoloChef 化 | `demo_data.py` 的 MEALS/SHOPPING/TASKS/EVENTS 仍是「小满绘画课」等家庭叙事，重写为独居场景 | **P1** | 无难度，影响演示观感与 LLM 缺席时的可信度 |
+| G11 | 执行反馈复盘页 | 前端新增复盘视图：口味画像变化、预算偏差趋势、营养达标率周对比（消费 `/feedback` + `/meals/nutrition`） | **P1** | 纯前端 + 已有 API；ECharts 趋势图 |
+| G12 | 前端遗留模块冻结 | calendar/tasks/inventory/members 视图从导航隐藏、路由保留但打标，后续随表一起清理 6 张遗留表 | **P1** | 需先确认无核心链路依赖（当前 dashboard 仍聚合今日日程） |
+
+#### 3.3.3 工程化缺口（P1-P2）
+
+| 编号 | 功能 | 具体需求 | 优先级 | 技术难点 |
+|---|---|---|---|---|
+| G13 | Git 仓库与 CI/CD | 初始化 git、接入 GitHub Actions（详见第四章设计） | **P1** | 无；当前目录非 git 仓库 |
+| G14 | MySQL 集成测试 | docker-compose 起真实 MySQL 跑迁移 + 核心 API smoke suite | **P1** | aiomysql 与 aiosqlite 行为差异（如 `server_default`、JSON 默认值）需逐一核对 |
+| G15 | 前端测试体系 | 引入 Vitest + 组件测试，至少覆盖 api.ts 拦截器与 router 守卫 | **P2** | 从零搭建；当前前端零测试零 lint |
+| G16 | 女性生理周期饮食标记 | 自愿开启、非医疗化的周期记录与饮食提示（PRD F8） | **P2** | 隐私敏感设计；明确排除在 MVP 外 |
+
+### 3.4 完成度统计
+
+| 类别 | 已完成模块数 | 未实现/缺口数 | 结论 |
+|---|---:|---:|---|
+| 后端业务与 AI | 24 | 7（G01/G02/G05/G06/G07/G08/G12 部分） | 最强资产，但核心叙事「营养目标驱动」恰好断在最关键的 G01/G02 |
+| RAG/知识库 | 6 | 2（G08/G09） | 链路完整，内容待换血 |
+| 前端 | 4 | 4（G03/G07/G11/G12） | 最大瓶颈 |
+| 工程化 | 4 | 3（G13/G14/G15） | 质量门禁好，缺自动化流水线 |
+
+---
+
+## 四、工作流设计
+
+本章描述项目开发、测试、部署的完整工作流程。**4.1-4.3 为当前实际执行的工作流**（代码与配置实证），**4.4-4.6 为目标设计**（当前缺口 + 落地方案）。
+
+### 4.1 开发工作流（现状）
+
+```mermaid
+flowchart TD
+    A[需求/定位 PRD] --> B[本地开发 PyCharm]
+    B --> C{改动类型}
+    C -->|后端| D[uv 依赖管理]
+    C -->|前端| E[npm 构建]
+    D --> F[质量门禁: ruff/mypy/pytest]
+    E --> G[构建验证: npm run build]
+    F --> H[接口联调: Yaak]
+    G --> H
+    H --> I[文档同步]
+```
+
+关键实践（实证）：
+- **依赖管理**：后端用 uv（`pyproject.toml` 四个 extra：`ai`/`bge`/`rerank`/`dev`，AI 依赖按需安装）；`uv.lock` 冻结 + `uv export` 出 `requirements.txt` 供 Docker 使用。
+- **环境分层**：`config.py` 默认值即开发环境（localhost MySQL/Redis/Neo4j/Chroma）；`.env` 覆盖；docker-compose 注入生产值；测试用环境变量切 SQLite 内存库。
+- **PyCharm 运行配置**：`.run/` 下 5 个共享配置（Backend Dev / Debug / Frontend / Full Stack / DB Migration），新人导入即可跑。
+- **接口调试**：Yaak 测试集 + `docs/PyCharm调试与Yaak测试.md` 操作手册。
+- **双模式开发**：`LLM_PROVIDER=demo` 时全链路走确定性实现（`DemoPlanGenerator` + 领域智能体 fallback），无 API Key 也可完整开发与测试。
+
+### 4.2 测试工作流（现状）
+
+| 层级 | 工具与配置 | 覆盖内容 | 现状 |
+|---|---|---|---|
+| 接口/服务测试 | pytest + pytest-asyncio（`asyncio_mode=auto`），SQLite 内存库 | `test_api.py`（907 行：认证/计划/餐食/购物/反馈/知识/对话/后台任务）、`test_rag.py`（419 行）、`test_graph_rag_quality.py`（169 行） | **51 passed** |
+| 静态检查 | ruff（E/F/I/UP/B/SIM，行宽 100）+ mypy 严格模式（`disallow_untyped_defs`，pydantic 插件，AI 可选依赖 `ignore_missing_imports`） | 全部 54 个源文件 | 全绿 |
+| 前端类型 | `vue-tsc -b` 随 build 执行 | 26 个 TS/Vue 文件 | 通过 |
+| 检索质量回归 | `/admin/rag/eval` 离线评测（Recall@k / nDCG@k，5 用例） | 检索链路 | 可用，需接入定期执行 |
+| 智能体质量回归 | `/agents/evaluate` 四维度加权评分 | 计划产出质量 | 可用，需接入定期执行 |
+| 冒烟 | `/health`、`/ai/status`、`/ai/llm/smoke` | 部署后存活与 LLM 连通 | 可用 |
+
+**已知测试债**：前端零测试（无 Vitest/ESLint）；MySQL 方言仅靠 SQLite 近似覆盖（G14）；`.env` 漂移使「克隆即跑测试」不成立（G04）。
+
+### 4.3 部署工作流（现状）
+
+```mermaid
+flowchart TD
+    A[docker compose up -d] --> B[mysql:8.0 healthcheck]
+    A --> C[redis:7-alpine]
+    A --> D[neo4j:5-community]
+    A --> E[chroma:1.5.9]
+    B -->|healthy| F[backend 启动]
+    C --> F
+    D --> F
+    E --> F
+    F --> F1[alembic upgrade head + create_all 兜底]
+    F1 --> F2[uvicorn :8000]
+    F --> G[worker celery concurrency=2]
+    F2 --> H[frontend vite build -> nginx :80]
+    H --> H1["SPA try_files + /api 反代"]
+```
+
+- **启动顺序**：依赖健康检查后启动 backend；建表双保险（Alembic 正规迁移 + lifespan 幂等 `create_all` 兜底，`main.py:16`）。
+- **数据持久化**：4 个命名卷（mysql_data / redis_data / neo4j_data / chroma_data）。
+- **运维面**：`/admin/celery/stats` 队列监控、`/jobs/dead-letter` 死信、`/jobs/cleanup` 手动清理（另有 beat 每日自动）、`/admin/rag/sync` 一致性巡检。
+- **本地零配置降级**：`DATABASE_URL=sqlite+aiosqlite:///./solochef.db` 即可脱离 Docker 全栈开发。
+
+### 4.4 版本控制策略（目标设计）
+
+**现状**：项目目录**不是 git 仓库**，无分支与提交历史——这是当前最大的工程化风险（无法回溯、无法协作、无法接 CI）。
+
+**目标策略（Trunk-Based 轻量版，适配个人项目 + AI 协作）**：
+
+| 项 | 策略 |
+|---|---|
+| 分支模型 | `main` 受保护（仅 PR 合入）+ 短生命周期 `feature/<scope>-<desc>` 分支；hotfix 走 `fix/*` |
+| 提交规范 | Conventional Commits（`feat/fix/refactor/docs/test/chore`），与里程碑标签对应 |
+| 版本号 | SemVer；后端 `pyproject.toml` 与报告头部版本联动；提示词版本（`prompts.py`）独立语义化演进 |
+| 数据迁移纪律 | 每次模型变更必须配套 Alembic revision（`alembic revision --autogenerate` + 人工复核），禁止裸改模型依赖 `create_all` |
+| PR 粒度 | 单 PR ≤ 400 行有效变更；涉及提示词/检索策略变更必须附 `/agents/evaluate` 或 `/admin/rag/eval` 前后对比 |
+
+### 4.5 代码审查机制（目标设计）
+
+个人项目采用「**门禁自动化 + AI 结对审查 + 人工终审**」三层：
+
+1. **自动化门禁（合入前必过）**：ruff / mypy / pytest / 前端 build 四道关卡，任一红灯禁止合入；
+2. **AI 结对审查**：每个 PR 由 AI 助手按固定清单审查——分层依赖方向（api→services→repositories，禁止反向）、异步阻塞调用是否 `asyncio.to_thread` 包裹、外部依赖失败是否只降级不阻断（feedback_loop 模式）、幂等与事务边界；
+3. **人工终审聚焦**：产品定位符合性（拒绝家庭域回潮）、提示词变更的语义审查、安全面（密钥不落库、日志不打印凭证）。
+
+### 4.6 CI/CD 流水线设计（目标）
+
+```mermaid
+flowchart TD
+    A[PR 提交] --> B[ruff check]
+    B --> C[mypy app]
+    C --> D[pytest SQLite 内存库]
+    D --> E[前端 build vue-tsc]
+    E --> F{全部通过?}
+    F -- 否 --> G[阻止合入]
+    F -- 是 --> H[合入 main]
+    H --> I[docker build 镜像]
+    I --> J[compose pull and up]
+    J --> K[health 冒烟]
+    K -- 失败 --> L[回滚上一版本]
+```
+
+落地要点：CI 环境显式注入 `DATABASE_URL=sqlite+aiosqlite:///:memory:`（同时根治 G04 的本地漂移）；nightly 用 GitHub Actions `services:` 起 MySQL 8 / Redis / Neo4j / Chroma 容器；镜像标签与 git tag 一致保证可回滚。
+
+---
+
+## 五、Agent 设计流程
+
+### 5.1 总体架构：一张可执行的 LangGraph 状态图
+
+项目的 Agent 体系是一个**「协调器 + 领域专家 + 校验器」三层编排的可执行状态机**（`ai/workflow.py::SoloChefWorkflow`，13 节点），不是简单的单次 LLM 调用：
+
+```mermaid
+flowchart TD
+    A([START]) --> B[Intent Agent 意图识别]
+    B --> C[Graph Retriever 图谱检索]
+    B --> D[Vector Retriever 向量检索]
+    C --> E[Coordinator 上下文融合]
+    D --> E
+    E --> F[Calendar Agent 日程冲突]
+    E --> G[Meal Agent 餐食策略]
+    E --> H[Shopping Agent 购物合并]
+    E --> I[Task Agent 任务排程]
+    E --> J[Budget Agent 预算限额]
+    G --> K[Domain Coordinator 领域结果合并]
+    H --> K
+    I --> K
+    J --> K
+    F --> L[Planning Agent LLM 生成]
+    K --> L
+    L --> M[Verifier 确定性校验]
+    M --> N[Final Planner 汇总输出]
+    N --> O([END])
+```
+
+**并行设计**：双路检索并行（START 后扇出）、五个领域智能体并行（coordinator 后扇出），LangGraph 的 `Annotated[list, operator.add]` 归约器自动合并并行分支的 `trace` / `domain_results` / `specialist_outputs`。
+
+### 5.2 核心功能模块
+
+| 模块 | 输入 → 输出 | 决策职责 | 实现 |
+|---|---|---|---|
+| Intent Agent | `PlanningRequest` → intent dict | 识别规划类型与硬约束清单 | `workflow.py::_intent_node` |
+| Graph/Vector Retriever | prompt → `GraphSearchHit[]` / `VectorSearchHit[]` + 状态 | 硬约束（图谱）与软知识（向量）分工召回 | `knowledge.py::{retrieve_graph,retrieve_vector}` |
+| Coordinator | 两路 hits → context 文本 | 把检索结果排版为「知识图谱：… 向量知识片段：…」的可注入上下文 | `workflow.py::_coordinator_node` |
+| 四领域智能体 | request + 画像 + 日程 (+taste_profile) → 各 schema 结果 | 各自产出**结构化中间约束**而非最终计划（见 5.3） | `domain_agents.py::StructuredDomainAgentEngine` |
+| Domain Coordinator | 四路 dict → `DomainAgentBundle` | 反向 Pydantic 校验 + 合并为去重约束清单（时长上限、预算预留、公平规则、采购策略） | `workflow.py::_domain_coordinator_node` |
+| Planning Agent | context + 专家建议 + 领域约束 → `PlanDraft` | 唯一与 LLM 自由生成对话的节点；流式输出 | `ai/llm.py::OpenAICompatiblePlanGenerator` |
+| Verifier Agent | draft + 约束 → warnings + 修正后 draft | **确定性**后校验（不调 LLM），可直接改写预算字段 | `workflow.py::_verifier_node` |
+| Final Planner | 全状态 → sources + 汇总 | 标注每条计划的知识来源（Neo4j / Chroma 文档名 / 降级声明） | `workflow.py::_final_node` |
+
+### 5.3 决策逻辑：约束式生成的三段式
+
+本项目区别于「一次性 prompt 生成」的核心设计是**前约束、中约束、后校验**三段：
+
+**① 前约束（检索注入）**：Graph Retriever 召回的 `HAS_CONSTRAINT`（忌口/过敏）与向量知识片段，由 Coordinator 排版进上下文；`PlanningService._load_taste_profile` 额外把历史反馈聚合的口味画像注入状态，使长期偏好进入本轮决策。
+
+**② 中约束（结构化中间结果）**：四个领域智能体各自只产出狭窄 schema（如 `MealAgentResult{strategy, constraints_applied, excluded_ingredients, preferred_tags, max_duration_minutes}`），LLM 路径用 `response_format=json_object` + Pydantic 强校验，任何异常立即切换**确定性回退实现**——回退不是摆设：口味学习在回退路径同样生效（`merged_tags = liked + preferences − disliked`；排除项 = 硬约束 ∪ 负向标签 ∪ 被拒菜品）。运行模式串（`llm:v1.2.0` / `deterministic:v1.2.0` / `deterministic-fallback:v1.2.0`）把所用提示词版本写进每次 trace，可审计、可回归。
+
+**③ 后校验（确定性 Verifier）**：LLM 产出之后必经八道确定性检查——预算超限钳制（`estimated` 压回上限并重算 saved/usage_percent）、忌口词别名展开命中（`不吃辣→{辣椒,辣酱,麻辣}`、`X过敏→X`、`忌X→X`）、7 天餐食完整性、重复菜品、预算分类合计、领域限额+预留≤总额、未知任务负责人、任务-日程时间重叠。警告不阻断输出但随计划持久化，前端可见。
+
+**口味学习决策规则**（`prompts.py` meal v1.2.0 契约）：硬约束（过敏/忌口）不可协商；口味偏好是软约束、冲突时让位硬约束；样本量为 0 时退回静态画像；正反馈进 `preferred_tags`、负反馈进 `excluded_ingredients` 或从偏好剔除。同标签正负信号冲突时按净票数归属（`feedback.py::taste_profile`）。
+
+### 5.4 与其他系统组件的交互
+
+```mermaid
+flowchart TD
+    WF[工作流 SoloChefWorkflow] --> KS[知识检索 Neo4j/Chroma]
+    WF --> FR[反馈仓储 MySQL]
+    WF --> AR[(agent_runs 表)]
+    ENG[领域智能体] --> LLM[DeepSeek API]
+    GEN[计划生成器] --> LLM
+    GEN --> DEMO[demo 兜底数据]
+    WF --> SSE[SSE Redis 前端]
+    AR --> RETRY[/retry 续跑或重跑/]
+```
+
+| 交互对象 | 方式 | 容错 |
+|---|---|---|
+| MySQL | `PlanningRepository` 创建/更新 run 记录；每步 checkpoint 落库 | 无 session 时纯内存运行（测试路径） |
+| Neo4j/Chroma | 经 `KnowledgeRetriever` Protocol 注入，可替换 | 不可用时 hits 为空、trace 标 WARNING，流程继续 |
+| LLM | langchain-openai `ChatOpenAI`，OpenAI 兼容协议 | `LLMGenerationError` → `ai_fallback_enabled` 时 DemoPlanGenerator 兜底，mode 记为 `x->demo-fallback` |
+| Redis | SSE 事件日志、取消标记、限流 | 进程内降级 + 5s 熔断（`runtime.py`） |
+| LangGraph checkpoint | PostgresSaver（psycopg 池 + Windows Proactor 线程适配器 `AsyncThreadedPostgresSaver`） | **仅 PostgreSQL 方言启用**；MySQL/SQLite 下 retry 退化为完整重跑（缺口 G05） |
+
+### 5.5 技术实现细节
+
+- **状态模型**：`WorkflowState`（TypedDict，total=False）承载 request/检索结果/领域结果/draft/trace 等 17 个键；并行分支用 `operator.add` 归约。
+- **流式桥接**：LLM token 经 `ContextVar[TokenSink]`（`llm.py::token_sink`）穿透到 `ConversationService.on_token`；`SummaryStreamExtractor` 用有限状态机从 JSON 流中只抽取 `"summary"` 字段的字符串值逐字推给前端——避免了「先看到一堆 JSON 再看到结论」的糟糕体验。
+- **可取消**：每个 step/token 回调先查 Redis 取消标记，命中即抛 `PlanningCancelledError` / `CancelledError`，run 记录落 `failed + CancelledError + failed_step`。
+- **可恢复**：`resume()` 从 `agent_runs.checkpoint` 还原，配合 LangGraph `aget_state(thread_id)` 断点续跑；恢复后 checkpoint 标记 `resumed: true`。
+- **观测面**：`/agents/runs` 列表与详情、`/agents/prompts` 提示词注册表、`/agents/evaluate` 四维加权评分（餐食 35/购物 25/任务 25/预算 15）。
+
+### 5.6 已知局限
+
+1. **无营养硬约束**：Verifier 八项校验不含热量/宏量达成率（G02）；
+2. **checkpoint 方言绑定**：MySQL 迁移后断点续跑失效（G05）；
+3. **遗留智能体稀释**：calendar/task/budget 三智能体仍带家庭语义（如 task 的「儿童适龄」规则），需在去家庭化阶段裁剪或改写为独居语义；
+4. **Demo 数据出戏**：无 LLM 时演示数据仍是家庭叙事（G10）；
+5. **Planner 单点自由生成**：最终 PlanDraft 完全由一次 LLM 调用产出，7 天×3 餐的结构稳定性依赖 prompt 约束 + Verifier 兜底，尚无分段生成/重试细化策略。
+
+---
+
+## 六、RAG（检索增强生成）设计流程
+
+### 6.1 技术架构：Graph + Vector 双引擎混合检索
+
+```mermaid
+flowchart TD
+    UP[文本/MD/PDF 上传] --> DP[中文切块 600/重叠100]
+    DP --> VS[(Chroma 向量库)]
+    DP --> EE[实体关系抽取]
+    EE --> GS[(Neo4j 图谱)]
+    FB[执行反馈] --> RN[滚动叙述文档]
+    RN --> VS
+    FB --> GS
+    Q[用户查询] --> QR[查询改写]
+    QR --> V1[向量召回 top_k×3]
+    V1 --> RR[二阶段精排 top_k]
+    QR --> G1[图谱 Cypher 查询]
+    V1 --> MERGE[Coordinator 融合]
+    G1 --> MERGE
+    RR --> MERGE
+    MERGE --> CTX[RAG 上下文]
+    CTX --> PLAN[生成模型]
+```
+
+**分工原则**：图谱管**硬约束与关系**（忌口、偏好、食材-菜谱、反馈信号），向量库管**非结构化语义知识**（菜谱文档、营养原则、反馈叙述）。两者并行召回（`asyncio.gather`），由 Coordinator 融合为统一文本上下文注入生成模型——即经典的 GraphRAG 混合架构，且**任一引擎不可用都降级为空召回而非失败**。
+
+### 6.2 数据来源与知识库构建
+
+| 来源 | 内容 | 入库方式 | 目标存储 |
+|---|---|---|---|
+| 内置种子文档 | `BOOTSTRAP_DOCUMENTS` 3 篇（当前为家庭向内容，待改写 G09） | `/knowledge/bootstrap` 幂等重建（固定 document_id） | Chroma + Neo4j |
+| 用户上传 | 文本/MD/PDF，中文编码自动识别（utf-8-sig/utf-8/gb18030） | 同步端点或 Celery 异步 job（幂等键防重，死信兜底） | Chroma 切块 + Neo4j 实体关系 |
+| 业务数据投影 | 菜谱/任务/计划/预算/日程 | 每次检索前 `sync_user_context` 全量 MERGE（先删后建 Member/Event 子图） | Neo4j |
+| 执行反馈 | 五类反馈信号的自然语言叙述 + 结构化子图 | `feedback_loop` 捕获时即时回流；失败待补偿重放 | Neo4j 反馈子图 + Chroma 滚动文档 |
+
+**切块策略**：`RecursiveCharacterTextSplitter`，chunk 600 字、重叠 100，分隔符按中文排版优先级 `## → ### → 空行 → 换行 → 。→ ；→ ，→ 空格`，保证菜谱步骤不被从句中切断。
+
+**图谱 Schema**（12 类节点）：`User / Preference / Constraint / Event / Recipe / Ingredient / Task / Plan / Budget / Document / KnowledgeEntity / FeedbackSignal`；关键关系：`PREFERS`、`HAS_CONSTRAINT`、`REQUIRES`（菜谱→食材）、`MENTIONS`（文档→实体）、`RELATION`（LLM 抽取的自由三元组）、`HAS_FEEDBACK / ABOUT / SIGNALS{polarity}`（反馈子图）。所有节点带 `user_id` 属性隔离多用户。
+
+### 6.3 检索策略
+
+**四级流水线**（每级都可独立降级）：
+
+1. **查询改写**（`query_rewriter.py`）：LLM 级把自然语言改写为 `QuerySpec{keywords, entity_kinds, relations}`（实体类型与关系限枚举白名单，temp 0）；失败回退规则级（6 类实体、5 类关系的关键词映射表 + 标点分词）。
+2. **双路首阶段召回**：
+   - 向量：Chroma `query`（user_id 元数据过滤，cosine 距离转 0-1 分），召回 `top_k × rerank_candidate_multiplier(3)` 候选；
+   - 图谱：参数化 Cypher——关键词 CONTAINS + 实体类型白名单 + 关系白名单（恒含 `HAS_CONSTRAINT/AVOIDS`），LIMIT 40；另路反馈子图查询 LIMIT 8 置顶合并。
+3. **二阶段精排**（`reranker.py`）：`bge-reranker-v2-m3` 对候选逐一算 (query, doc) 相关性分，重排后截回 top_k；模型缺失时透传首阶段排序，链路不断。
+4. **融合注入**：Coordinator 把图关系（`主体 --关系--> 客体`）与向量片段（`[文档名#块号, score] 内容`）排版为分区文本，附带 `RetrievalDiagnostics`（chroma/neo4j/embedding/rerank 四组件状态）供前端与排障。
+
+### 6.4 生成模型选型
+
+| 组件 | 选型 | 理由 | 降级链 |
+|---|---|---|---|
+| 主生成 LLM | DeepSeek `deepseek-chat`（OpenAI 兼容，base_url 可换） | 中文场景性价比与 JSON 遵循度；temp 0.2 / max_tokens 4096 / `json_object` 强制 | LLM 异常 → `DemoPlanGenerator` 确定性计划（可关：`ai_fallback_enabled=false`） |
+| 领域智能体 LLM | 同上，temp 0.1 / max_tokens 900（小 schema 快调用） | 结构化中间结果要求稳定 | 异常 → 各智能体内置确定性实现（模式串可审计） |
+| Embedding | BGE-M3（1024 维，sentence-transformers 本地加载） | 中文语义检索开源 SOTA 梯队；`local_files_only` 杜绝隐式下载 | 缺模型/缺依赖 → Chroma 内置 ONNX MiniLM-L6-v2（384 维），**独立 collection 隔离维度** |
+| Reranker | bge-reranker-v2-m3（FlagEmbedding 本地加载） | 与 BGE-M3 同族，精排增益明确 | 不可用 → 透传首阶段排序 |
+| 查询改写/实体抽取 | 主 LLM temp 0 小输出 | 复用同一 provider，零额外成本 | 规则级关键词映射 / 正则「类型: 值」 |
+
+### 6.5 性能优化与容错
+
+- **全链路异步**：Chroma/Neo4j/模型加载等阻塞调用一律 `asyncio.to_thread` 移出事件循环（`vector_store.py`、`checkpoints.py`）；双路检索 `asyncio.gather` 并行。
+- **进程内单例 + 锁**：embedding/reranker/Chroma collection 解析一次缓存（`ensure_embedding` / `ensure_reranker`，`asyncio.Lock` 防并发重复加载大模型）。
+- **滚动文档防膨胀**：反馈向量按类型固定 document_id 覆写（窗口 30 条），知识库文档数与反馈次数解耦。
+- **双库一致性自检**：`/admin/rag/sync` 对比 Chroma 文档清单与 Neo4j Document 节点，报「图谱未同步」与「孤儿节点」两类偏差。
+- **容错总原则**：任何外部依赖（Neo4j/Chroma/Redis/LLM）异常只降级（空召回 / WARNING 状态 / 同步标记置 false / 补偿重放），**永不阻断主业务链路**——这一原则在 `knowledge.py`、`feedback_loop.py`、`runtime.py` 中一致贯彻。
+
+### 6.6 检索质量评测
+
+`/admin/rag/eval` 提供**不依赖 LLM 的离线回归评测**（`rag_eval.py`）：内置 5 条评测用例（query + 期望文档 + 期望实体类型），逐案计算 **Recall@k**（期望命中占比）与 **nDCG@k**（命中位置折扣增益），输出均值与逐案明细。评测集与种子文档主题对齐，改写种子库时必须同步更新（G09）。当前缺口：评测未接入定期执行，用例量偏少且仍是家庭主题。
+
+---
+
+## 七、下一步计划
+
+### 7.1 总体策略
+
+作为个人项目，剩余开发周期压缩至 **1-2 天**完成全部开发流程。核心原则：**只做打通 MVP 闭环必须的事，其余一律降级或跳过**。
+
+| 原则 | 说明 |
+|---|---|
+| 只做 P0 | G01/G02/G03/G04 必做；G05 接受降级（retry=完整重跑，UI 明示） |
+| 内容快速换血 | G09/G10 随手改，不追求完美 |
+| 其余全部跳过 | G06-G08/G11-G16 不在本周期内 |
+| 验收唯一标准 | 从注册到换菜反馈的完整路径可在 Docker 下演示 |
+
+### 7.2 两天任务分解
+
+```mermaid
+gantt
+    title SoloChef 收尾冲刺（1-2 天）
+    dateFormat YYYY-MM-DD
+    axisFormat %m-%d
+
+    section Day 1 后端闭环
+    .env MySQL 同步 + git 初始化       :a1, 2026-08-08, 1d
+    画像/营养目标 API + TDEE 计算       :a2, 2026-08-08, 1d
+    营养硬约束 + Verifier 校验          :a3, 2026-08-08, 1d
+    种子库/Demo 数据 SoloChef 化        :a4, 2026-08-08, 1d
+
+    section Day 2 前端收尾
+    品牌/导航/路由去家庭化              :b1, 2026-08-09, 1d
+    画像设置页 + 今日营养首页            :b2, 2026-08-09, 1d
+    三餐营养可视化 + 购物清单            :b3, 2026-08-09, 1d
+    pytest 补充 + Docker 冒烟 + README  :b4, 2026-08-09, 1d
+```
+
+### 7.3 Day 1：后端闭环（营养目标 API + 营养硬约束 + 内容换血）
+
+| 序号 | 任务 | 缺口 | 预估工时 | 技术方案 | 验收标准 |
+|---|---|---|---|---|---|
+| 1 | `.env` MySQL 同步 | G04 | 0.5h | `.env` / `.env.example` 改为 `mysql+aiomysql://...solochef`，与 config.py 默认值对齐 | `pytest` 无需临时覆盖 `DATABASE_URL` 即可跑 |
+| 2 | git 初始化 | G13 | 0.5h | `git init` + `.gitignore`（已有）+ 初始提交 | `git log` 有提交记录 |
+| 3 | 画像与营养目标 API | G01 | 3h | 新增 `GET/PUT /profile` + `POST /profile/nutrition-goal`；`services/nutrition.py` 新增 `compute_nutrition_goal(profile)`：Mifflin-St Jeor 求 BMR → ×活动系数得 TDEE → 按目标类型调整热量（增肌+10%/减脂-15%/维护0%）→ 分配 P/C/F 克数 → 落 `nutrition_goals` | 录入身体数据后返回 BMR/TDEE/P/C/F；`/meals/nutrition` 目标值不再是建表默认值；pytest 新增用例通过 |
+| 4 | 营养硬约束 | G02 | 2h | Meal Agent schema 增加 `daily_targets`；Planner prompt 注入营养目标；Verifier 新增达成率校验（90%-110% 区间，越界写 warning） | 生成计划带逐日热量/P/C/F；故意偏离目标的输入产生警告 |
+| 5 | 种子库 + Demo 数据换血 | G09/G10 | 1h | `BOOTSTRAP_DOCUMENTS` 3 篇改为增肌/减脂/快手一人食；`demo_data.py` 的 MEALS/SHOPPING 改为独居场景；`rag_eval.py::EVAL_SET` 同步改写 | bootstrap 后文档主题为独居膳食；demo 模式生成的计划无家庭叙事 |
+
+**Day 1 交付物**：后端营养目标闭环打通（G01/G02/G04），种子内容 SoloChef 化（G09/G10），`pytest` 全绿。
+
+### 7.4 Day 2：前端收尾 + 验证交付
+
+| 序号 | 任务 | 缺口 | 预估工时 | 技术方案 | 验收标准 |
+|---|---|---|---|---|---|
+| 6 | 前端去家庭化骨架 | G03 | 2h | `router.ts` 收敛为 今日营养/画像/AI备餐/三餐/购物/反馈/知识库/Agent轨迹 8 项；`api.ts` 删 family 系列；`AppShell.vue` 品牌改 SoloChef；`index.html` 标题替换 | 登录后无 family 请求；导航无成员/日历/任务入口 |
+| 7 | 画像设置页 + 今日营养首页 | G03 | 2h | 新增/重写 `ProfileView.vue`（调 profile/nutrition-goal API）；重写 `DashboardView.vue` 展示今日热量/P/C/F + 三餐 + 购物状态 | 用户可完成「填数据 → 看目标」；首屏展示今日营养摘要 |
+| 8 | 三餐营养可视化 + 购物清单 | G03 | 2h | `MealsView.vue` 用 ECharts 展示每餐热量/P/C/F 与全天达标进度；`ShoppingView.vue` 去家庭化文案 | 每餐营养可见；购物清单无家庭叙事 |
+| 9 | pytest 补充 + Docker 冒烟 + README | G14 | 2h | 为新增 profile/nutrition-goal 端点补 pytest 用例；`docker compose up -d` 全栈冒烟；README 重写 5 分钟演示路径 | Docker 下从注册到换菜反馈完整路径可演示；README 可复现 |
+
+**Day 2 交付物**：前端 SoloChef 化（G03），Docker 下完整 MVP 路径可演示，README 可复现。
+
+### 7.5 降级策略
+
+1. **G05 checkpoint 适配**：接受「retry=完整重跑」降级，UI 明示，不花时间在本周期内适配 MySQL saver；
+2. **G06 食材营养基准库**：不扩充，沿用现有 10 种食材粗略估算，营养报告标注「未校准」；
+3. **G07 替换重算 / G08 购物替代**：沿用现有换菜逻辑和硬编码替代字典，本周期不改；
+4. **G11 反馈复盘页**：若 Day 2 时间不足，跳过，反馈数据仍可通过 `/feedback` API 查看；
+5. **CI/CD（G13 完整版）**：本周期只做 git init + 本地 pytest/ruff/mypy 三道门禁，不接 GitHub Actions。
+
+---
+
+## 八、附录
+
+### 8.1 数据库表清单（20 张，`models/identity.py`）
+
+- **核心表（14）**：`users`、`refresh_sessions`、`user_profiles`、`nutrition_goals`、`weekly_plans`、`plan_meal_items`、`plan_shopping_items`、`recipes`、`expense_records`、`plan_feedback`、`chat_sessions`、`chat_messages`、`agent_runs`、`background_jobs`
+- **遗留表（6，冻结待清理）**：`calendar_events`、`calendar_event_exceptions`、`plan_tasks`、`plan_budgets`、`task_completions`、`inventory_items`
+
+### 8.2 API 端点分组（85+，`api/router.py` + `api/auth_router.py`）
+
+认证 13 · 仪表盘/健康/AI 状态 4 · 日程 8 · 任务 7 · 餐食 8 · 购物 7 · 库存 3 · 预算 6 · 反馈 2 · 菜谱 4 · 知识库 8 · 后台任务 5 · 监控管理 3 · 对话 8 · 计划 10 · Agent 5。
+
+### 8.3 代码依据索引
+
+| 主题 | 文件 |
+|---|---|
+| 工作流编排 | `backend/app/ai/workflow.py` |
+| 领域智能体 / 提示词注册表 / LLM 生成器 / 评测 | `backend/app/ai/{domain_agents,prompts,llm,evaluation}.py` |
+| 规划服务（持久化/恢复/口味注入） | `backend/app/services/planning.py` |
+| RAG 编排 / 向量库 / 图谱 / 嵌入 / 精排 / 改写 / 抽取 / 评测 | `backend/app/services/{knowledge,vector_store,graph_store,embeddings,reranker,query_rewriter,entity_extractor,rag_eval}.py` |
+| 反馈闭环 / 口味画像 | `backend/app/services/feedback_loop.py`、`backend/app/repositories/feedback.py` |
+| 营养报告 / 换菜 / 单位换算 | `backend/app/services/{nutrition,domain,unit_conversion}.py` |
+| 异步任务 / Redis 运行时 / checkpoint | `backend/app/worker.py`、`services/{runtime,checkpoints}.py` |
+| 前端 | `frontend/src/{router.ts,api.ts,stores/app.ts,views/*}` |
+| 部署 | `docker-compose.yml`、`backend/Dockerfile`、`frontend/{Dockerfile,nginx.conf}` |
+
+### 8.4 流程图渲染说明
+
+本报告全部流程图采用 Mermaid 语法，结构统一为自上而下（`flowchart TD`）。渲染环境：GitHub / Typora / Obsidian 原生支持；VSCode 安装 `Markdown Preview Mermaid Support` 插件；导出图片可用 [mermaid.live](https://mermaid.live) 或 `mmdc` CLI。
+
+---
+
+> **报告结束** | SoloChef 个人项目分析报告 v6.0 | 编制日期 2026-08-07 | 全部技术结论可经附录 8.3 文件索引复核

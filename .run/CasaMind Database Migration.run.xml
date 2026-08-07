@@ -1,0 +1,18 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="CasaMind Database Migration" type="PythonConfigurationType" factoryName="Python">
+    <option name="ENV_FILES" value="$PROJECT_DIR$/.env" />
+    <option name="PARENT_ENVS" value="true" />
+    <envs>
+      <env name="PYTHONUNBUFFERED" value="1" />
+    </envs>
+    <option name="SDK_HOME" value="$PROJECT_DIR$/backend/.venv/Scripts/python.exe" />
+    <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/backend" />
+    <option name="IS_MODULE_SDK" value="false" />
+    <option name="ADD_CONTENT_ROOTS" value="true" />
+    <option name="ADD_SOURCE_ROOTS" value="true" />
+    <option name="MODULE_MODE" value="true" />
+    <option name="SCRIPT_NAME" value="alembic" />
+    <option name="PARAMETERS" value="upgrade head" />
+    <method v="2" />
+  </configuration>
+</component>
