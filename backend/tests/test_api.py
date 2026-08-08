@@ -1,25 +1,9 @@
-from datetime import datetime
-
 import pytest
 from fastapi.testclient import TestClient
 from pytest import MonkeyPatch
 
 import app.api.router as api_router
 from app.core.config import Settings
-from app.repositories import PlanningRepository
-from app.schemas.domain import CalendarAgentConflict, CalendarAgentResult
-
-
-def recurrence_payload(
-    type_: str = "none", days_of_week: list[int] | None = None, count: int | None = None
-) -> dict[str, object]:
-    return {
-        "type": type_,
-        "interval": 1,
-        "days_of_week": days_of_week or [],
-        "until": None,
-        "count": count,
-    }
 
 
 def _register_second_user(
@@ -45,25 +29,6 @@ def test_health(client: TestClient) -> None:
     assert response.json()["status"] == "ok"
 
 
-def test_plan_task_json_dates_are_restored_before_persistence() -> None:
-    values = PlanningRepository._task_values(
-        {
-            "id": 1,
-            "title": "整理厨房",
-            "assignee": "小满",
-            "duration": 30,
-            "due": "周三 19:00",
-            "status": "todo",
-            "category": "家务",
-            "assignee_member_id": 2,
-            "scheduled_start_at": "2026-08-05T19:00:00",
-            "scheduled_end_at": "2026-08-05T19:30:00",
-        }
-    )
-    assert isinstance(values["scheduled_start_at"], datetime)
-    assert isinstance(values["scheduled_end_at"], datetime)
-
-
 def test_business_endpoint_requires_jwt(client: TestClient) -> None:
     response = client.get("/api/v1/dashboard")
     assert response.status_code == 401
@@ -85,96 +50,6 @@ def test_dashboard_uses_authenticated_user(
     response = client.get("/api/v1/dashboard", headers=auth_headers)
     assert response.status_code == 200
     assert response.json()["user_name"] == "测试用户"
-
-
-def test_calendar_event_crud_conflicts_and_user_scope(
-    client: TestClient, auth_headers: dict[str, str]
-) -> None:
-    payload = {
-        "title": "Piano class pickup",
-        "start_at": "2026-08-03T19:00:00+08:00",
-        "end_at": "2026-08-03T20:00:00+08:00",
-        "participant_ids": [1],
-        "category": "course",
-        "location": "Community center",
-        "notes": "Bring lesson book",
-        "timezone": "Asia/Shanghai",
-        "recurrence": recurrence_payload(),
-        "is_all_day": False,
-    }
-    created = client.post("/api/v1/calendar/events", headers=auth_headers, json=payload)
-    assert created.status_code == 201
-    event_id = created.json()["id"]
-
-    conflict = client.post(
-        "/api/v1/calendar/conflicts/check",
-        headers=auth_headers,
-        json={
-            "start_at": "2026-08-03T19:30:00+08:00",
-            "end_at": "2026-08-03T20:30:00+08:00",
-            "participant_ids": [1],
-            "recurrence": recurrence_payload(),
-        },
-    )
-    assert conflict.status_code == 200
-    assert conflict.json()["has_conflict"] is True
-    assert conflict.json()["conflicts"][0]["event_id"] == event_id
-
-    rejected = client.post(
-        "/api/v1/calendar/events",
-        headers=auth_headers,
-        json={**payload, "title": "Overlapping pickup"},
-    )
-    assert rejected.status_code == 409
-
-    updated = client.patch(
-        f"/api/v1/calendar/events/{event_id}",
-        headers=auth_headers,
-        json={"title": "Piano class and pickup"},
-    )
-    assert updated.status_code == 200
-    assert updated.json()["title"] == "Piano class and pickup"
-
-    other_headers = _register_second_user(client, phone="13800000010", display_name="日程隔离用户")
-    hidden = client.get(f"/api/v1/calendar/events/{event_id}", headers=other_headers)
-    assert hidden.status_code == 404
-
-    deleted = client.delete(f"/api/v1/calendar/events/{event_id}", headers=auth_headers)
-    assert deleted.status_code == 204
-
-
-def test_recurring_calendar_events_expand_in_query_window(
-    client: TestClient, auth_headers: dict[str, str]
-) -> None:
-    created = client.post(
-        "/api/v1/calendar/events",
-        headers=auth_headers,
-        json={
-            "title": "Weekly review",
-            "start_at": "2026-08-04T08:00:00+08:00",
-            "end_at": "2026-08-04T08:30:00+08:00",
-            "participant_ids": [1],
-            "category": "plan",
-            "location": "",
-            "notes": "",
-            "timezone": "Asia/Shanghai",
-            "recurrence": recurrence_payload("weekly", days_of_week=[1], count=3),
-            "is_all_day": False,
-        },
-    )
-    assert created.status_code == 201
-
-    listed = client.get(
-        "/api/v1/calendar/events",
-        headers=auth_headers,
-        params={
-            "start_at": "2026-08-04T00:00:00+08:00",
-            "end_at": "2026-08-25T00:00:00+08:00",
-        },
-    )
-    assert listed.status_code == 200
-    weekly_items = [item for item in listed.json() if item["title"] == "Weekly review"]
-    assert len(weekly_items) == 3
 
 
 def test_refresh_token_rotates_session(client: TestClient, auth_session: dict[str, object]) -> None:
@@ -223,59 +98,6 @@ def test_sms_auth_requires_code_and_logs_in_existing_user(
     assert sms_login.json()["user"]["phone"] == "13800000001"
 
 
-def test_calendar_occurrence_exception_changes_conflict_result(
-    client: TestClient, auth_headers: dict[str, str]
-) -> None:
-    created = client.post(
-        "/api/v1/calendar/events",
-        headers=auth_headers,
-        json={
-            "title": "Exception test",
-            "start_at": "2030-01-07T09:00:00+08:00",
-            "end_at": "2030-01-07T10:00:00+08:00",
-            "participant_ids": [1],
-            "category": "test",
-            "location": "",
-            "notes": "",
-            "timezone": "Asia/Shanghai",
-            "recurrence": recurrence_payload("weekly", days_of_week=[0], count=2),
-            "is_all_day": False,
-        },
-    )
-    assert created.status_code == 201
-    event_id = created.json()["id"]
-    listed = client.get(
-        "/api/v1/calendar/events",
-        headers=auth_headers,
-        params={
-            "start_at": "2030-01-07T00:00:00+08:00",
-            "end_at": "2030-01-22T00:00:00+08:00",
-        },
-    ).json()
-    occurrences = [item for item in listed if item["id"] == event_id]
-    assert len(occurrences) == 2
-    cancelled_start = occurrences[1]["occurrence_start_at"]
-    exception = client.post(
-        f"/api/v1/calendar/events/{event_id}/exceptions",
-        headers=auth_headers,
-        json={"occurrence_start_at": cancelled_start, "action": "cancel", "override": {}},
-    )
-    assert exception.status_code == 201
-    conflict = client.post(
-        "/api/v1/calendar/conflicts/check",
-        headers=auth_headers,
-        json={
-            "start_at": "2030-01-14T09:15:00+08:00",
-            "end_at": "2030-01-14T09:45:00+08:00",
-            "participant_ids": [1],
-            "recurrence": recurrence_payload(),
-        },
-    )
-    assert conflict.status_code == 200
-    assert conflict.json()["has_conflict"] is False
-    client.delete(f"/api/v1/calendar/events/{event_id}", headers=auth_headers)
-
-
 def test_generate_weekly_plan_and_trace_are_user_scoped(
     client: TestClient, auth_headers: dict[str, str]
 ) -> None:
@@ -290,8 +112,8 @@ def test_generate_weekly_plan_and_trace_are_user_scoped(
     assert payload["budget"]["estimated"] <= 500
     trace = client.get(f"/api/v1/agents/runs/{payload['run_id']}", headers=auth_headers)
     assert trace.status_code == 200
-    assert len(trace.json()["steps"]) == 13
-    assert any(step["name"] == "calendar_agent" for step in trace.json()["steps"])
+    assert len(trace.json()["steps"]) == 11
+    assert any(step["name"] == "meal_agent" for step in trace.json()["steps"])
     assert any(step["name"] == "domain_coordinator" for step in trace.json()["steps"])
     assert payload["domain"]["meal"]["strategy"]
 
@@ -344,6 +166,9 @@ def test_failed_agent_run_is_persisted(
     class FailingWorkflow:
         _generator = type("Generator", (), {"mode": "test"})()
 
+        def set_checkpointer(self, checkpointer: object) -> None:
+            del checkpointer
+
         async def run(self, *args: object, **kwargs: object) -> None:
             del args, kwargs
             raise RuntimeError("intentional workflow failure")
@@ -370,7 +195,7 @@ def test_failed_agent_run_is_persisted(
 def test_plan_confirmation_writes_to_database(
     client: TestClient, auth_headers: dict[str, str]
 ) -> None:
-    """Confirming a plan should persist meals, shopping, tasks, budget."""
+    """Confirming a plan should persist meals and shopping (budget lives on the plan row)."""
     response = client.post(
         "/api/v1/plans/generate-weekly",
         headers=auth_headers,
@@ -461,42 +286,6 @@ def test_plan_versions_activate_and_rollback(
     )
 
 
-def test_confirm_plan_rechecks_current_calendar_conflicts(
-    client: TestClient,
-    auth_headers: dict[str, str],
-    monkeypatch: MonkeyPatch,
-) -> None:
-    run_id = client.post(
-        "/api/v1/plans/generate-weekly",
-        headers=auth_headers,
-        json={"prompt": "确认前冲突复核测试", "budget": 350},
-    ).json()["run_id"]
-    conflict = CalendarAgentConflict(
-        event_ids=[101, 102],
-        titles=["接送", "加班"],
-        start_at="2026-08-05T18:00:00",
-        end_at="2026-08-05T18:30:00",
-        participant_ids=[1],
-        participants=["测试用户"],
-        message="测试用户的接送与加班冲突",
-    )
-    monkeypatch.setattr(
-        api_router,
-        "analyze_calendar",
-        lambda events, members: CalendarAgentResult(
-            status="conflict",
-            has_conflict=True,
-            checked_event_count=len(events),
-            affected_member_ids=[1],
-            conflicts=[conflict],
-        ),
-    )
-
-    confirmed = client.post(f"/api/v1/plans/{run_id}/confirm", headers=auth_headers)
-    assert confirmed.status_code == 409
-    assert "未解决冲突" in confirmed.json()["detail"]["message"]
-
-
 def test_plan_cross_user_isolation(client: TestClient, auth_headers: dict[str, str]) -> None:
     """Plans from one user should not be visible to another."""
     response = client.post(
@@ -539,7 +328,8 @@ def test_plan_derive_diff_and_checkpoint(client: TestClient, auth_headers: dict[
         f"/api/v1/plans/{source_id}/diff/{derived.json()['id']}", headers=auth_headers
     )
     assert compared.status_code == 200
-    assert set(compared.json()["sections"]) == {"meals", "shopping", "tasks"}
+    # Phase 3 清理：plan_tasks 表已删除，diff 仅保留 meals / shopping 两段。
+    assert set(compared.json()["sections"]) == {"meals", "shopping"}
 
 
 def test_chat_session_search_rename_and_delete(
@@ -603,7 +393,6 @@ def test_domain_crud_is_persisted_and_user_scoped(
 
     assert client.get("/api/v1/meals", headers=headers).json() == []
     assert client.get("/api/v1/shopping", headers=headers).json() == []
-    assert client.get("/api/v1/tasks", headers=headers).json() == []
 
     meal = client.post(
         "/api/v1/meals",
@@ -637,30 +426,12 @@ def test_domain_crud_is_persisted_and_user_scoped(
     assert checked.status_code == 200
     assert checked.json()["purchased"] is True
 
-    task = client.post(
-        "/api/v1/tasks",
-        headers=headers,
-        json={"title": "整理冰箱", "assignee": "测试用户", "due": "周五 20:00"},
-    )
-    assert task.status_code == 201
-    task_id = task.json()["id"]
-    completed = client.patch(f"/api/v1/tasks/{task_id}", headers=headers, json={"status": "done"})
-    assert completed.status_code == 200
-    assert completed.json()["status"] == "done"
-
-    budget = client.patch(
-        "/api/v1/budget",
-        headers=headers,
-        json={"limit": 600, "estimated": 120, "categories": {"肉蛋奶": 120}},
-    )
-    assert budget.status_code == 200
-    assert budget.json()["saved"] == 480
-    assert budget.json()["usage_percent"] == 20
+    # Phase 3 清理：/tasks 与 /budget (PATCH) 端点随 plan_tasks / plan_budgets 表一并移除，
+    # 预算改由 WeeklyPlan.budget 标量列承载，不再单独 CRUD。
 
     assert client.get(f"/api/v1/meals/{meal_id}", headers=auth_headers).status_code == 404
     assert client.delete(f"/api/v1/meals/{meal_id}", headers=headers).status_code == 204
     assert client.delete(f"/api/v1/shopping/{shopping_id}", headers=headers).status_code == 204
-    assert client.delete(f"/api/v1/tasks/{task_id}", headers=headers).status_code == 204
 
 
 def test_domain_operations_close_the_household_loop(
@@ -733,35 +504,6 @@ def test_domain_operations_close_the_household_loop(
         ).status_code
         == 204
     )
-
-
-def test_task_assignment_completion_and_user_scope(
-    client: TestClient, auth_headers: dict[str, str]
-) -> None:
-    run_id = client.post(
-        "/api/v1/plans/generate-weekly",
-        headers=auth_headers,
-        json={"prompt": "生成用于任务分配测试的一周计划", "budget": 500},
-    ).json()["run_id"]
-    client.post(f"/api/v1/plans/{run_id}/confirm", headers=auth_headers)
-
-    assigned = client.post("/api/v1/tasks/auto-assign", headers=auth_headers)
-    assert assigned.status_code == 200
-    assert assigned.json()["assigned"] > 0
-    task = next(item for item in assigned.json()["tasks"] if item["status"] != "done")
-    assert task["scheduled_start_at"] is not None
-
-    completion = client.post(
-        f"/api/v1/tasks/{task['id']}/complete",
-        headers=auth_headers,
-        json={"actual_duration": task["duration"], "notes": "按计划完成"},
-    )
-    assert completion.status_code == 200
-    assert completion.json()["task_id"] == task["id"]
-
-    other_headers = _register_second_user(client, phone="13800000015", display_name="任务隔离用户")
-    hidden = client.get(f"/api/v1/tasks/{task['id']}", headers=other_headers)
-    assert hidden.status_code == 404
 
 
 def test_recipe_and_chat_are_user_scoped(
@@ -905,3 +647,187 @@ def test_device_sessions_listing_and_revocation(
 
     foreign = client.delete("/api/v1/auth/sessions/not-a-session", headers=auth_headers)
     assert foreign.status_code == 404
+
+
+# ---------- 用户画像与营养目标闭环 ----------
+
+
+def test_get_profile_auto_creates_with_defaults(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    """GET /profile 不存在时自动创建默认画像。"""
+    response = client.get("/api/v1/profile", headers=auth_headers)
+    assert response.status_code == 200
+    profile = response.json()
+    assert profile["height_cm"] == 170.0
+    assert profile["weight_kg"] == 65.0
+    assert profile["age"] == 30
+    assert profile["gender"] == "male"
+    assert profile["activity_level"] == "moderate"
+    assert profile["goal_type"] == "maintain"
+
+
+def test_update_profile_persists_fields(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    """PUT /profile 更新画像字段后再次 GET 返回新值。"""
+    updated = client.put(
+        "/api/v1/profile",
+        headers=auth_headers,
+        json={
+            "height_cm": 178.0,
+            "weight_kg": 72.5,
+            "age": 28,
+            "gender": "male",
+            "activity_level": "active",
+            "goal_type": "bulk",
+        },
+    )
+    assert updated.status_code == 200
+    assert updated.json()["height_cm"] == 178.0
+    assert updated.json()["goal_type"] == "bulk"
+
+    fetched = client.get("/api/v1/profile", headers=auth_headers)
+    assert fetched.json()["weight_kg"] == 72.5
+    assert fetched.json()["activity_level"] == "active"
+
+
+def test_update_profile_rejects_invalid_values(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    """PUT /profile 对超范围值返回 422。"""
+    invalid = client.put(
+        "/api/v1/profile",
+        headers=auth_headers,
+        json={"height_cm": 300.0, "age": 200},
+    )
+    assert invalid.status_code == 422
+
+
+def test_update_profile_requires_at_least_one_field(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    """PUT /profile 空请求体返回 422。"""
+    empty = client.put("/api/v1/profile", headers=auth_headers, json={})
+    assert empty.status_code == 422
+
+
+def test_compute_nutrition_goal_male_bulk(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    """POST /profile/nutrition-goal 按 Mifflin-St Jeor 计算 TDEE 并持久化。"""
+    client.put(
+        "/api/v1/profile",
+        headers=auth_headers,
+        json={
+            "height_cm": 180.0,
+            "weight_kg": 75.0,
+            "age": 25,
+            "gender": "male",
+            "activity_level": "moderate",
+            "goal_type": "bulk",
+        },
+    )
+    response = client.post("/api/v1/profile/nutrition-goal", headers=auth_headers)
+    assert response.status_code == 201
+    goal = response.json()
+    # BMR = 10*75 + 6.25*180 - 5*25 + 5 = 750 + 1125 - 125 + 5 = 1755
+    assert goal["bmr"] == 1755.0
+    # TDEE = 1755 * 1.55 = 2720.25
+    assert goal["tdee"] == 2720.2
+    # target = round(2720.25 * 1.10, 1) = 2992.3（浮点舍入）
+    assert goal["target_calories"] == 2992.3
+    # 增肌比例 P30% C40% F30%
+    assert goal["protein_g"] == 224.4  # 2992.3 * 0.30 / 4
+    assert goal["carb_g"] == 299.2  # 2992.3 * 0.40 / 4
+    assert goal["fat_g"] == 99.7  # 2992.3 * 0.30 / 9
+
+
+def test_compute_nutrition_goal_female_cut(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    """女性减脂目标：BMR 用 -161 偏移，热量赤字 15%。"""
+    client.put(
+        "/api/v1/profile",
+        headers=auth_headers,
+        json={
+            "height_cm": 165.0,
+            "weight_kg": 58.0,
+            "age": 30,
+            "gender": "female",
+            "activity_level": "light",
+            "goal_type": "cut",
+        },
+    )
+    response = client.post("/api/v1/profile/nutrition-goal", headers=auth_headers)
+    assert response.status_code == 201
+    goal = response.json()
+    # BMR = 10*58 + 6.25*165 - 5*30 - 161 = 580 + 1031.25 - 150 - 161 = 1300.25
+    assert goal["bmr"] == 1300.2
+    # TDEE = 1300.25 * 1.375 = 1787.84...
+    assert goal["tdee"] == 1787.8
+    # target = 1787.84 * 0.85 = 1519.67 → 1519.7
+    assert goal["target_calories"] == 1519.7
+    # 减脂比例 P40% C30% F30%
+    assert goal["protein_g"] == 152.0  # 1519.7 * 0.40 / 4
+    assert goal["fat_g"] == 50.7  # 1519.7 * 0.30 / 9
+
+
+def test_get_nutrition_goal_returns_404_when_not_computed(
+    client: TestClient
+) -> None:
+    """GET /profile/nutrition-goal 未计算时返回 404（用新用户确保无残留）。"""
+    headers = _register_second_user(client, phone="13900000077", display_name="无目标用户")
+    response = client.get("/api/v1/profile/nutrition-goal", headers=headers)
+    assert response.status_code == 404
+
+
+def test_get_nutrition_goal_after_compute(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    """计算后 GET 返回持久化的目标。"""
+    client.put(
+        "/api/v1/profile",
+        headers=auth_headers,
+        json={"height_cm": 175.0, "weight_kg": 70.0, "age": 30, "gender": "male"},
+    )
+    client.post("/api/v1/profile/nutrition-goal", headers=auth_headers)
+    response = client.get("/api/v1/profile/nutrition-goal", headers=auth_headers)
+    assert response.status_code == 200
+    assert response.json()["bmr"] > 0
+    assert response.json()["tdee"] > response.json()["bmr"]
+
+
+def test_compute_nutrition_goal_is_idempotent(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    """重复计算覆盖旧目标（user_id 唯一约束）。"""
+    client.put(
+        "/api/v1/profile",
+        headers=auth_headers,
+        json={"goal_type": "maintain", "activity_level": "sedentary"},
+    )
+    first = client.post("/api/v1/profile/nutrition-goal", headers=auth_headers)
+    assert first.status_code == 201
+
+    client.put(
+        "/api/v1/profile",
+        headers=auth_headers,
+        json={"goal_type": "bulk", "activity_level": "active"},
+    )
+    second = client.post("/api/v1/profile/nutrition-goal", headers=auth_headers)
+    assert second.status_code == 201
+    assert second.json()["target_calories"] > first.json()["target_calories"]
+
+
+def test_profile_is_user_scoped(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    """用户 A 的画像与用户 B 隔离。"""
+    client.put(
+        "/api/v1/profile", headers=auth_headers, json={"height_cm": 190.0}
+    )
+    other = _register_second_user(client, phone="13900000099")
+    other_profile = client.get("/api/v1/profile", headers=other)
+    assert other_profile.json()["height_cm"] == 170.0  # 默认值，非 190
+

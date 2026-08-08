@@ -5,8 +5,9 @@
 family_invitations / event_participants`` 已删除；新增 ``UserProfile``（身体数据
 + 饮食偏好）与 ``NutritionGoal``（TDEE + 宏量分配）支撑营养目标驱动生成。
 
-注：``calendar_* / plan_tasks / plan_budgets / inventory_items`` 暂保留（改为
-user 作用域），后续按 PRD 功能裁剪阶段再移除。
+Phase 3 清理（2026-08-09）：``calendar_events / calendar_event_exceptions /
+plan_tasks / plan_budgets / task_completions / inventory_items`` 6 张遗留表
+及对应模型已移除，数据模型精简为 14 张核心表。
 """
 
 from datetime import datetime
@@ -23,7 +24,9 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    false,
     func,
+    true,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -50,7 +53,7 @@ class User(TimestampMixin, Base):
     phone: Mapped[str] = mapped_column(String(20))
     display_name: Mapped[str] = mapped_column(String(80))
     password_hash: Mapped[str] = mapped_column(String(255))
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true())
     token_version: Mapped[int] = mapped_column(default=1, server_default="1")
 
     profile: Mapped["UserProfile | None"] = relationship(
@@ -123,30 +126,6 @@ class NutritionGoal(TimestampMixin, Base):
     user: Mapped[User] = relationship(back_populates="nutrition_goal")
 
 
-class CalendarEventRecord(TimestampMixin, Base):
-    __tablename__ = "calendar_events"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[int] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"), index=True
-    )
-    title: Mapped[str] = mapped_column(String(120))
-    category: Mapped[str] = mapped_column(String(40), default="meal", server_default="meal")
-    location: Mapped[str] = mapped_column(String(120), default="", server_default="")
-    notes: Mapped[str] = mapped_column(String(500), default="", server_default="")
-    start_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), index=True)
-    end_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), index=True)
-    timezone: Mapped[str] = mapped_column(
-        String(64), default="Asia/Shanghai", server_default="Asia/Shanghai"
-    )
-    recurrence_type: Mapped[str] = mapped_column(String(20), default="none", server_default="none")
-    recurrence_interval: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
-    recurrence_days: Mapped[list[int]] = mapped_column(JSON, default=list)
-    recurrence_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
-    recurrence_count: Mapped[int | None] = mapped_column(Integer)
-    is_all_day: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
-
-
 class AgentRunRecord(TimestampMixin, Base):
     __tablename__ = "agent_runs"
 
@@ -188,7 +167,7 @@ class WeeklyPlan(TimestampMixin, Base):
     )
     status: Mapped[str] = mapped_column(String(30), default="draft", server_default="draft")
     version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true())
     parent_plan_id: Mapped[int | None] = mapped_column(
         ForeignKey("weekly_plans.id", ondelete="SET NULL"), nullable=True, index=True
     )
@@ -214,12 +193,6 @@ class WeeklyPlan(TimestampMixin, Base):
     )
     shopping_items: Mapped[list["PlanShoppingItem"]] = relationship(
         back_populates="plan", cascade="all, delete-orphan"
-    )
-    tasks: Mapped[list["PlanTask"]] = relationship(
-        back_populates="plan", cascade="all, delete-orphan"
-    )
-    budget_record: Mapped["PlanBudget | None"] = relationship(
-        back_populates="plan", cascade="all, delete-orphan", uselist=False
     )
 
 
@@ -253,72 +226,9 @@ class PlanShoppingItem(TimestampMixin, Base):
     quantity: Mapped[str] = mapped_column(String(40), default="1", server_default="1")
     price: Mapped[float] = mapped_column(default=0, server_default="0")
     source: Mapped[str] = mapped_column(String(100), default="", server_default="")
-    purchased: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    purchased: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
 
     plan: Mapped[WeeklyPlan] = relationship(back_populates="shopping_items")
-
-
-class PlanTask(TimestampMixin, Base):
-    __tablename__ = "plan_tasks"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    plan_id: Mapped[int] = mapped_column(
-        ForeignKey("weekly_plans.id", ondelete="CASCADE"), index=True
-    )
-    title: Mapped[str] = mapped_column(String(120))
-    assignee: Mapped[str] = mapped_column(String(80), default="", server_default="")
-    duration: Mapped[int] = mapped_column(Integer, default=15, server_default="15")
-    due: Mapped[str] = mapped_column(String(50), default="", server_default="")
-    status: Mapped[str] = mapped_column(String(30), default="todo", server_default="todo")
-    category: Mapped[str] = mapped_column(String(40), default="未分类", server_default="未分类")
-    scheduled_start_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
-    scheduled_end_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
-    recurrence_type: Mapped[str] = mapped_column(String(20), default="none", server_default="none")
-    recurrence_interval: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
-
-    plan: Mapped[WeeklyPlan] = relationship(back_populates="tasks")
-    completions: Mapped[list["TaskCompletion"]] = relationship(
-        back_populates="task", cascade="all, delete-orphan"
-    )
-
-
-class PlanBudget(TimestampMixin, Base):
-    __tablename__ = "plan_budgets"
-    __table_args__ = (UniqueConstraint("plan_id", name="uq_plan_budget"),)
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    plan_id: Mapped[int] = mapped_column(
-        ForeignKey("weekly_plans.id", ondelete="CASCADE"), index=True
-    )
-    limit: Mapped[float] = mapped_column(default=500, server_default="500")
-    estimated: Mapped[float] = mapped_column(default=0, server_default="0")
-    saved: Mapped[float] = mapped_column(default=0, server_default="0")
-    usage_percent: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
-    categories: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
-
-    plan: Mapped[WeeklyPlan] = relationship(back_populates="budget_record")
-
-
-class TaskCompletion(TimestampMixin, Base):
-    __tablename__ = "task_completions"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[int] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"), index=True
-    )
-    task_id: Mapped[int] = mapped_column(
-        ForeignKey("plan_tasks.id", ondelete="CASCADE"), index=True
-    )
-    completed_by_user_id: Mapped[int] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"), index=True
-    )
-    completed_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
-    )
-    actual_duration: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
-    notes: Mapped[str] = mapped_column(String(500), default="", server_default="")
-
-    task: Mapped[PlanTask] = relationship(back_populates="completions")
 
 
 class ExpenseRecord(TimestampMixin, Base):
@@ -359,7 +269,7 @@ class RecipeRecord(TimestampMixin, Base):
     allergens: Mapped[list[str]] = mapped_column(JSON, default=list)
     duration: Mapped[int] = mapped_column(Integer, default=30, server_default="30")
     estimated_cost: Mapped[float] = mapped_column(default=0, server_default="0")
-    is_favorite: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    is_favorite: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
     like_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     servings: Mapped[int] = mapped_column(Integer, default=2, server_default="2")
     nutrition: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
@@ -394,40 +304,17 @@ class PlanFeedback(TimestampMixin, Base):
     tags: Mapped[list[str]] = mapped_column(JSON, default=list)
     rating: Mapped[int | None] = mapped_column(Integer, nullable=True)
     sentiment: Mapped[str] = mapped_column(String(20), default="neutral", server_default="neutral")
-    content: Mapped[str] = mapped_column(Text, default="", server_default="")
+    content: Mapped[str] = mapped_column(Text, default="")
     planned_value: Mapped[float] = mapped_column(Float, default=0, server_default="0")
     actual_value: Mapped[float] = mapped_column(Float, default=0, server_default="0")
     deviation: Mapped[float] = mapped_column(Float, default=0, server_default="0")
     source: Mapped[str] = mapped_column(String(20), default="auto", server_default="auto")
     synced_to_graph: Mapped[bool] = mapped_column(
-        Boolean, default=False, server_default="false"
+        Boolean, default=False, server_default=false()
     )
     synced_to_vector: Mapped[bool] = mapped_column(
-        Boolean, default=False, server_default="false"
+        Boolean, default=False, server_default=false()
     )
-
-
-class InventoryItem(TimestampMixin, Base):
-    """用户库存项（暂保留，后续按 PRD 功能裁剪阶段移除）。"""
-
-    __tablename__ = "inventory_items"
-    __table_args__ = (
-        UniqueConstraint("user_id", "name", name="uq_inventory_user_name"),
-    )
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[int] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"), index=True
-    )
-    name: Mapped[str] = mapped_column(String(120))
-    category: Mapped[str] = mapped_column(String(40), default="未分类", server_default="未分类")
-    quantity: Mapped[str] = mapped_column(String(40), default="0", server_default="0")
-    quantity_value: Mapped[float] = mapped_column(Float, default=0.0, server_default="0")
-    unit: Mapped[str] = mapped_column(String(20), default="个", server_default="个")
-    low_stock_threshold: Mapped[float] = mapped_column(
-        Float, default=0.0, server_default="0"
-    )
-    note: Mapped[str] = mapped_column(String(500), default="", server_default="")
 
 
 class ChatSession(TimestampMixin, Base):
@@ -494,21 +381,3 @@ class RefreshSession(TimestampMixin, Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-
-
-class CalendarEventException(TimestampMixin, Base):
-    __tablename__ = "calendar_event_exceptions"
-    __table_args__ = (
-        UniqueConstraint("event_id", "occurrence_start_at", name="uq_event_occurrence_exception"),
-    )
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[int] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"), index=True
-    )
-    event_id: Mapped[int] = mapped_column(
-        ForeignKey("calendar_events.id", ondelete="CASCADE"), index=True
-    )
-    occurrence_start_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), index=True)
-    action: Mapped[str] = mapped_column(String(20), default="cancel", server_default="cancel")
-    override: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)

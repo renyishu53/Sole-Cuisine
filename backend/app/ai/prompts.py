@@ -1,6 +1,6 @@
 """领域智能体提示词版本注册表。
 
-集中管理餐食/购物/任务/预算四个领域智能体的系统提示与指令，每个提示词带
+集中管理餐食/购物/预算三个领域智能体的系统提示与指令，每个提示词带
 语义化版本号与变更说明，便于审计、回滚和 A/B 对比。``StructuredDomainAgentEngine``
 通过 :func:`get_active` 读取当前生效版本，调用方可通过 :func:`list_versions`
 查看历史版本，实现"提示词即代码"的版本管理。
@@ -18,7 +18,7 @@ from dataclasses import dataclass
 class PromptVersion:
     """单个提示词版本的不可变描述。"""
 
-    name: str  # 智能体标识：meal / shopping / task / budget
+    name: str  # 智能体标识：meal / shopping / budget
     version: str  # 语义化版本，如 "1.1.0"
     system_message: str  # 系统角色提示
     instruction: str  # 用户指令模板
@@ -91,27 +91,6 @@ _REGISTRY: dict[str, list[PromptVersion]] = {
                 "划分周中补货与周末集中采购批次，输出合并键、偏好分类与采购窗口。"
             ),
             changelog="明确跨单位求和与采购批次划分，新增合并键与采购窗口字段说明。",
-            released_at="2026-08-05",
-        ),
-    ],
-    "task": [
-        PromptVersion(
-            name="task",
-            version="1.0.0",
-            system_message="你是 SoloChef 的独立领域智能体。",
-            instruction="基于成员可用时间生成公平任务分配候选顺序。",
-            changelog="初始版本：按当前任务负担从低到高分配，避开成员真实日程。",
-            released_at="2026-08-01",
-        ),
-        PromptVersion(
-            name="task",
-            version="1.1.0",
-            system_message="你是 SoloChef 的任务调度智能体，追求成员间的公平分配。",
-            instruction=(
-                "结合成员可用时间、历史完成时长与年龄适宜性生成公平任务分配候选顺序；"
-                "儿童只分配适龄低风险任务，输出公平规则、候选成员与默认时长。"
-            ),
-            changelog="显式纳入年龄适宜性与历史完成时长，新增公平规则与候选成员字段说明。",
             released_at="2026-08-05",
         ),
     ],

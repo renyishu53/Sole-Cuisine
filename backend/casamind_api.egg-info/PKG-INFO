@@ -17,14 +17,12 @@ Requires-Dist: loguru<1.0,>=0.7
 Requires-Dist: python-multipart<1.0,>=0.0.12
 Requires-Dist: redis<7.0,>=5.2
 Requires-Dist: celery<6.0,>=5.4
-Requires-Dist: psycopg[binary,pool]<4.0,>=3.2
 Requires-Dist: alibabacloud_dypnsapi20170525<3.0,>=1.0
 Provides-Extra: ai
 Requires-Dist: langchain<2.0,>=1.0; extra == "ai"
 Requires-Dist: langchain-openai<2.0,>=1.0; extra == "ai"
 Requires-Dist: langchain-text-splitters<2.0,>=1.0; extra == "ai"
 Requires-Dist: langgraph<3.0,>=1.0; extra == "ai"
-Requires-Dist: langgraph-checkpoint-postgres<4.0,>=3.1; extra == "ai"
 Requires-Dist: chromadb==1.5.9; extra == "ai"
 Requires-Dist: neo4j<6.0,>=5.25; extra == "ai"
 Requires-Dist: pypdf<7.0,>=5.0; extra == "ai"

@@ -47,7 +47,7 @@ class DemoPlanGenerator:
         del context
         estimated = min(472.0, request.budget * 0.94)
         return PlanDraft(
-            summary="已结合成员画像、日程冲突、预算约束和检索上下文生成一周计划。",
+            summary="已结合营养目标、预算约束和检索上下文生成一周膳食计划。",
             meals=MEALS,
             shopping=SHOPPING,
             tasks=TASKS,
@@ -63,7 +63,7 @@ class DemoPlanGenerator:
                     "其他": max(0, estimated - 368),
                 },
             ),
-            conflicts=["周三 18:00 加班与绘画课接送重叠，建议由可用成员接送。"],
+            conflicts=[],
             suggestions=["周三安排 18 分钟快手餐", "复用菌菇与青菜以减少浪费"],
         )
 
@@ -88,7 +88,7 @@ class OpenAICompatiblePlanGenerator:
     async def generate(self, request: PlanningRequest, context: str) -> PlanDraft:
         system_prompt = (
             "你是 SoloChef 规划协调智能体。只能依据用户需求和 RAG 上下文生成计划。"
-            "严格遵守成员忌口、日程和预算，不要编造来源。只输出符合要求的 JSON 对象。"
+            "严格遵守成员忌口、营养目标和预算，不要编造来源。只输出符合要求的 JSON 对象。"
         )
         user_prompt = (
             f"用户需求：{request.prompt}\n预算上限：{request.budget}\n"

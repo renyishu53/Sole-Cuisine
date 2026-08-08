@@ -1,6 +1,14 @@
+"""Repository for domain entities: recipes, expenses, and meal replacement.
+
+去家庭化版：所有查询以 user_id 隔离。
+Phase 3 清理：移除 PlanTask / TaskCompletion / InventoryItem 相关持久化
+（plan_tasks / task_completions / inventory_items 表已删除）。
+任务与库存不再落库；预算由 WeeklyPlan.budget 列承载，PlanBudget 表已删除。
+"""
+
 import re
 from collections import defaultdict
-from datetime import UTC, datetime, timedelta
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import select
@@ -8,12 +16,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import (
     ExpenseRecord,
-    InventoryItem,
     PlanMealItem,
     PlanShoppingItem,
-    PlanTask,
     RecipeRecord,
-    TaskCompletion,
 )
 from app.repositories.planning import PlanningRepository
 from app.services.unit_conversion import add_quantities, describe_conversion
@@ -207,217 +212,9 @@ class DomainRepository:
         await self._session.commit()
         return True
 
-    async def complete_task(
-        self,
-        task: PlanTask,
-        *,
-        user_id: int,
-        actual_duration: int,
-        notes: str,
-    ) -> TaskCompletion:
-        task.status = "done"
-        completion = TaskCompletion(
-            user_id=user_id,
-            task_id=task.id,
-            completed_by_user_id=user_id,
-            completed_at=datetime.now(UTC),
-            actual_duration=actual_duration,
-            notes=notes,
-        )
-        self._session.add(completion)
-        await self._session.commit()
-        await self._session.refresh(completion)
-        return completion
-
-    async def get_active_tasks(self, user_id: int) -> list[PlanTask]:
-        plan = await PlanningRepository(self._session).get_active_plan(user_id)
-        return list(plan.tasks) if plan is not None else []
-
-    async def save_tasks(self) -> None:
-        await self._session.commit()
-
-    async def completion_workload(self, user_id: int) -> dict[int, int]:
-        completions = list(
-            (
-                await self._session.scalars(
-                    select(TaskCompletion).where(TaskCompletion.user_id == user_id)
-                )
-            ).all()
-        )
-        result: dict[int, int] = defaultdict(int)
-        for completion in completions:
-            result[completion.completed_by_user_id] += completion.actual_duration
-        return result
-
     async def replace_meal(self, meal: PlanMealItem, **values: object) -> PlanMealItem:
         for key, value in values.items():
             setattr(meal, key, value)
         await self._session.commit()
         await self._session.refresh(meal)
         return meal
-
-    async def expand_recurring_tasks(
-        self, user_id: int, *, days: int = 30
-    ) -> list[dict[str, Any]]:
-        """展开周期任务为未来 ``days`` 天的具体发生项。
-
-        遍历活跃计划中所有 ``recurrence_type != 'none'`` 的任务，按其
-        ``scheduled_start_at`` 与 ``recurrence_interval`` 推算未来发生时间。
-        返回列表元素包含 task_id、title、assignee、occurrence_at 等字段，
-        供前端"未来任务预览"展示，不会写入数据库。
-        """
-        plan = await PlanningRepository(self._session).get_active_plan(user_id)
-        if plan is None:
-            return []
-        now = datetime.now(UTC)
-        horizon = now + timedelta(days=days)
-        expansions: list[dict[str, Any]] = []
-        for task in plan.tasks:
-            if task.recurrence_type is None or task.recurrence_type == "none":
-                continue
-            anchor = task.scheduled_start_at or task.created_at
-            if anchor is None:
-                continue
-            if anchor.tzinfo is None:
-                anchor = anchor.replace(tzinfo=UTC)
-            interval = max(int(task.recurrence_interval or 1), 1)
-            step = _recurrence_step(task.recurrence_type, interval)
-            if step is None:
-                continue
-            # 从 anchor 开始向前推进到 >= now，再继续到 horizon
-            current = anchor
-            # 若 anchor 已过去，跳到第一个 >= now 的发生点
-            while current < now:
-                current = current + step
-            counter = 0
-            while current <= horizon and counter < 50:  # 安全上限
-                expansions.append({
-                    "task_id": task.id,
-                    "title": task.title,
-                    "assignee": task.assignee,
-                    "category": task.category,
-                    "duration": task.duration,
-                    "recurrence_type": task.recurrence_type,
-                    "recurrence_interval": interval,
-                    "occurrence_at": current.isoformat(),
-                })
-                current = current + step
-                counter += 1
-        expansions.sort(key=lambda item: item["occurrence_at"])
-        return expansions
-
-    # ── 库存管理 ────────────────────────────────────────────────────────
-
-    async def list_inventory(self, user_id: int) -> list[InventoryItem]:
-        """返回库存列表，按名称排序。"""
-        statement = (
-            select(InventoryItem)
-            .where(InventoryItem.user_id == user_id)
-            .order_by(InventoryItem.category, InventoryItem.name)
-        )
-        return list((await self._session.scalars(statement)).all())
-
-    async def adjust_inventory(
-        self,
-        user_id: int,
-        *,
-        name: str,
-        category: str = "未分类",
-        delta: float,
-        unit: str = "个",
-        quantity: str | None = None,
-        low_stock_threshold: float | None = None,
-        note: str = "",
-    ) -> InventoryItem:
-        """按 (user_id, name) 增量调整库存：delta 为正入库、为负出库。
-
-        不存在则新建；quantity_value 不会低于 0。返回调整后的库存项。
-        """
-        item = await self._session.scalar(
-            select(InventoryItem).where(
-                InventoryItem.user_id == user_id,
-                InventoryItem.name == name,
-            )
-        )
-        if item is None:
-            item = InventoryItem(
-                user_id=user_id,
-                name=name,
-                category=category,
-                quantity=quantity or f"{max(delta, 0):g} {unit}",
-                quantity_value=max(delta, 0.0),
-                unit=unit,
-                low_stock_threshold=low_stock_threshold or 0.0,
-                note=note,
-            )
-            self._session.add(item)
-        else:
-            if category:
-                item.category = category
-            if unit:
-                item.unit = unit
-            if low_stock_threshold is not None:
-                item.low_stock_threshold = low_stock_threshold
-            if note:
-                item.note = note
-            item.quantity_value = max(item.quantity_value + delta, 0.0)
-            item.quantity = quantity or f"{item.quantity_value:g} {item.unit}"
-        await self._session.commit()
-        await self._session.refresh(item)
-        return item
-
-    async def delete_inventory(self, item_id: int, user_id: int) -> bool:
-        """删除指定库存项，严格校验用户归属。"""
-        item = await self._session.scalar(
-            select(InventoryItem).where(
-                InventoryItem.id == item_id,
-                InventoryItem.user_id == user_id,
-            )
-        )
-        if item is None:
-            return False
-        await self._session.delete(item)
-        await self._session.commit()
-        return True
-
-    async def restock_from_shopping(
-        self, item: PlanShoppingItem, *, user_id: int
-    ) -> InventoryItem:
-        """采购项标记为已购买时入库：按数量解析数值后增量入库。"""
-        parsed_value = _parse_quantity_value(item.quantity)
-        return await self.adjust_inventory(
-            user_id,
-            name=item.name,
-            category=item.category,
-            delta=parsed_value,
-            unit=_parse_quantity_unit(item.quantity) or "个",
-            note=f"采购入库：{item.source}" if item.source else "采购入库",
-        )
-
-
-def _parse_quantity_value(quantity: str) -> float:
-    """从数量字符串中解析数值部分，无法解析时按 1 计。"""
-    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([^\d\s]+)?\s*", quantity)
-    if match and match.group(1):
-        return float(match.group(1))
-    return 1.0
-
-
-def _parse_quantity_unit(quantity: str) -> str | None:
-    """从数量字符串中解析单位部分。"""
-    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([^\d\s]+)?\s*", quantity)
-    if match and match.group(2):
-        return match.group(2)
-    return None
-
-
-def _recurrence_step(recurrence_type: str, interval: int) -> timedelta | None:
-    """根据 recurrence_type 计算单步间隔。"""
-    if recurrence_type == "daily":
-        return timedelta(days=interval)
-    if recurrence_type == "weekly":
-        return timedelta(weeks=interval)
-    if recurrence_type == "monthly":
-        # 简化处理：按 30 天近似
-        return timedelta(days=30 * interval)
-    return None

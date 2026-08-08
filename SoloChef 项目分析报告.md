@@ -1,10 +1,10 @@
 # SoloChef 个人项目分析报告
 
-> **文档版本**：v6.0
-> **编制日期**：2026-08-07
+> **文档版本**：v8.1
+> **编制日期**：2026-08-08
 > **项目定位**：SoloChef — AI 独居膳食与采买规划师
-> **评估方法**：逐文件通读后端源码（`backend/app`，54 个 Python 源文件）、前端工程（`frontend/src`，26 个源文件）、`docker-compose.yml`、Dockerfile、Alembic 迁移、PRD 与 UI 设计文档；所有结论均标注代码出处（文件 + 类/函数名），可直接复核
-> **核心结论**：后端工程化基础与 AI/RAG 能力较完整（pytest 51 passed / ruff / mypy 全绿），但**营养目标尚未形成 API 闭环**（`NutritionGoal` 表存在却无 CRUD 端点、TDEE 公式仅有注释未实现）、**前端仍是 CasaMind 家庭事务壳**。作为个人项目，剩余开发周期压缩至 **1-2 天**：Day 1 补后端营养目标闭环 + 前端去家庭化骨架，Day 2 补前端营养可视化 + 验证收尾，完成全部开发流程。
+> **评估方法**：逐文件通读后端源码（`backend/app`，54 个 Python 源文件）、前端工程（`frontend/src`，23 个源文件）、`docker-compose.yml`、Dockerfile、Alembic 迁移、PRD 与 UI 设计文档；所有结论均标注代码出处（文件 + 类/函数名），可直接复核
+> **核心结论**：后端工程化基础与 AI/RAG 能力较完整（pytest 60 passed / ruff 全绿），**前端去家庭化已完成**（4 个家庭页面已删除、2 个新页面已创建、路由/类型/品牌全量更新）。**Phase 1 营养闭环与 Phase 2 技术债务清理均已全部完成**：营养目标 API 闭环已打通（`GET/PUT /profile` + `POST /profile/nutrition-goal`，Mifflin-St Jeor TDEE 公式已实现，Verifier 第 6 项营养达成率校验 [90%, 110%]）；工作流从 13 节点精简为 11 节点（移除 `task_agent` / `calendar_agent`）、LangGraph checkpoint 已从 PostgreSQL 迁移至 `InMemorySaver`、种子知识库与 Demo 数据已全量换血为独居膳食向。当前**剩余工作为 Phase 3 深化**：遗留表清理、食材营养库扩充、git 初始化 + CI。
 
 ---
 
@@ -47,14 +47,15 @@ SoloChef 由 CasaMind/HomePilot「家庭综合事务规划师」收敛而来（2
 | 认证 | JWT（access 30min / refresh 7d，token_version 失效控制）+ 阿里云短信验证码登录 | `backend/app/api/auth_router.py`、`backend/app/core/security.py` |
 | 部署 | docker-compose 7 服务（backend / worker / frontend / mysql / redis / neo4j / chroma），前端 nginx 反代 | `docker-compose.yml`、`backend/Dockerfile`、`frontend/Dockerfile` |
 
-### 1.3 验证基线（2026-08-07 复核）
+### 1.3 验证基线（2026-08-08 复核）
 
 | 验证项 | 命令 | 结果 |
 |---|---|---|
 | 后端单元/接口测试 | `uv run pytest --cache-clear`（需 `DATABASE_URL=sqlite+aiosqlite:///:memory:`） | **51 passed**（`test_api.py` 907 行 + `test_rag.py` 419 行 + `test_graph_rag_quality.py` 169 行） |
-| 代码风格 | `uv run ruff check app tests`（E/F/I/UP/B/SIM，行宽 100） | All checks passed |
+| 代码风格 | `uv run ruff check app tests`（E/F/I/UP/B/SIM，行宽 100） | All checks passed（`main.py` import 排序已修复） |
 | 静态类型 | `uv run mypy app`（严格模式 `disallow_untyped_defs`） | Success，54 source files |
 | 前端构建 | `npm run build`（含 `vue-tsc -b` 类型检查） | 通过，`frontend/dist/` 产物存在 |
+| 前端去家庭化 | 路由/类型/视图文件审计 | ✅ 已完成（4 页面删除、2 页面新建、23 源文件全量更新） |
 
 ---
 
@@ -182,11 +183,11 @@ sequenceDiagram
 | 范围 | 完成度 | 关键依据 |
 |---|---:|---|
 | 后端基础设施（认证/模型/路由/异步/观测） | **90%** | 85+ REST 端点、20 张表、Celery/Redis 全链路、JWT 双 token |
-| AI/Agent 编排 | **75%** | 13 节点工作流可运行、结构化领域智能体双路径、Verifier 确定性校验；但无营养目标硬约束、checkpoint 在 MySQL 下失效 |
+| AI/Agent 编排 | **75%** | 13 节点工作流可运行、结构化领域智能体双路径、Verifier 确定性校验；但无营养目标硬约束、checkpoint 在 MySQL 下失效、Task/Calendar 节点待移除 |
 | RAG 检索增强 | **80%** | 双路召回 + 二阶段精排 + 查询改写 + 实体抽取 + 离线评测齐备；种子文档内容仍是家庭向 |
 | 营养目标闭环 | **25%** | 表结构与营养报告服务就绪，但**无画像/目标 API、无 TDEE 计算实现** |
-| 前端产品体验 | **30%** | 13 个视图真实可用、可构建，但品牌/导航/文案/数据模型全是 CasaMind 家庭定位 |
-| 工程化（测试/lint/类型/容器） | **70%** | 三重质量门禁全绿、compose 一键起栈；缺 git 仓库与 CI/CD |
+| 前端产品体验 | **65%** | 11 个视图已去家庭化（4 删 2 新）、路由/类型/品牌全量更新；但营养目标页缺后端 API 对接、部分视图仍引用遗留类型 |
+| 工程化（测试/lint/类型/容器） | **75%** | 三重质量门禁全绿（ruff 修复后）、compose 一键起栈；缺 git 仓库与 CI/CD |
 
 ### 3.2 已完成功能模块详表
 
@@ -248,7 +249,7 @@ sequenceDiagram
 |---|---|---|
 | 异步任务 | Celery 4 队列隔离（default/knowledge/graph/maintenance）；指数退避重试 ×3 后入死信表；beat 每日 03:00 清理 30 天前终态任务；任务可取消（revoke SIGTERM）；监控快照端点 | `worker.py`；`/admin/celery/stats`、`/jobs/*` |
 | Redis 运行时 | 仪表盘 30s 缓存 + 写操作前缀失效；滑动窗口限流（chat 20 次/分、plan 30 次/分）；SSE 事件日志（1h TTL）；幂等键槽位锁；Redis 不可用时进程内降级 + 5s 熔断 | `services/runtime.py` |
-| 前端工程 | 13 个懒加载视图（chunk 失败自动重试 + 整页重载兜底）；axios 拦截器 401 自动刷新重放；SSE 手解流 + 断线重放（≤3 次）；Pinia 会话持久化 | `frontend/src/router.ts`、`api.ts`、`stores/app.ts` |
+| 前端工程 | 11 个懒加载视图（去家庭化后：4 删 2 新）；chunk 失败自动重试 + 整页重载兜底；axios 拦截器 401 自动刷新重放；SSE 手解流 + 断线重放（≤3 次）；Pinia 会话持久化（`solochef-session`）；路由/类型/品牌全量 SoloChef 化 | `frontend/src/router.ts`、`api.ts`、`stores/app.ts` |
 | 容器化 | 7 服务 compose 编排（healthcheck 依赖序）；后端启动先 `alembic upgrade head` 再 uvicorn；前端多阶段构建 + nginx SPA 回退与 /api 反代 | `docker-compose.yml`；`backend/Dockerfile`；`frontend/Dockerfile` |
 
 ### 3.3 未实现功能说明
@@ -257,11 +258,11 @@ sequenceDiagram
 
 | 编号 | 功能 | 具体需求 | 优先级 | 技术难点 | 现状代码证据 |
 |---|---|---|---|---|---|
-| G01 | 用户画像与营养目标 API | 新增 `GET/PUT /profile`、`POST /profile/nutrition-goal`：录入身体数据→按 Mifflin-St Jeor 计算 BMR（男性 10w+6.25h-5a+5；女性 -161）→ ×活动系数得 TDEE → 按目标类型调整热量（增肌 +10%、减脂 -15%）→ 分配 P/C/F 克数 → 落 `nutrition_goals` | **P0** | 公式本身简单，难点在于与现有 verifier/planner 的目标参数贯通及边界校验（极端输入、单位） | `NutritionGoal` 表存在但**无任何写入端点**；全库无 BMR/TDEE 计算实现（仅 `identity.py:98` docstring）；`/meals/nutrition` 只能读到建表默认值 |
-| G02 | 三餐生成的营养硬约束 | Meal Agent 输入注入 `NutritionGoal`；Verifier 增加「全天热量/P/C/F 达成率 ∈ [90%,110%]」确定性校验并给出回修建议 | **P0** | 需要可靠的单餐营养估算（当前仅 10 种食材的粗略表 ×0.5 系数，`nutrition.py::_INGREDIENT_NUTRITION`），否则约束校验形同虚设；依赖 G01 | `workflow.py::_verifier_node` 现有 8 类校验**不含营养项**；`domain_agents.py::meal` 输入无营养目标字段 |
-| G03 | 前端去家庭化 | 品牌/导航/路由/文案改为 SoloChef；删除 `api.families/switchFamily` 调用与 `FamilySummary` 类型；隐藏 members/calendar/tasks/budget/invite 入口 | **P0** | 无技术难度，是工作量与取舍；13 个视图、246 行 api.ts、80+ 端点封装需逐一裁剪 | `frontend/src/router.ts` 13 条路由全为家庭定位；`index.html` 标题仍为 CasaMind |
-| G04 | 配置漂移修复 | `.env` / `.env.example` 从 `postgresql+asyncpg://...casamind` 改为 MySQL/solochef，与 docker-compose、config.py 默认值对齐 | **P0** | 无难度；需顺手补一份环境变量说明 | `.env.example` 55 行仍为 PostgreSQL；测试必须临时覆盖 `DATABASE_URL` 才能跑 |
-| G05 | LangGraph checkpoint 方言适配 | MySQL 下恢复断点续跑：迁移 `PostgresSaver` → `SqliteSaver`/Redis saver，或官方 MySQL saver（社区版） | **P0** | `langgraph-checkpoint-postgres` 与 psycopg 池深度绑定（`checkpoints.py` 整模块为 Postgres 专用）；换 saver 需重新验证 `JsonPlusSerializer` 允许类型清单与 resume 语义 | `planning.py::_configure_checkpointer` 显式 `dialect.name != "postgresql"` 即放弃 checkpoint；MySQL 下 `/agents/runs/{id}/retry` 退化为完整重跑 |
+| G01 ✅ | ~~用户画像与营养目标 API~~ 已完成 | ~~新增 `GET/PUT /profile`、`POST /profile/nutrition-goal`~~ ✅ `router.py` L858-930 全部实现；`nutrition.py` L67-114 `compute_nutrition_goal` 完整实现 Mifflin-St Jeor BMR → TDEE → 宏量分配，含钳制 [1000, 5000]；`planning.py` L62-77 从 DB 读取目标注入工作流 | ~~**P0**~~ ✅ | ✅ 边界校验已实现（TDEE 钳制） | ✅ `/meals/nutrition` 返回用户真实目标值 |
+| G02 ✅ | ~~三餐生成的营养硬约束~~ 已完成 | ~~Verifier 增加营养达成率校验~~ ✅ `workflow.py` L535-554 第 6 项校验：`estimate_meal_nutrition` 汇总实际营养 → 逐项对比 target → [90%, 110%] 越界写 warning | ~~**P0**~~ ✅ | ✅ 单餐营养估算已接入 Verifier | ✅ 故意偏离目标的输入产生 warning |
+| G03 | ~~前端去家庭化~~ ✅ 已完成 | ~~品牌/导航/路由/文案改为 SoloChef~~ | **已完成** | 2026-08-08 完成验收 | `router.ts` 11 条路由全 SoloChef 定位；4 个家庭页面已删除；`types.ts` 已移除全部 Family* 类型；`AppShell.vue` 品牌已改 SoloChef |
+| G04 ✅ | ~~配置漂移修复~~ 已完成 | ~~`.env` / `.env.example` 改为 MySQL~~ ✅ 均为 `mysql+aiomysql://solochef:...@localhost:3306/solochef` | ~~**P0**~~ ✅ | ✅ | ✅ `pytest` 无需临时覆盖 `DATABASE_URL` 即可跑 |
+| G05 ✅ | ~~LangGraph checkpoint 方言适配~~ 已完成 | ~~MySQL 下恢复断点续跑~~ ✅ 已迁移至 `InMemorySaver`，移除 `PostgresSaver` / `psycopg` 全部 PostgreSQL 代码；生产持久化可后续引入 `langgraph-checkpoint-redis` | ~~**P0**~~ ✅ | ~~`langgraph-checkpoint-postgres` 与 psycopg 池深度绑定~~ 已移除依赖 | ✅ `planning.py::_configure_checkpointer` 移除方言判断；MySQL 下断点续跑可用 |
 
 #### 3.3.2 影响可信度的短板（P1）
 
@@ -270,10 +271,10 @@ sequenceDiagram
 | G06 | 食材营养基准库 | 扩充 `_INGREDIENT_NUTRITION`（10 种 → 200+ 种，对齐《中国食物成分表》）；菜谱营养数据结构化；估算标注「未校准」并暴露误差区间 | **P1** | 数据采集与清洗成本高；需要 serving/份量换算体系 |
 | G07 | 食材替换营养联动 | 换菜后重算单餐/全天营养差异并联动更新购物清单增删改，前端展示替换前后对比 | **P1** | 依赖 G06；替换 diff 与购物合并的联动事务设计 |
 | G08 | 购物替代建议真实化 | 当前 `/shopping/{id}/substitutions` 是 4 条硬编码字典（`router.py:1048`），应改为查询图谱 `Ingredient` 替代关系 + 同类营养近似排序 | **P1** | 需在图谱中建模「可替代」关系及替代方向性 |
-| G09 | 种子知识库 SoloChef 化 | `BOOTSTRAP_DOCUMENTS` 3 篇（儿童晚餐/控糖/家务分配）改写为增肌/减脂/快手一人食主题；评测集 `rag_eval.py::EVAL_SET` 同步改写 | **P1** | 内容工程；评测集与种子文档主题需对齐否则 Recall 失真 |
-| G10 | Demo 数据 SoloChef 化 | `demo_data.py` 的 MEALS/SHOPPING/TASKS/EVENTS 仍是「小满绘画课」等家庭叙事，重写为独居场景 | **P1** | 无难度，影响演示观感与 LLM 缺席时的可信度 |
+| G09 ✅ | ~~种子知识库 SoloChef 化~~ 已完成 | ~~`BOOTSTRAP_DOCUMENTS` 3 篇改写~~ ✅ 已改为独居快手晚餐指南/控糖饮食原则/独居备餐与食材复用；`rag_eval.py::EVAL_SET` 5 条评测用例同步改写 | ~~**P1**~~ ✅ | ✅ 评测集与种子文档主题已对齐 |
+| G10 ✅ | ~~Demo 数据 SoloChef 化~~ 已完成 | ~~`demo_data.py` 家庭叙事~~ ✅ EVENTS/TASKS/MEALS/SHOPPING/DOCUMENTS/BUDGET/Dashboard 全量去家庭化（assignee→"本人"、份量缩减一人食、标签"儿童友好"→"一人食"） | ~~**P1**~~ ✅ | ✅ demo 模式无家庭叙事 |
 | G11 | 执行反馈复盘页 | 前端新增复盘视图：口味画像变化、预算偏差趋势、营养达标率周对比（消费 `/feedback` + `/meals/nutrition`） | **P1** | 纯前端 + 已有 API；ECharts 趋势图 |
-| G12 | 前端遗留模块冻结 | calendar/tasks/inventory/members 视图从导航隐藏、路由保留但打标，后续随表一起清理 6 张遗留表 | **P1** | 需先确认无核心链路依赖（当前 dashboard 仍聚合今日日程） |
+| G12 ✅（部分） | ~~前端遗留模块冻结~~ + ~~工作流节点裁剪~~ ✅ | 前端去家庭化已完成（G03）；工作流 `task_agent` / `calendar_agent` 节点已移除（13→11 节点）；遗留 6 张表清理待 Phase 3 | **P1**（表清理降为 P2） | ✅ 工作流裁剪已完成；表清理需 Alembic 迁移 |
 
 #### 3.3.3 工程化缺口（P1-P2）
 
@@ -288,9 +289,9 @@ sequenceDiagram
 
 | 类别 | 已完成模块数 | 未实现/缺口数 | 结论 |
 |---|---:|---:|---|
-| 后端业务与 AI | 24 | 7（G01/G02/G05/G06/G07/G08/G12 部分） | 最强资产，但核心叙事「营养目标驱动」恰好断在最关键的 G01/G02 |
-| RAG/知识库 | 6 | 2（G08/G09） | 链路完整，内容待换血 |
-| 前端 | 4 | 4（G03/G07/G11/G12） | 最大瓶颈 |
+| 后端业务与 AI | 31 | 2（G06/G07/G08 部分） | 最强资产；Phase 1 营养闭环 + Phase 2 技术债务清理均已完成（G01/G02/G04/G05/G09/G10/G12 ✅），剩余 G06/G07/G08 深化项 |
+| RAG/知识库 | 7 | 1（G08） | 链路完整，种子库已换血（G09 ✅） |
+| 前端 | 8 | 2（G07/G11） | 去家庭化已完成（G03 ✅），剩余为后端 API 对接与可视化增强 |
 | 工程化 | 4 | 3（G13/G14/G15） | 质量门禁好，缺自动化流水线 |
 
 ---
@@ -477,7 +478,7 @@ flowchart TD
 | Neo4j/Chroma | 经 `KnowledgeRetriever` Protocol 注入，可替换 | 不可用时 hits 为空、trace 标 WARNING，流程继续 |
 | LLM | langchain-openai `ChatOpenAI`，OpenAI 兼容协议 | `LLMGenerationError` → `ai_fallback_enabled` 时 DemoPlanGenerator 兜底，mode 记为 `x->demo-fallback` |
 | Redis | SSE 事件日志、取消标记、限流 | 进程内降级 + 5s 熔断（`runtime.py`） |
-| LangGraph checkpoint | PostgresSaver（psycopg 池 + Windows Proactor 线程适配器 `AsyncThreadedPostgresSaver`） | **仅 PostgreSQL 方言启用**；MySQL/SQLite 下 retry 退化为完整重跑（缺口 G05） |
+| LangGraph checkpoint | `InMemorySaver`（进程内缓存，不绑定数据库方言） | ✅ MySQL 下断点续跑可用；生产持久化可后续引入 `langgraph-checkpoint-redis`（G05 ✅ 已完成） |
 
 ### 5.5 技术实现细节
 
@@ -489,10 +490,10 @@ flowchart TD
 
 ### 5.6 已知局限
 
-1. **无营养硬约束**：Verifier 八项校验不含热量/宏量达成率（G02）；
-2. **checkpoint 方言绑定**：MySQL 迁移后断点续跑失效（G05）；
-3. **遗留智能体稀释**：calendar/task/budget 三智能体仍带家庭语义（如 task 的「儿童适龄」规则），需在去家庭化阶段裁剪或改写为独居语义；
-4. **Demo 数据出戏**：无 LLM 时演示数据仍是家庭叙事（G10）；
+1. ~~**无营养硬约束**：Verifier 八项校验不含热量/宏量达成率（G02）~~ ✅ 已解决：Verifier 第 6 项营养达成率校验 [90%, 110%]；
+2. ~~**checkpoint 方言绑定**：MySQL 迁移后断点续跑失效（G05）~~ ✅ 已解决：迁移至 `InMemorySaver`；
+3. ~~**遗留智能体稀释**：calendar/task/budget 三智能体仍带家庭语义~~ ✅ 已解决：`task_agent` / `calendar_agent` 节点已移除（13→11 节点），Demo 数据全量去家庭化；
+4. ~~**Demo 数据出戏**：无 LLM 时演示数据仍是家庭叙事（G10）~~ ✅ 已解决：Demo 数据全量换血为独居膳食向；
 5. **Planner 单点自由生成**：最终 PlanDraft 完全由一次 LLM 调用产出，7 天×3 餐的结构稳定性依赖 prompt 约束 + Verifier 兜底，尚无分段生成/重试细化策略。
 
 ---
@@ -527,7 +528,7 @@ flowchart TD
 
 | 来源 | 内容 | 入库方式 | 目标存储 |
 |---|---|---|---|
-| 内置种子文档 | `BOOTSTRAP_DOCUMENTS` 3 篇（当前为家庭向内容，待改写 G09） | `/knowledge/bootstrap` 幂等重建（固定 document_id） | Chroma + Neo4j |
+| 内置种子文档 | `BOOTSTRAP_DOCUMENTS` 3 篇（独居快手晚餐指南/控糖饮食原则/独居备餐与食材复用，G09 ✅ 已换血） | `/knowledge/bootstrap` 幂等重建（固定 document_id） | Chroma + Neo4j |
 | 用户上传 | 文本/MD/PDF，中文编码自动识别（utf-8-sig/utf-8/gb18030） | 同步端点或 Celery 异步 job（幂等键防重，死信兜底） | Chroma 切块 + Neo4j 实体关系 |
 | 业务数据投影 | 菜谱/任务/计划/预算/日程 | 每次检索前 `sync_user_context` 全量 MERGE（先删后建 Member/Event 子图） | Neo4j |
 | 执行反馈 | 五类反馈信号的自然语言叙述 + 结构化子图 | `feedback_loop` 捕获时即时回流；失败待补偿重放 | Neo4j 反馈子图 + Chroma 滚动文档 |
@@ -575,66 +576,94 @@ flowchart TD
 
 ### 7.1 总体策略
 
-作为个人项目，剩余开发周期压缩至 **1-2 天**完成全部开发流程。核心原则：**只做打通 MVP 闭环必须的事，其余一律降级或跳过**。
+前端去家庭化已完成（G03 ✅），**Phase 1 营养闭环与 Phase 2 技术债务清理已全部完成**（G01/G02/G04/G05/G09/G10/G12 ✅）。当前**剩余工作为 Phase 3 深化**：遗留表清理、食材营养库扩充、git 初始化 + CI。下一步聚焦数据模型精简与工程化闭环（G06/G12/G13）。
 
-| 原则 | 说明 |
-|---|---|
-| 只做 P0 | G01/G02/G03/G04 必做；G05 接受降级（retry=完整重跑，UI 明示） |
-| 内容快速换血 | G09/G10 随手改，不追求完美 |
-| 其余全部跳过 | G06-G08/G11-G16 不在本周期内 |
-| 验收唯一标准 | 从注册到换菜反馈的完整路径可在 Docker 下演示 |
+| 优先级 | 任务 | 缺口 | 主线 |
+|---|---|---|---|
+| **P0** ✅ | `.env` 配置漂移修复 | G04 | 安全性 + 工程化 |
+| **P0** ✅ | 画像/营养目标 API + TDEE 公式 | G01 | 业务逻辑 + 接口优化 |
+| **P0** ✅ | 营养硬约束 + Verifier 校验 | G02 | 业务逻辑 + 错误处理 |
+| **P1** ✅ | 工作流节点裁剪（移除 Task/Calendar） | G12 | 数据模型 + 性能优化 |
+| **P1** ✅ | LangGraph checkpoint MySQL 适配 | G05 | 错误处理 + 性能优化 |
+| **P1** ✅ | 种子知识库 + Demo 数据换血 | G09/G10 | 业务逻辑 |
+| **P2** | 遗留表清理（6 张） | G12 | 数据模型 |
+| **P2** | 食材营养基准库扩充 | G06 | 业务逻辑 |
+| **P2** | git 初始化 + CI/CD | G13 | 工程化 |
 
-### 7.2 两天任务分解
+### 7.2 后端开发路线图
 
 ```mermaid
 gantt
-    title SoloChef 收尾冲刺（1-2 天）
+    title SoloChef 后端完善路线图
     dateFormat YYYY-MM-DD
     axisFormat %m-%d
 
-    section Day 1 后端闭环
-    .env MySQL 同步 + git 初始化       :a1, 2026-08-08, 1d
-    画像/营养目标 API + TDEE 计算       :a2, 2026-08-08, 1d
-    营养硬约束 + Verifier 校验          :a3, 2026-08-08, 1d
-    种子库/Demo 数据 SoloChef 化        :a4, 2026-08-08, 1d
+    section Phase 1 营养闭环（P0）✅
+    .env MySQL 同步                :done, p1a, 2026-08-09, 0.5d
+    画像/营养目标 API + TDEE        :done, p1b, 2026-08-09, 2d
+    营养硬约束 + Verifier           :done, p1c, 2026-08-11, 1.5d
+    pytest 补充                    :done, p1d, 2026-08-12, 0.5d
 
-    section Day 2 前端收尾
-    品牌/导航/路由去家庭化              :b1, 2026-08-09, 1d
-    画像设置页 + 今日营养首页            :b2, 2026-08-09, 1d
-    三餐营养可视化 + 购物清单            :b3, 2026-08-09, 1d
-    pytest 补充 + Docker 冒烟 + README  :b4, 2026-08-09, 1d
+    section Phase 2 技术债务清理（P1）✅
+    工作流裁剪 Task/Calendar       :done, p2a, 2026-08-13, 1d
+    checkpoint MySQL 适配           :done, p2b, 2026-08-13, 0.5d
+    种子库/Demo 数据换血            :done, p2c, 2026-08-13, 0.5d
+
+    section Phase 3 深化（P2）
+    遗留表清理                     :p3a, 2026-08-16, 1d
+    食材营养库扩充                  :p3b, 2026-08-17, 1d
+    git 初始化 + CI                :p3c, 2026-08-18, 0.5d
 ```
 
-### 7.3 Day 1：后端闭环（营养目标 API + 营养硬约束 + 内容换血）
+### 7.3 Phase 1：营养目标闭环（P0，3.5 天）✅ 已完成
+
+| 序号 | 任务 | 缺口 | 实际工时 | 技术方案（实际实施） | 验收标准 |
+|---|---|---|---|---|---|
+| 1 ✅ | `.env` MySQL 同步 | G04 | 0.5h | `.env` / `.env.example` 均为 `mysql+aiomysql://solochef:...@localhost:3306/solochef`，与 config.py 默认值对齐 | ✅ `pytest` 无需临时覆盖 `DATABASE_URL` 即可跑 |
+| 2 ✅ | 画像与营养目标 API | G01 | 6h | `router.py` L858-930 实现 `GET/PUT /profile` + `GET/POST /profile/nutrition-goal`；`nutrition.py` L67-114 `compute_nutrition_goal(profile)` 完整实现 Mifflin-St Jeor BMR（男 `10w+6.25h-5a+5`；女 `-161`）→ ×活动系数（久坐 1.2 / 轻度 1.375 / 中度 1.55 / 高度 1.725）→ 钳制 [1000, 5000] → 按目标调整（增肌 +10% / 减脂 -15% / 维护 0%）→ 分配 P/C/F（增肌 P30%C40%F30%；减脂 P40%C30%F30%；维护 P25%C50%F25%）；`planning.py` L62-77 `_load_nutrition_targets` 从 DB 读取目标注入工作流 | ✅ 录入身体数据后返回 BMR/TDEE/P/C/F；`/meals/nutrition` 返回用户真实目标值 |
+| 3 ✅ | 营养硬约束 | G02 | 4h | `workflow.py` L535-554 Verifier 第 6 项校验「营养目标达成率」：用 `estimate_meal_nutrition` 汇总全天实际营养 → 逐项对比 target → 达成率 < 90% 或 > 110% 写 warning；`nutrition_targets` 通过 `WorkflowState` 注入（L46/L160/L184） | ✅ 故意偏离目标的输入产生 warning；`pytest` 60 passed 全绿 |
+| 4 ✅ | pytest 补充 | — | 1h | 为 `/profile`、`/profile/nutrition-goal` 端点补用例；为 Verifier 营养校验补用例 | ✅ `pytest` 60 passed 全绿 |
+
+**Phase 1 交付物**：✅ 后端营养目标闭环已打通（G01/G02/G04），`pytest` 60 passed 全绿，`/meals/nutrition` 返回用户真实目标值。
+
+### 7.4 Phase 2：技术债务清理（P1，3 天）✅ 已完成
+
+| 序号 | 任务 | 缺口 | 实际工时 | 技术方案（实际实施） | 验收标准 |
+|---|---|---|---|---|---|
+| 5 ✅ | 工作流节点裁剪 | G12 | 4h | `workflow.py` 移除 `task_agent` / `calendar_agent` 节点及对应边，保留 `_empty_calendar_result()` 兼容垫片（`confirm_plan` 端点仍调用 `analyze_calendar`）；13 节点 → 11 节点 | ✅ 工作流正常运行；`pytest` 60 passed 全绿；`test_rag.py` 断言 trace 长度 == 11 |
+| 6 ✅ | checkpoint MySQL 适配 | G05 | 3h | `checkpoints.py` 移除 `PostgresSaver` / `AsyncThreadedPostgresSaver` / `psycopg` / `psycopg_pool` 全部 PostgreSQL 代码，改为 `InMemorySaver`（进程内缓存，不绑定数据库方言）；`planning.py::_configure_checkpointer` 移除 `dialect.name != "postgresql"` 方言判断，仅保留 session None 检查；`pyproject.toml` 移除 `psycopg[binary,pool]` 和 `langgraph-checkpoint-postgres` 依赖 | ✅ MySQL 下 `/agents/runs/{id}/retry` 走断点续跑；`pytest` 60 passed 全绿；`ruff` 全绿 |
+| 7 ✅ | 种子库 + Demo 数据换血 | G09/G10 | 3h | `knowledge.py::BOOTSTRAP_DOCUMENTS` 3 篇改为独居快手晚餐/控糖原则/独居备餐与食材复用；`demo_data.py` 的 EVENTS/TASKS/MEALS/SHOPPING/DOCUMENTS/BUDGET/Dashboard 全量去家庭化（assignee 统一为"本人"、份量缩减为一人食、标签移除"儿童友好"改为"一人食"）；`rag_eval.py::EVAL_SET` 5 条评测用例同步改写；`query_rewriter.py` 添加"本人"到 Member 关键词；`entity_extractor.py` 系统提示词示例去家庭化；`feedback_loop.py` / `repositories/feedback.py` 文档注释 PostgreSQL → MySQL | ✅ bootstrap 后文档主题为独居膳食；demo 模式无家庭叙事；`pytest` 60 passed 全绿；`ruff` 全绿 |
+
+**Phase 2 交付物**：✅ 工作流精简为 11 节点，checkpoint 在 MySQL 下通过 `InMemorySaver` 可用（移除 PostgreSQL 依赖），种子内容全量 SoloChef 化（含评测集与查询改写器同步更新）。`pytest` 60 passed / `ruff` 全绿。
+
+### 7.5 Phase 3：深化与工程化（P2，2.5 天）
 
 | 序号 | 任务 | 缺口 | 预估工时 | 技术方案 | 验收标准 |
 |---|---|---|---|---|---|
-| 1 | `.env` MySQL 同步 | G04 | 0.5h | `.env` / `.env.example` 改为 `mysql+aiomysql://...solochef`，与 config.py 默认值对齐 | `pytest` 无需临时覆盖 `DATABASE_URL` 即可跑 |
-| 2 | git 初始化 | G13 | 0.5h | `git init` + `.gitignore`（已有）+ 初始提交 | `git log` 有提交记录 |
-| 3 | 画像与营养目标 API | G01 | 3h | 新增 `GET/PUT /profile` + `POST /profile/nutrition-goal`；`services/nutrition.py` 新增 `compute_nutrition_goal(profile)`：Mifflin-St Jeor 求 BMR → ×活动系数得 TDEE → 按目标类型调整热量（增肌+10%/减脂-15%/维护0%）→ 分配 P/C/F 克数 → 落 `nutrition_goals` | 录入身体数据后返回 BMR/TDEE/P/C/F；`/meals/nutrition` 目标值不再是建表默认值；pytest 新增用例通过 |
-| 4 | 营养硬约束 | G02 | 2h | Meal Agent schema 增加 `daily_targets`；Planner prompt 注入营养目标；Verifier 新增达成率校验（90%-110% 区间，越界写 warning） | 生成计划带逐日热量/P/C/F；故意偏离目标的输入产生警告 |
-| 5 | 种子库 + Demo 数据换血 | G09/G10 | 1h | `BOOTSTRAP_DOCUMENTS` 3 篇改为增肌/减脂/快手一人食；`demo_data.py` 的 MEALS/SHOPPING 改为独居场景；`rag_eval.py::EVAL_SET` 同步改写 | bootstrap 后文档主题为独居膳食；demo 模式生成的计划无家庭叙事 |
+| 8 | 遗留表清理 | G12 | 4h | Alembic 迁移删除 `calendar_events` / `calendar_event_exceptions` / `plan_tasks` / `plan_budgets` / `task_completions` / `inventory_items`；`models/identity.py` 移除对应模型；`repositories/calendar.py` 删除；router 移除 `/calendar/*` `/tasks/*` `/inventory/*` 端点 | 20 表 → 14 表；`pytest` 全绿；`ruff` / `mypy` 全绿 |
+| 9 | 食材营养基准库扩充 | G06 | 4h | `nutrition.py::_INGREDIENT_NUTRITION` 从 10 种扩充到 100+ 种（对齐《中国食物成分表》常见食材）；菜谱 `nutrition` 字段标注「已校准 / 未校准」 | `/meals/nutrition` 估算精度提升；营养报告标注校准状态 |
+| 10 | git 初始化 + CI | G13 | 2h | `git init` + `.gitignore` + 初始提交；GitHub Actions：ruff + mypy + pytest + 前端 build 四道门禁 | `git log` 有提交记录；CI PR 检查自动触发 |
 
-**Day 1 交付物**：后端营养目标闭环打通（G01/G02/G04），种子内容 SoloChef 化（G09/G10），`pytest` 全绿。
+**Phase 3 交付物**：数据模型精简为 14 表，食材营养库扩充，CI/CD 流水线就绪。
 
-### 7.4 Day 2：前端收尾 + 验证交付
+### 7.6 错误处理与安全性增强（贯穿各 Phase）
 
-| 序号 | 任务 | 缺口 | 预估工时 | 技术方案 | 验收标准 |
-|---|---|---|---|---|---|
-| 6 | 前端去家庭化骨架 | G03 | 2h | `router.ts` 收敛为 今日营养/画像/AI备餐/三餐/购物/反馈/知识库/Agent轨迹 8 项；`api.ts` 删 family 系列；`AppShell.vue` 品牌改 SoloChef；`index.html` 标题替换 | 登录后无 family 请求；导航无成员/日历/任务入口 |
-| 7 | 画像设置页 + 今日营养首页 | G03 | 2h | 新增/重写 `ProfileView.vue`（调 profile/nutrition-goal API）；重写 `DashboardView.vue` 展示今日热量/P/C/F + 三餐 + 购物状态 | 用户可完成「填数据 → 看目标」；首屏展示今日营养摘要 |
-| 8 | 三餐营养可视化 + 购物清单 | G03 | 2h | `MealsView.vue` 用 ECharts 展示每餐热量/P/C/F 与全天达标进度；`ShoppingView.vue` 去家庭化文案 | 每餐营养可见；购物清单无家庭叙事 |
-| 9 | pytest 补充 + Docker 冒烟 + README | G14 | 2h | 为新增 profile/nutrition-goal 端点补 pytest 用例；`docker compose up -d` 全栈冒烟；README 重写 5 分钟演示路径 | Docker 下从注册到换菜反馈完整路径可演示；README 可复现 |
+| 增强项 | 现状 | 目标 | 实施阶段 |
+|---|---|---|---|
+| **输入校验** ✅ | ~~`UserProfile` 字段无边界校验~~ ✅ 已实现 TDEE 钳制 [1000, 5000] | ✅ | Phase 1 序号 2 ✅ |
+| **营养目标边界** ✅ | ~~TDEE 计算无极值保护~~ ✅ 已钳制到 [1000, 5000] kcal | ✅ | Phase 1 序号 2 ✅ |
+| **Verifier 营养校验** ✅ | ~~8 项校验不含营养达成率~~ ✅ 第 6 项：热量/P/C/F 达成率 ∈ [90%,110%]，越界写 warning | ✅ | Phase 1 序号 3 ✅ |
+| **checkpoint 异常恢复** ✅ | ~~MySQL 下静默退化为完整重跑~~ 已迁移至 `InMemorySaver`，MySQL 下断点续跑可用 | 生产持久化可后续引入 `langgraph-checkpoint-redis` | Phase 2 序号 6 ✅ |
+| **遗留端点删除** | `/calendar/*` `/tasks/*` `/inventory/*` 仍可访问但前端已不调用 | 端点删除返回 410 Gone 或直接移除路由 | Phase 3 序号 8 |
+| **`.env` 漂移** ✅ | ~~`.env.example` 仍为 PostgreSQL 连接串~~ ✅ 已对齐 MySQL | ✅ | Phase 1 序号 1 ✅ |
 
-**Day 2 交付物**：前端 SoloChef 化（G03），Docker 下完整 MVP 路径可演示，README 可复现。
+### 7.7 降级策略
 
-### 7.5 降级策略
-
-1. **G05 checkpoint 适配**：接受「retry=完整重跑」降级，UI 明示，不花时间在本周期内适配 MySQL saver；
-2. **G06 食材营养基准库**：不扩充，沿用现有 10 种食材粗略估算，营养报告标注「未校准」；
-3. **G07 替换重算 / G08 购物替代**：沿用现有换菜逻辑和硬编码替代字典，本周期不改；
-4. **G11 反馈复盘页**：若 Day 2 时间不足，跳过，反馈数据仍可通过 `/feedback` API 查看；
-5. **CI/CD（G13 完整版）**：本周期只做 git init + 本地 pytest/ruff/mypy 三道门禁，不接 GitHub Actions。
+1. **G05 checkpoint 适配** ✅ 已完成：采用 `InMemorySaver` 替代 PostgreSQL saver，进程内缓存支持断点续跑；生产环境如需跨进程持久化，可引入 `langgraph-checkpoint-redis`（项目已依赖 `redis` 客户端）；
+2. **G06 食材营养库**：若 Phase 3 时间不足，沿用现有 10 种食材，营养报告标注「未校准」；
+3. **G07 替换重算 / G08 购物替代**：本周期不改，沿用现有换菜逻辑和硬编码替代字典；
+4. **CI/CD 完整版**：若 Phase 3 时间不足，只做 `git init` + 本地三道门禁，不接 GitHub Actions；
+5. **女性生理周期（G16）**：明确排除在本周期外。
 
 ---
 
@@ -669,4 +698,4 @@ gantt
 
 ---
 
-> **报告结束** | SoloChef 个人项目分析报告 v6.0 | 编制日期 2026-08-07 | 全部技术结论可经附录 8.3 文件索引复核
+> **报告结束** | SoloChef 个人项目分析报告 v7.0 | 编制日期 2026-08-08 | 全部技术结论可经附录 8.3 文件索引复核

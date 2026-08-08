@@ -6,17 +6,35 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from app.core.config import get_settings
 
 settings = get_settings()
-engine = create_async_engine(settings.database_url, pool_pre_ping=True)
+
+# SQLite（含 aiosqlite）不支持连接池参数 pool_size/max_overflow/pool_timeout，
+# 需按方言区分构造引擎，避免测试内存库或本地 SQLite 文件库启动失败。
+_is_sqlite = settings.database_url.startswith("sqlite")
+_engine_kwargs: dict[str, object] = {
+    "pool_pre_ping": True,
+    "pool_recycle": settings.db_pool_recycle,
+}
+if not _is_sqlite:
+    _engine_kwargs.update(
+        pool_size=settings.db_pool_size,
+        max_overflow=settings.db_max_overflow,
+        pool_timeout=settings.db_pool_timeout,
+    )
+
+engine = create_async_engine(settings.database_url, **_engine_kwargs)
 SessionFactory = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
 
 
 async def get_db() -> AsyncIterator[AsyncSession]:
-    async with SessionFactory() as session:
+    session = SessionFactory()
+    try:
         try:
             yield session
         except Exception:
             await session.rollback()
             raise
+    finally:
+        await session.close()
 
 
 async def verify_database() -> None:

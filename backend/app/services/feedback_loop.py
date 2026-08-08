@@ -1,11 +1,11 @@
-"""执行反馈闭环：把执行结果从 PostgreSQL 回流到 Neo4j 与 Chroma。
+"""执行反馈闭环：把执行结果从 MySQL 回流到 Neo4j 与 Chroma。
 
 项目没有 ORM 事件钩子（``event.listen`` / ``after_commit``），因此"计划 → 执行 →
 反馈 → 检索/记忆"这一环必须显式编排。本模块提供唯一入口
 :meth:`FeedbackLoopService.capture`：
 
 1. **落库**：写入 ``plan_feedback`` 偏差表，记录主观反馈与客观偏差；
-2. **回图谱**：``(:Family)-[:HAS_FEEDBACK]->(:FeedbackSignal)-[:ABOUT]->(:KnowledgeEntity)``，
+2. **回图谱**：``(:User)-[:HAS_FEEDBACK]->(:FeedbackSignal)-[:ABOUT]->(:KnowledgeEntity)``，
    正/负向信号额外连到 ``Preference`` 节点；
 3. **回向量库**：按反馈类型维护一份滚动文档（固定 ``document_id``），
    下一轮 RAG 检索即可召回"上次这道菜太辣"这类历史反馈。
@@ -96,7 +96,7 @@ def extract_taste_tags(*sources: str | Iterable[str]) -> tuple[str, ...]:
 
 @dataclass(frozen=True, slots=True)
 class FeedbackSignal:
-    """一次执行反馈的规范化描述，跨 PostgreSQL / Neo4j / Chroma 共用。"""
+    """一次执行反馈的规范化描述，跨 MySQL / Neo4j / Chroma 共用。"""
 
     user_id: int
     feedback_type: str

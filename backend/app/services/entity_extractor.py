@@ -54,7 +54,7 @@ def _extract_with_regex(content: str) -> ExtractedKnowledge:
 
 _SYSTEM_PROMPT = (
     "你是 SoloChef 知识图谱抽取器。从用户给出的知识文本中抽取实体与关系。"
-    "实体为「类型: 值」形式（如 菜系: 儿童友好、约束: 不吃辣、角色: 女儿）。"
+    "实体为「类型: 值」形式（如 菜系: 一人食、约束: 不吃辣、角色: 本人）。"
     "关系为「主语 - 关系 - 宾语」三元组（如 虾仁滑蛋盖饭 - 需要 - 鸡蛋）。"
     "只输出 JSON，不要任何解释或 Markdown 代码块，结构严格如下："
     '{"entities": [{"kind": "类型", "value": "值"}], '

@@ -188,7 +188,6 @@ async def _sync_member_graph(job_id: str) -> None:
     from app.db.session import SessionFactory
     from app.repositories import (
         BackgroundJobRepository,
-        CalendarRepository,
         DomainRepository,
         PlanningRepository,
     )
@@ -202,12 +201,14 @@ async def _sync_member_graph(job_id: str) -> None:
         await jobs.mark_running(job)
         knowledge = KnowledgeService(get_settings())
         try:
-            events = await CalendarRepository(session).list_event_schemas_for_graph(job.user_id)
+            # Phase 3 清理：calendar_events / plan_tasks / plan_budgets 表已删除，
+            # 图谱同步上下文不再包含日程、任务与预算明细——events 恒为空，
+            # 预算改由 WeeklyPlan.budget 标量列派生（已并入 plans 节点，不再单独建 Budget 节点）。
+            events: list = []
             domain_repository = DomainRepository(session)
             planning = PlanningRepository(session)
             recipes = await domain_repository.list_recipes(job.user_id)
             plans = await planning.list_plans(job.user_id)
-            active = await planning.get_active_plan(job.user_id)
             domain: dict[str, list[dict[str, object]]] = {
                 "recipes": [
                     {
@@ -219,15 +220,6 @@ async def _sync_member_graph(job_id: str) -> None:
                     }
                     for item in recipes
                 ],
-                "tasks": [
-                    {
-                        "id": item.id,
-                        "title": item.title,
-                        "status": item.status,
-                        "category": item.category,
-                    }
-                    for item in (active.tasks if active else [])
-                ],
                 "plans": [
                     {
                         "id": item.id,
@@ -237,15 +229,6 @@ async def _sync_member_graph(job_id: str) -> None:
                     }
                     for item in plans
                 ],
-                "budgets": [
-                    {
-                        "id": active.budget_record.id,
-                        "limit": active.budget_record.limit,
-                        "estimated": active.budget_record.estimated,
-                    }
-                ]
-                if active and active.budget_record
-                else [],
             }
             await knowledge.graph_store.sync_user_context(job.user_id, None, events, domain)
             await jobs.mark_completed(

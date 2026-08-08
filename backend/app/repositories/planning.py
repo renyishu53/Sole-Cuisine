@@ -1,6 +1,8 @@
-"""Repository for plan persistence, agent run CRUD, and shopping/task item updates.
+"""Repository for plan persistence, agent run CRUD, and shopping item updates.
 
 去家庭化版：所有查询以 user_id 隔离。
+Phase 3 清理：移除 PlanTask / PlanBudget 持久化（表已删除），
+tasks 和 budget 仍由 PlanDraft → PlanningResponse 随计划返回，不再落表。
 """
 
 from typing import Any
@@ -11,13 +13,10 @@ from sqlalchemy.orm import selectinload
 
 from app.models.identity import (
     AgentRunRecord,
-    PlanBudget,
     PlanMealItem,
     PlanShoppingItem,
-    PlanTask,
     WeeklyPlan,
 )
-from app.schemas import TaskItem
 
 
 class PlanningRepository:
@@ -25,13 +24,6 @@ class PlanningRepository:
 
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
-
-    @staticmethod
-    def _task_values(item: dict[str, Any]) -> dict[str, Any]:
-        """Validate and strip non-persistent fields from task input dicts."""
-        return TaskItem.model_validate(item).model_dump(
-            exclude={"id", "assignee_member_id"}
-        )
 
     # ── Agent Run ──────────────────────────────────────────────────────
 
@@ -111,7 +103,7 @@ class PlanningRepository:
             is_active=True,
             prompt="手工维护的计划",
             budget=500,
-            summary="手工维护的餐食、购物、任务和预算",
+            summary="手工维护的餐食与购物",
             conflicts=[],
             suggestions=[],
         )
@@ -128,8 +120,6 @@ class PlanningRepository:
         plan_values: dict[str, Any],
         meals: list[dict[str, Any]],
         shopping: list[dict[str, Any]],
-        tasks: list[dict[str, Any]],
-        budget: dict[str, Any],
     ) -> WeeklyPlan:
         active = await self.get_active_plan(user_id)
         latest_version = await self._session.scalar(
@@ -156,10 +146,6 @@ class PlanningRepository:
             PlanShoppingItem(**{key: value for key, value in item.items() if key != "id"})
             for item in shopping
         ]
-        plan.tasks = [PlanTask(**self._task_values(item)) for item in tasks]
-        plan.budget_record = PlanBudget(
-            **{key: value for key, value in budget.items() if key != "id"}
-        )
         self._session.add(plan)
         await self._session.commit()
         await self._session.refresh(plan)
@@ -171,8 +157,6 @@ class PlanningRepository:
         *,
         meals: list[dict[str, Any]],
         shopping: list[dict[str, Any]],
-        tasks: list[dict[str, Any]],
-        budget: dict[str, Any],
     ) -> WeeklyPlan:
         plan.status = "confirmed"
         for meal_data in meals:
@@ -185,11 +169,6 @@ class PlanningRepository:
                     plan_id=plan.id, **{k: v for k, v in shop_data.items() if k != "id"}
                 )
             )
-        for task_data in tasks:
-            self._session.add(PlanTask(plan_id=plan.id, **self._task_values(task_data)))
-        self._session.add(
-            PlanBudget(plan_id=plan.id, **{k: v for k, v in budget.items() if k != "id"})
-        )
         await self._session.commit()
         await self._session.refresh(plan)
         return plan
@@ -239,30 +218,6 @@ class PlanningRepository:
             )
             for item in source.shopping_items
         ]
-        plan.tasks = [
-            PlanTask(
-                title=item.title,
-                assignee=item.assignee,
-                duration=item.duration,
-                due=item.due,
-                status=item.status,
-                category=item.category,
-                scheduled_start_at=item.scheduled_start_at,
-                scheduled_end_at=item.scheduled_end_at,
-                recurrence_type=item.recurrence_type,
-                recurrence_interval=item.recurrence_interval,
-            )
-            for item in source.tasks
-        ]
-        if source.budget_record is not None:
-            budget = source.budget_record
-            plan.budget_record = PlanBudget(
-                limit=budget.limit,
-                estimated=budget.estimated,
-                saved=budget.saved,
-                usage_percent=budget.usage_percent,
-                categories=dict(budget.categories),
-            )
         self._session.add(plan)
         await self._session.commit()
         return await self.get_plan(plan.id, plan.user_id) or plan
@@ -274,8 +229,6 @@ class PlanningRepository:
             .options(
                 selectinload(WeeklyPlan.meals),
                 selectinload(WeeklyPlan.shopping_items),
-                selectinload(WeeklyPlan.tasks),
-                selectinload(WeeklyPlan.budget_record),
             )
         )
 
@@ -296,7 +249,6 @@ class PlanningRepository:
             .options(
                 selectinload(WeeklyPlan.meals),
                 selectinload(WeeklyPlan.shopping_items),
-                selectinload(WeeklyPlan.tasks),
             )
         )
         return list((await self._session.scalars(statement)).all())
@@ -312,8 +264,6 @@ class PlanningRepository:
             .options(
                 selectinload(WeeklyPlan.meals),
                 selectinload(WeeklyPlan.shopping_items),
-                selectinload(WeeklyPlan.tasks),
-                selectinload(WeeklyPlan.budget_record),
             )
         )
 
@@ -360,7 +310,6 @@ class PlanningRepository:
             .options(
                 selectinload(WeeklyPlan.meals),
                 selectinload(WeeklyPlan.shopping_items),
-                selectinload(WeeklyPlan.tasks),
             )
         )
         return list((await self._session.scalars(statement)).all())
@@ -373,7 +322,7 @@ class PlanningRepository:
             .limit(1)
         )
 
-    # ── Shopping / Task item updates ───────────────────────────────────
+    # ── Shopping / Meal item updates ───────────────────────────────────
 
     async def get_shopping_item(self, item_id: int, user_id: int) -> PlanShoppingItem | None:
         return await self._session.scalar(
@@ -392,20 +341,6 @@ class PlanningRepository:
             .where(PlanMealItem.id == item_id, WeeklyPlan.user_id == user_id)
         )
 
-    async def get_task(self, task_id: int, user_id: int) -> PlanTask | None:
-        return await self._session.scalar(
-            select(PlanTask)
-            .join(WeeklyPlan)
-            .where(
-                PlanTask.id == task_id,
-                WeeklyPlan.user_id == user_id,
-            )
-        )
-
-    async def get_budget(self, user_id: int) -> PlanBudget | None:
-        plan = await self.get_active_plan(user_id)
-        return plan.budget_record if plan is not None else None
-
     async def create_meal(self, user_id: int, **values: Any) -> PlanMealItem:
         plan = await self.get_or_create_active_plan(user_id)
         item = PlanMealItem(plan_id=plan.id, **values)
@@ -422,39 +357,10 @@ class PlanningRepository:
         await self._session.refresh(item)
         return item
 
-    async def create_task(self, user_id: int, **values: Any) -> PlanTask:
-        plan = await self.get_or_create_active_plan(user_id)
-        item = PlanTask(plan_id=plan.id, **values)
-        self._session.add(item)
-        await self._session.commit()
-        await self._session.refresh(item)
-        return item
-
-    async def update_budget(self, user_id: int, **values: Any) -> PlanBudget:
-        plan = await self.get_or_create_active_plan(user_id)
-        budget = plan.budget_record
-        if budget is None:
-            budget = PlanBudget(
-                plan_id=plan.id,
-                limit=500,
-                estimated=0,
-                saved=500,
-                usage_percent=0,
-                categories={},
-            )
-            self._session.add(budget)
-        for key, value in values.items():
-            setattr(budget, key, value)
-        budget.saved = max(0, budget.limit - budget.estimated)
-        budget.usage_percent = min(100, round(budget.estimated / budget.limit * 100))
-        await self._session.commit()
-        await self._session.refresh(budget)
-        return budget
-
-    async def save_item(self, item: PlanMealItem | PlanShoppingItem | PlanTask) -> None:
+    async def save_item(self, item: PlanMealItem | PlanShoppingItem) -> None:
         await self._session.commit()
         await self._session.refresh(item)
 
-    async def delete_item(self, item: PlanMealItem | PlanShoppingItem | PlanTask) -> None:
+    async def delete_item(self, item: PlanMealItem | PlanShoppingItem) -> None:
         await self._session.delete(item)
         await self._session.commit()

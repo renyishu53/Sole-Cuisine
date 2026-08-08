@@ -184,10 +184,13 @@ class RuntimeStateService:
 
     async def get_turn_status(self, session_id: str) -> str | None:
         try:
-            return await self._redis.get(f"chat:status:{session_id}")
+            value = await self._redis.get(f"chat:status:{session_id}")
         except RedisError:
             self._mark_unavailable()
             return None
+        if value is None:
+            return None
+        return value.decode() if isinstance(value, bytes) else value
 
     async def clear_turn(self, session_id: str) -> None:
         """Clear event log, sequence counter and status for a chat turn."""

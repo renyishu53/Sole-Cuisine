@@ -264,7 +264,6 @@ class BudgetAgentResult(BaseModel):
 class DomainAgentBundle(BaseModel):
     meal: MealAgentResult
     shopping: ShoppingAgentResult
-    task: TaskAgentResult
     budget: BudgetAgentResult
     merged_constraints: list[str]
 
@@ -981,6 +980,64 @@ class WeeklyPlanDetail(BaseModel):
     shopping: list[ShoppingItem]
     tasks: list[TaskItem]
     budget_record: BudgetSummary | None = None
+
+
+# ---------- 用户画像与营养目标 ----------
+
+
+class UserProfileResponse(BaseModel):
+    """用户画像响应：身体数据 + 饮食偏好/忌口 + 预算偏好。"""
+
+    user_id: int
+    height_cm: float
+    weight_kg: float
+    age: int
+    gender: str
+    activity_level: str
+    goal_type: str
+    preferences: list[str]
+    constraints: list[str]
+    budget_limit: float
+    notes: str
+
+
+class UserProfileUpdate(BaseModel):
+    """用户画像更新请求，所有字段可选。"""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    height_cm: float | None = Field(default=None, ge=80, le=250)
+    weight_kg: float | None = Field(default=None, ge=20, le=500)
+    age: int | None = Field(default=None, ge=1, le=120)
+    gender: str | None = Field(default=None, pattern=r"^(male|female)$")
+    activity_level: str | None = Field(
+        default=None, pattern=r"^(sedentary|light|moderate|active)$"
+    )
+    goal_type: str | None = Field(default=None, pattern=r"^(bulk|cut|maintain)$")
+    preferences: list[str] | None = Field(default=None, max_length=20)
+    constraints: list[str] | None = Field(default=None, max_length=20)
+    budget_limit: float | None = Field(default=None, ge=0, le=10000)
+    notes: str | None = Field(default=None, max_length=500)
+
+    @model_validator(mode="after")
+    def ensure_update_has_values(self) -> "UserProfileUpdate":
+        if not self.model_fields_set:
+            raise ValueError("至少提供一个需要修改的字段")
+        return self
+
+
+class NutritionGoalResponse(BaseModel):
+    """营养目标快照响应：BMR/TDEE/目标热量/宏量分配。"""
+
+    user_id: int
+    goal_type: str
+    bmr: float
+    tdee: float
+    target_calories: float
+    protein_g: float
+    carb_g: float
+    fat_g: float
+    activity_level: str
 
 
 # ---------- 营养目标求解 ----------

@@ -1,7 +1,6 @@
 import asyncio
 import sys
 from collections.abc import AsyncIterator, Sequence
-from datetime import datetime
 from pathlib import Path
 from types import ModuleType
 from typing import Any, cast
@@ -44,7 +43,7 @@ class StubKnowledgeService:
         del query, user_id, members, events
         return [
             GraphSearchHit(
-                subject="小满",
+                subject="本人",
                 relation="HAS_CONSTRAINT",
                 target="不吃辣",
                 detail="工作日晚上",
@@ -58,7 +57,7 @@ class StubKnowledgeService:
         return [
             VectorSearchHit(
                 document_id="doc-1",
-                document_name="儿童友好晚餐.md",
+                document_name="独居快手晚餐指南.md",
                 category="菜谱",
                 content="虾仁滑蛋盖饭约 18 分钟，不使用辣椒。",
                 chunk_index=0,
@@ -94,65 +93,11 @@ def test_demo_langgraph_workflow_has_parallel_specialists() -> None:
     response = asyncio.run(workflow.run(request))
 
     names = {step.name for step in response.trace}
-    assert {"calendar_agent", "meal_agent", "shopping_agent", "task_agent", "budget_agent"} <= names
+    assert {"meal_agent", "shopping_agent", "budget_agent"} <= names
     assert len(response.meals) == 7
     assert response.budget.estimated <= request.budget
     assert response.calendar.has_conflict is False
     assert response.conflicts == []
-
-
-def test_calendar_agent_detects_real_overlap_and_suggests_slots() -> None:
-    member = MemberProfile(
-        id=7,
-        name="小满",
-        role="女儿",
-        avatar="满",
-        color="#5b8db8",
-        preferences=[],
-        constraints=[],
-        availability="工作日 18:00 后",
-    )
-    events = [
-        CalendarEvent(
-            id=11,
-            title="绘画课",
-            member="小满",
-            day="周三",
-            time="18:00",
-            category="course",
-            participant_ids=[7],
-            occurrence_start_at=datetime(2026, 8, 5, 18, 0),
-            occurrence_end_at=datetime(2026, 8, 5, 19, 0),
-        ),
-        CalendarEvent(
-            id=12,
-            title="体检",
-            member="小满",
-            day="周三",
-            time="18:30",
-            category="health",
-            participant_ids=[7],
-            occurrence_start_at=datetime(2026, 8, 5, 18, 30),
-            occurrence_end_at=datetime(2026, 8, 5, 19, 30),
-        ),
-    ]
-    workflow = SoloChefWorkflow(
-        knowledge=StubKnowledgeService(),
-        generator=DemoPlanGenerator(),
-    )
-
-    response = asyncio.run(
-        workflow.run(
-            PlanningRequest(prompt="避开已有日程安排", budget=500),
-            members=[member],
-            events=events,
-        )
-    )
-
-    assert response.calendar.has_conflict is True
-    assert response.calendar.conflicts[0].event_ids == [11, 12]
-    assert response.calendar.alternative_slots
-    assert response.conflicts == [response.calendar.conflicts[0].message]
 
 
 def test_graph_search_uses_non_conflicting_search_parameter() -> None:
@@ -162,7 +107,7 @@ def test_graph_search_uses_non_conflicting_search_parameter() -> None:
         async def data(self) -> list[dict[str, str]]:
             return [
                 {
-                    "subject": "小满",
+                    "subject": "本人",
                     "relation": "HAS_CONSTRAINT",
                     "target": "不吃辣",
                     "detail": "",
@@ -245,7 +190,7 @@ async def test_langgraph_resume_retries_only_pending_node() -> None:
 
     result = await workflow.run(None, run_id=run_id, resume=True)
 
-    assert len(result.trace) == 13
+    assert len(result.trace) == 11
     assert generator.calls == 2
     assert knowledge.calls == retrieval_calls
 

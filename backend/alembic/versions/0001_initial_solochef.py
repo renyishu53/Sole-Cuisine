@@ -14,6 +14,7 @@ from collections.abc import Sequence
 
 from alembic import op
 from app.db.base import Base
+import app.models  # noqa: F401
 
 # revision identifiers, used by Alembic.
 revision: str = "0001_initial_solochef"

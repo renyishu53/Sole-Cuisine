@@ -1,17 +1,15 @@
 import json
 from collections import defaultdict
 from collections.abc import Sequence
-from datetime import datetime, time, timedelta
 
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, get_settings
-from app.models import PlanMealItem, PlanTask, RecipeRecord
+from app.models import PlanMealItem, RecipeRecord
 from app.repositories import DomainRepository, PlanningRepository
 from app.repositories.feedback import FeedbackRepository, TasteProfile
-from app.schemas import CalendarEvent
 from app.schemas.domain import BudgetAnalytics
 from app.services.feedback_loop import (
     MEAL_REPLACEMENT,
@@ -94,35 +92,11 @@ class DomainOperationsService:
         if match is not None:
             await repository.save_recipe(match, like_count=match.like_count + 1)
 
-    async def auto_assign_tasks(
-        self,
-        session: AsyncSession,
-        *,
-        user_id: int,
-        events: list[CalendarEvent],
-    ) -> tuple[int, int, list[PlanTask]]:
-        """单用户任务排程：把未完成任务安排到可用时间段。"""
-        repository = DomainRepository(session)
-        tasks = await repository.get_active_tasks(user_id)
-        assigned = 0
-        skipped = 0
-        for task in tasks:
-            if task.status == "done":
-                skipped += 1
-                continue
-            slot = self._next_available_slot(task.duration, events, tasks)
-            if slot is not None:
-                task.scheduled_start_at, task.scheduled_end_at = slot
-                task.due = slot[0].strftime("%m-%d %H:%M")
-            assigned += 1
-        await repository.save_tasks()
-        return assigned, skipped, tasks
-
     async def budget_analytics(self, session: AsyncSession, user_id: int) -> BudgetAnalytics:
         repository = DomainRepository(session)
         expenses = await repository.list_expenses(user_id)
-        budget = await PlanningRepository(session).get_budget(user_id)
-        limit = budget.limit if budget is not None else 500
+        plan = await PlanningRepository(session).get_active_plan(user_id)
+        limit = plan.budget if plan is not None else 500
         actual = round(sum(item.amount for item in expenses), 2)
         by_category: dict[str, float] = defaultdict(float)
         monthly: dict[str, float] = defaultdict(float)
@@ -242,38 +216,8 @@ class DomainOperationsService:
             ingredients=["番茄", "鸡蛋", "面条"] if quick else ["鸡肉", "菌菇", "大米"],
         )
 
-    @staticmethod
-    def _next_available_slot(
-        duration_minutes: int,
-        events: list[CalendarEvent],
-        tasks: list[PlanTask],
-    ) -> tuple[datetime, datetime] | None:
-        """单用户：在日历事件与已排任务之间找到下一个可用时间段。"""
-        now = datetime.now().replace(second=0, microsecond=0)
-        busy: list[tuple[datetime, datetime]] = []
-        for event in events:
-            start = event.occurrence_start_at or event.start_at
-            end = event.occurrence_end_at or event.end_at
-            if start is not None and end is not None:
-                busy.append((start.replace(tzinfo=None), end.replace(tzinfo=None)))
-        for task in tasks:
-            if (
-                task.scheduled_start_at is not None
-                and task.scheduled_end_at is not None
-            ):
-                busy.append((task.scheduled_start_at, task.scheduled_end_at))
-        duration = timedelta(minutes=duration_minutes)
-        for day_offset in range(8):
-            day = (now + timedelta(days=day_offset)).date()
-            candidate = datetime.combine(day, time(18))
-            while candidate + duration <= datetime.combine(day, time(21, 30)):
-                if candidate >= now and not any(
-                    candidate < busy_end and candidate + duration > busy_start
-                    for busy_start, busy_end in busy
-                ):
-                    return candidate, candidate + duration
-                candidate += timedelta(minutes=30)
-        return None
+    # Phase 3 清理：任务排程（auto_assign_tasks / _next_available_slot）已移除，
+    # plan_tasks 表删除后不再有可排程的任务实体。餐食替换与预算分析仍保留。
 
 
 domain_operations_service = DomainOperationsService()

@@ -12,8 +12,6 @@ from app.schemas.domain import (
     BudgetAgentResult,
     MealAgentResult,
     ShoppingAgentResult,
-    TaskAgentResult,
-    TaskAssignmentCandidate,
 )
 
 ResultT = TypeVar("ResultT", bound=BaseModel)
@@ -114,36 +112,6 @@ class StructuredDomainAgentEngine:
         return await self._generate(
             ShoppingAgentResult,
             get_active("shopping"),
-            request,
-            members,
-            events,
-            fallback,
-        )
-
-    async def task(
-        self,
-        request: PlanningRequest,
-        members: Sequence[MemberProfile],
-        events: Sequence[CalendarEvent],
-    ) -> tuple[TaskAgentResult, str, str]:
-        candidates = [
-            TaskAssignmentCandidate(
-                member_id=member.id,
-                member_name=member.name,
-                availability=member.availability,
-                priority=index + 1,
-            )
-            for index, member in enumerate(members)
-        ]
-        fallback = TaskAgentResult(
-            strategy="按当前任务负担从低到高分配，并避开成员真实日程",
-            fairness_rule="任务数量优先，其次累计时长，儿童只分配适龄低风险任务",
-            candidates=candidates,
-            default_duration_minutes=20,
-        )
-        return await self._generate(
-            TaskAgentResult,
-            get_active("task"),
             request,
             members,
             events,

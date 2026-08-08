@@ -1,6 +1,6 @@
 """执行反馈仓储：``plan_feedback`` 偏差表的读写与口味画像聚合。
 
-本模块只负责 PostgreSQL 侧的持久化与统计；回流到 Neo4j / Chroma 的动作由
+本模块只负责 MySQL 侧的持久化与统计；回流到 Neo4j / Chroma 的动作由
 :mod:`app.services.feedback_loop` 编排，保持仓储层无外部依赖、可单测。
 """
 

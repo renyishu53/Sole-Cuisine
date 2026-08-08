@@ -24,11 +24,11 @@ from app.schemas import (
     VectorSearchHit,
 )
 
-# 评测集：与引导文档主题对齐，覆盖菜谱/营养/家务/成员约束/日程。
+# 评测集：与引导文档主题对齐，覆盖菜谱/营养/备餐/用户约束/日程。
 EVAL_SET: list[RagEvalCase] = [
     RagEvalCase(
-        query="儿童友好的快手晚餐有哪些？",
-        expected_documents=["儿童友好快手晚餐"],
+        query="独居快手晚餐有哪些？",
+        expected_documents=["独居快手晚餐指南"],
     ),
     RagEvalCase(
         query="控糖的饮食原则是什么？",
@@ -36,17 +36,17 @@ EVAL_SET: list[RagEvalCase] = [
         expected_entity_kinds=["Recipe", "Ingredient"],
     ),
     RagEvalCase(
-        query="任务如何公平分配？",
-        expected_documents=["任务公平分配"],
+        query="独居备餐怎么规划？",
+        expected_documents=["独居备餐与食材复用"],
     ),
     RagEvalCase(
-        query="孩子不吃辣，周三要快手晚餐，有什么推荐？",
-        expected_documents=["儿童友好快手晚餐", "控糖饮食原则"],
+        query="本人不吃辣，周三要快手晚餐，有什么推荐？",
+        expected_documents=["独居快手晚餐指南", "控糖饮食原则"],
         expected_entity_kinds=["Member"],
     ),
     RagEvalCase(
         query="工作日 30 分钟以内的晚餐怎么安排？",
-        expected_documents=["儿童友好快手晚餐", "任务公平分配"],
+        expected_documents=["独居快手晚餐指南", "独居备餐与食材复用"],
     ),
 ]
 

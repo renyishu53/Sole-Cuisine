@@ -1,6 +1,5 @@
 from base64 import b64encode
 from collections import defaultdict
-from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Any
 from uuid import UUID
@@ -16,15 +15,13 @@ from app.ai.prompts import agent_names, get_active, list_versions
 from app.api.dependencies import CurrentContext, OwnerContext, SessionDep
 from app.core.config import get_settings
 from app.models import (
-    CalendarEventRecord,
-    InventoryItem,
     NutritionGoal,
     RecipeRecord,
+    UserProfile,
     WeeklyPlan,
 )
 from app.repositories import (
     BackgroundJobRepository,
-    CalendarRepository,
     ConversationRepository,
     DomainRepository,
     FeedbackRepository,
@@ -33,16 +30,6 @@ from app.repositories import (
 from app.schemas import (
     AgentRun,
     AIServiceStatus,
-    BudgetUpdate,
-    CalendarConflict,
-    CalendarConflictCheckRequest,
-    CalendarConflictCheckResponse,
-    CalendarEvent,
-    CalendarEventCreate,
-    CalendarEventUpdate,
-    CalendarOccurrenceException,
-    CalendarOccurrenceExceptionCreate,
-    CalendarRecurrenceRule,
     Dashboard,
     KnowledgeDocument,
     KnowledgeSearchRequest,
@@ -58,9 +45,6 @@ from app.schemas import (
     ShoppingItem,
     ShoppingItemCreate,
     ShoppingItemUpdate,
-    TaskItem,
-    TaskItemCreate,
-    TaskItemUpdate,
     WeeklyPlanDetail,
     WeeklyPlanSummary,
 )
@@ -88,11 +72,9 @@ from app.schemas.domain import (
     FeedbackEntry,
     FeedbackOverviewResponse,
     FeedbackSyncInfo,
-    InventoryAdjustRequest,
-    InventoryEntry,
-    InventoryResponse,
     MealReplacementRequest,
     MealReplacementResponse,
+    NutritionGoalResponse,
     NutritionReport,
     PromptRegistryResponse,
     PromptVersionInfo,
@@ -103,29 +85,27 @@ from app.schemas.domain import (
     RecipeUpdate,
     ShoppingMergeResponse,
     SyncConsistencyResponse,
-    TaskAutoAssignResponse,
-    TaskCompleteRequest,
-    TaskCompletionResponse,
-    TaskExpansionItem,
-    TaskExpansionResponse,
-    TaskStatus,
     TasteProfileResponse,
+    UserProfileResponse,
+    UserProfileUpdate,
 )
-from app.services.calendar_planning import analyze_calendar
 from app.services.conversation import conversation_service
 from app.services.documents import DocumentParseError
 from app.services.domain import domain_operations_service
 from app.services.feedback_loop import (
     EXPENSE_RECORD,
     SHOPPING_VERIFICATION,
-    TASK_COMPLETION,
     FeedbackSignal,
     FeedbackSyncResult,
     extract_taste_tags,
     feedback_loop_service,
 )
 from app.services.knowledge import get_knowledge_service
-from app.services.nutrition import build_nutrition_report
+from app.services.nutrition import (
+    build_nutrition_report,
+    compute_nutrition_goal,
+    nutrition_goal_to_targets,
+)
 from app.services.planning import planning_service
 from app.services.runtime import runtime_state
 from app.worker import celery_app
@@ -168,11 +148,6 @@ async def dashboard(context: CurrentContext, session: SessionDep) -> Dashboard:
     if cached is not None:
         return Dashboard.model_validate(cached)
     now = datetime.now(UTC)
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    today_end = today_start + timedelta(days=1)
-    today_events = await CalendarRepository(session).list_events(
-        context.user_id, start_at=today_start, end_at=today_end
-    )
     active_plan = await PlanningRepository(session).get_active_plan(context.user_id)
     greeting = _time_based_greeting(now.hour) + f"，{context.display_name}"
     date_label = _format_date_label(now.date())
@@ -186,40 +161,38 @@ async def dashboard(context: CurrentContext, session: SessionDep) -> Dashboard:
         cost=0,
         reason="先在 AI 规划里生成周计划，解锁今晚推荐与采购清单。",
     )
+    # Phase 3 清理：calendar_events / plan_tasks / plan_budgets 表已删除，
+    # 仪表盘的日程、任务改为空值，预算由活跃计划的 budget 列派生（即本周限额）。
     empty_budget = BudgetSummary(estimated=0, limit=0, saved=0, usage_percent=0, categories={})
     if active_plan is not None:
-        plan_tasks = [_task_response(item) for item in active_plan.tasks]
         plan_meals = [_meal_response(item) for item in active_plan.meals]
         tonight = plan_meals[0] if plan_meals else placeholder_meal
-        plan_budget = (
-            _budget_response(active_plan.budget_record)
-            if active_plan.budget_record
-            else empty_budget
+        plan_budget = BudgetSummary(
+            estimated=0,
+            limit=active_plan.budget,
+            saved=active_plan.budget,
+            usage_percent=0,
+            categories={},
         )
-        week_progress = min(100, round(
-            len([t for t in plan_tasks if t.status == TaskStatus.DONE])
-            / max(len(plan_tasks), 1)
-            * 100
-        ))
-        notices = _build_real_notices(today_events, plan_tasks, plan_budget)
+        notices = _build_real_notices(plan_budget)
         response = Dashboard(
             user_name=context.display_name,
             greeting=greeting,
             date_label=date_label,
-            today_events=today_events,
-            tasks=plan_tasks,
+            today_events=[],
+            tasks=[],
             tonight_meal=tonight,
             budget=plan_budget,
             notices=notices,
-            week_progress=week_progress,
+            week_progress=0,
         )
     else:
-        notices = _build_real_notices(today_events, [], empty_budget, has_plan=False)
+        notices = _build_real_notices(empty_budget, has_plan=False)
         response = Dashboard(
             user_name=context.display_name,
             greeting=greeting,
             date_label=date_label,
-            today_events=today_events,
+            today_events=[],
             tasks=[],
             tonight_meal=placeholder_meal,
             budget=empty_budget,
@@ -250,23 +223,16 @@ def _format_date_label(today: date) -> str:
 
 
 def _build_real_notices(
-    today_events: Sequence[Any],
-    plan_tasks: Sequence[Any],
     budget: BudgetSummary,
     *,
     has_plan: bool = True,
 ) -> list[str]:
+    # Phase 3 清理：calendar_events / plan_tasks 表删除后，过期日程与任务提示不再产生，
+    # 仅保留预算使用率相关的提示。
     notices: list[str] = []
     if not has_plan:
         notices.append("尚未生成本周计划，前往 AI 规划一键生成")
         return notices
-    overdue = sum(
-        1
-        for item in today_events
-        if getattr(item, "end_at", None) and item.end_at < datetime.now(UTC)
-    )
-    if overdue:
-        notices.append(f"今天有 {overdue} 项已过期的安排，请尽快补办")
     if budget.usage_percent >= 90:
         notices.append(f"本周预算已使用 {budget.usage_percent}%，注意控制采购")
     elif budget.saved and budget.saved > 0:
@@ -283,7 +249,7 @@ async def _graph_domain_context(
     planning = PlanningRepository(session)
     recipes = await domain.list_recipes(user_id)
     plans = await planning.list_plans(user_id)
-    active = await planning.get_active_plan(user_id)
+    # Phase 3 清理：plan_tasks / plan_budgets 表已删除，图谱上下文只保留菜谱与计划。
     return {
         "recipes": [
             {
@@ -295,15 +261,6 @@ async def _graph_domain_context(
             }
             for item in recipes
         ],
-        "tasks": [
-            {
-                "id": item.id,
-                "title": item.title,
-                "status": item.status,
-                "category": item.category,
-            }
-            for item in (active.tasks if active else [])
-        ],
         "plans": [
             {
                 "id": item.id,
@@ -313,249 +270,7 @@ async def _graph_domain_context(
             }
             for item in plans
         ],
-        "budgets": [
-            {
-                "id": active.budget_record.id,
-                "limit": active.budget_record.limit,
-                "estimated": active.budget_record.estimated,
-            }
-        ]
-        if active and active.budget_record
-        else [],
     }
-
-
-def _conflict_detail(conflicts: list[CalendarConflict]) -> list[dict[str, Any]]:
-    return [item.model_dump(mode="json") for item in conflicts]
-
-
-def _record_recurrence(record: CalendarEventRecord) -> CalendarRecurrenceRule:
-    return CalendarRecurrenceRule(
-        type=record.recurrence_type,  # type: ignore[arg-type]
-        interval=record.recurrence_interval,
-        days_of_week=list(record.recurrence_days or []),
-        until=record.recurrence_until,
-        count=record.recurrence_count,
-    )
-
-
-@router.get("/calendar/events", response_model=list[CalendarEvent])
-async def calendar_events(
-    context: CurrentContext,
-    session: SessionDep,
-    start_at: Annotated[datetime | None, Query()] = None,
-    end_at: Annotated[datetime | None, Query()] = None,
-) -> list[CalendarEvent]:
-    try:
-        return await CalendarRepository(session).list_events(
-            context.user_id, start_at=start_at, end_at=end_at
-        )
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(exc),
-        ) from exc
-
-
-@router.post(
-    "/calendar/events",
-    response_model=CalendarEvent,
-    status_code=status.HTTP_201_CREATED,
-)
-async def create_calendar_event(
-    request: CalendarEventCreate, context: CurrentContext, session: SessionDep
-) -> CalendarEvent:
-    repository = CalendarRepository(session)
-    try:
-        conflicts = await repository.find_conflicts(
-            context.user_id,
-            start_at=request.start_at,
-            end_at=request.end_at,
-            recurrence=request.recurrence,
-        )
-        if conflicts:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail={
-                    "message": "calendar event conflicts with existing events",
-                    "conflicts": _conflict_detail(conflicts),
-                },
-            )
-        record = await repository.create_event(context.user_id, request)
-        response = await repository.get_event_schema(record.id, context.user_id)
-    except HTTPException:
-        raise
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(exc),
-        ) from exc
-    if response is None:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="event was not persisted",
-        )
-    await _invalidate_user_cache(context.user_id)
-    return response
-
-
-@router.get("/calendar/events/{event_id}", response_model=CalendarEvent)
-async def get_calendar_event(
-    event_id: int, context: CurrentContext, session: SessionDep
-) -> CalendarEvent:
-    response = await CalendarRepository(session).get_event_schema(event_id, context.user_id)
-    if response is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="calendar event not found",
-        )
-    return response
-
-
-@router.patch("/calendar/events/{event_id}", response_model=CalendarEvent)
-async def update_calendar_event(
-    event_id: int,
-    request: CalendarEventUpdate,
-    context: CurrentContext,
-    session: SessionDep,
-) -> CalendarEvent:
-    repository = CalendarRepository(session)
-    record = await repository.get_event(event_id, context.user_id)
-    if record is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="calendar event not found",
-        )
-    recurrence = request.recurrence or _record_recurrence(record)
-    try:
-        conflicts = await repository.find_conflicts(
-            context.user_id,
-            start_at=request.start_at or record.start_at,
-            end_at=request.end_at or record.end_at,
-            recurrence=recurrence,
-            exclude_event_id=record.id,
-        )
-        if conflicts:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail={
-                    "message": "calendar event conflicts with existing events",
-                    "conflicts": _conflict_detail(conflicts),
-                },
-            )
-        updated = await repository.update_event(record, request)
-        response = await repository.get_event_schema(updated.id, context.user_id)
-    except HTTPException:
-        raise
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(exc),
-        ) from exc
-    if response is None:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="event was not persisted",
-        )
-    await _invalidate_user_cache(context.user_id)
-    return response
-
-
-@router.delete("/calendar/events/{event_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_calendar_event(
-    event_id: int, context: CurrentContext, session: SessionDep
-) -> None:
-    repository = CalendarRepository(session)
-    record = await repository.get_event(event_id, context.user_id)
-    if record is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="calendar event not found",
-        )
-    await repository.delete_event(record)
-    await _invalidate_user_cache(context.user_id)
-
-
-@router.get(
-    "/calendar/events/{event_id}/exceptions",
-    response_model=list[CalendarOccurrenceException],
-)
-async def list_calendar_exceptions(
-    event_id: int, context: CurrentContext, session: SessionDep
-) -> list[CalendarOccurrenceException]:
-    repository = CalendarRepository(session)
-    if await repository.get_event(event_id, context.user_id) is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="日程不存在")
-    records = await repository.list_exceptions(event_id, context.user_id)
-    return [
-        CalendarOccurrenceException.model_validate(item, from_attributes=True) for item in records
-    ]
-
-
-@router.post(
-    "/calendar/events/{event_id}/exceptions",
-    response_model=CalendarOccurrenceException,
-    status_code=status.HTTP_201_CREATED,
-)
-async def create_calendar_exception(
-    event_id: int,
-    request: CalendarOccurrenceExceptionCreate,
-    context: CurrentContext,
-    session: SessionDep,
-) -> CalendarOccurrenceException:
-    repository = CalendarRepository(session)
-    event = await repository.get_event(event_id, context.user_id)
-    if event is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="日程不存在")
-    record = await repository.create_exception(event, request)
-    await _invalidate_user_cache(context.user_id)
-    return CalendarOccurrenceException.model_validate(record, from_attributes=True)
-
-
-@router.delete(
-    "/calendar/events/{event_id}/exceptions/{exception_id}",
-    status_code=status.HTTP_204_NO_CONTENT,
-)
-async def delete_calendar_exception(
-    event_id: int,
-    exception_id: int,
-    context: CurrentContext,
-    session: SessionDep,
-) -> None:
-    repository = CalendarRepository(session)
-    event = await repository.get_event(event_id, context.user_id)
-    if event is None or not await repository.delete_exception(exception_id, context.user_id):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="周期例外不存在")
-    await _invalidate_user_cache(context.user_id)
-
-
-@router.post(
-    "/calendar/conflicts/check",
-    response_model=CalendarConflictCheckResponse,
-)
-async def check_calendar_conflicts(
-    request: CalendarConflictCheckRequest,
-    context: CurrentContext,
-    session: SessionDep,
-) -> CalendarConflictCheckResponse:
-    try:
-        conflicts = await CalendarRepository(session).find_conflicts(
-            context.user_id,
-            start_at=request.start_at,
-            end_at=request.end_at,
-            recurrence=request.recurrence,
-            exclude_event_id=request.exclude_event_id,
-        )
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(exc),
-        ) from exc
-    return CalendarConflictCheckResponse(has_conflict=bool(conflicts), conflicts=conflicts)
-
-
-def _task_response(task: object) -> TaskItem:
-    return TaskItem.model_validate(task, from_attributes=True)
 
 
 def _meal_response(meal: object) -> MealItem:
@@ -564,10 +279,6 @@ def _meal_response(meal: object) -> MealItem:
 
 def _shopping_response(item: object) -> ShoppingItem:
     return ShoppingItem.model_validate(item, from_attributes=True)
-
-
-def _budget_response(budget: object) -> BudgetSummary:
-    return BudgetSummary.model_validate(budget, from_attributes=True)
 
 
 def _recipe_response(recipe: RecipeRecord) -> Recipe:
@@ -612,20 +323,6 @@ async def _taste_profile_response(session: SessionDep, user_id: int) -> TastePro
     )
 
 
-def _inventory_response(item: InventoryItem) -> InventoryEntry:
-    return InventoryEntry(
-        id=item.id,
-        name=item.name,
-        category=item.category,
-        quantity=item.quantity,
-        quantity_value=item.quantity_value,
-        unit=item.unit,
-        low_stock_threshold=item.low_stock_threshold,
-        note=item.note,
-        is_low_stock=item.quantity_value <= item.low_stock_threshold,
-    )
-
-
 def _chat_summary(chat: object) -> ChatSessionSummary:
     return ChatSessionSummary.model_validate(chat, from_attributes=True)
 
@@ -636,29 +333,6 @@ def _chat_message(message: object) -> ChatMessageResponse:
 
 def _job_response(job: object) -> BackgroundJobResponse:
     return BackgroundJobResponse.model_validate(job, from_attributes=True)
-
-
-async def _task_write_values(
-    request: TaskItemCreate | TaskItemUpdate,
-    context: CurrentContext,
-    session: SessionDep,
-    current: object | None = None,
-) -> dict[str, Any]:
-    values = request.model_dump(exclude_unset=isinstance(request, TaskItemUpdate))
-    if "assignee_member_id" in request.model_fields_set:
-        # 独居场景：任务归属用户本人
-        values["assignee"] = (
-            context.display_name if request.assignee_member_id is not None else "待分配"
-        )
-    start_at = values.get("scheduled_start_at", getattr(current, "scheduled_start_at", None))
-    end_at = values.get("scheduled_end_at", getattr(current, "scheduled_end_at", None))
-    if isinstance(start_at, datetime) and isinstance(end_at, datetime) and end_at <= start_at:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="scheduled_end_at must be after scheduled_start_at",
-        )
-    values.pop("assignee_member_id", None)
-    return values
 
 
 def _plan_summary_response(plan: WeeklyPlan) -> WeeklyPlanSummary:
@@ -673,7 +347,7 @@ def _plan_summary_response(plan: WeeklyPlan) -> WeeklyPlanSummary:
         summary=plan.summary,
         created_at=plan.created_at,
         meal_count=len(plan.meals),
-        task_count=len(plan.tasks),
+        task_count=0,
         shopping_count=len(plan.shopping_items),
     )
 
@@ -695,139 +369,9 @@ def _plan_detail_response(plan: WeeklyPlan) -> WeeklyPlanDetail:
         updated_at=plan.updated_at,
         meals=[_meal_response(meal) for meal in plan.meals],
         shopping=[_shopping_response(item) for item in plan.shopping_items],
-        tasks=[_task_response(task) for task in plan.tasks],
-        budget_record=_budget_response(plan.budget_record) if plan.budget_record else None,
+        tasks=[],
+        budget_record=None,
     )
-
-
-@router.get("/tasks", response_model=list[TaskItem])
-async def tasks(context: CurrentContext, session: SessionDep) -> list[TaskItem]:
-    plan = await PlanningRepository(session).get_active_plan(context.user_id)
-    return [_task_response(item) for item in plan.tasks] if plan is not None else []
-
-
-@router.post("/tasks", response_model=TaskItem, status_code=status.HTTP_201_CREATED)
-async def create_task(
-    request: TaskItemCreate, context: CurrentContext, session: SessionDep
-) -> TaskItem:
-    values = await _task_write_values(request, context, session)
-    item = await PlanningRepository(session).create_task(
-        context.user_id,
-        **values,
-    )
-    await _invalidate_user_cache(context.user_id)
-    return _task_response(item)
-
-
-@router.get("/tasks/expansions", response_model=TaskExpansionResponse)
-async def expand_tasks(
-    context: CurrentContext,
-    session: SessionDep,
-    days: int = 30,
-) -> TaskExpansionResponse:
-    """展开周期任务为未来 ``days`` 天的具体发生项（只读预览，不落库）。"""
-    days = max(1, min(days, 180))
-    items = await DomainRepository(session).expand_recurring_tasks(
-        context.user_id, days=days
-    )
-    return TaskExpansionResponse(
-        days=days,
-        count=len(items),
-        items=[TaskExpansionItem(**item) for item in items],
-    )
-
-
-@router.get("/tasks/{task_id}", response_model=TaskItem)
-async def get_task(task_id: int, context: CurrentContext, session: SessionDep) -> TaskItem:
-    item = await PlanningRepository(session).get_task(task_id, context.user_id)
-    if item is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="任务不存在")
-    return _task_response(item)
-
-
-@router.patch("/tasks/{task_id}", response_model=TaskItem)
-async def update_task(
-    task_id: int,
-    request: TaskItemUpdate,
-    context: CurrentContext,
-    session: SessionDep,
-) -> TaskItem:
-    repository = PlanningRepository(session)
-    item = await repository.get_task(task_id, context.user_id)
-    if item is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="任务不存在")
-    values = await _task_write_values(request, context, session, item)
-    for key, value in values.items():
-        setattr(item, key, value)
-    await repository.save_item(item)
-    await _invalidate_user_cache(context.user_id)
-    return _task_response(item)
-
-
-@router.delete("/tasks/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_task(task_id: int, context: CurrentContext, session: SessionDep) -> None:
-    repository = PlanningRepository(session)
-    item = await repository.get_task(task_id, context.user_id)
-    if item is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="任务不存在")
-    await repository.delete_item(item)
-    await _invalidate_user_cache(context.user_id)
-
-
-@router.post("/tasks/auto-assign", response_model=TaskAutoAssignResponse)
-async def auto_assign_tasks(context: CurrentContext, session: SessionDep) -> TaskAutoAssignResponse:
-    events = await CalendarRepository(session).list_event_schemas_for_graph(context.user_id)
-    assigned, skipped, tasks = await domain_operations_service.auto_assign_tasks(
-        session,
-        user_id=context.user_id,
-        events=events,
-    )
-    await _invalidate_user_cache(context.user_id)
-    return TaskAutoAssignResponse(
-        assigned=assigned,
-        skipped=skipped,
-        tasks=[_task_response(task) for task in tasks],
-    )
-
-
-@router.post("/tasks/{task_id}/complete", response_model=TaskCompletionResponse)
-async def complete_task(
-    task_id: int,
-    request: TaskCompleteRequest,
-    context: CurrentContext,
-    session: SessionDep,
-) -> TaskCompletionResponse:
-    planning = PlanningRepository(session)
-    task = await planning.get_task(task_id, context.user_id)
-    if task is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="任务不存在")
-    planned_duration = task.duration
-    completion = await DomainRepository(session).complete_task(
-        task,
-        user_id=context.user_id,
-        **request.completion_values(),
-    )
-    # 闭环：任务实际耗时与计划的偏差 + 主观反馈 → plan_feedback → Neo4j / Chroma
-    sync = await feedback_loop_service.capture(
-        session,
-        FeedbackSignal(
-            user_id=context.user_id,
-            feedback_type=TASK_COMPLETION,
-            subject=task.title,
-            content=request.notes,
-            reference_type="plan_task",
-            reference_id=task.id,
-            tags=extract_taste_tags(request.notes, [task.category]),
-            rating=request.rating,
-            planned_value=float(planned_duration),
-            actual_value=float(request.actual_duration or planned_duration),
-            source="user" if request.notes or request.rating else "auto",
-        ),
-    )
-    await _invalidate_user_cache(context.user_id)
-    response = TaskCompletionResponse.model_validate(completion, from_attributes=True)
-    response.feedback = _feedback_sync_info(sync)
-    return response
 
 
 @router.get("/meals", response_model=list[MealItem])
@@ -847,6 +391,94 @@ async def create_meal(
     return _meal_response(item)
 
 
+@router.get("/profile", response_model=UserProfileResponse)
+async def get_profile(context: CurrentContext, session: SessionDep) -> UserProfileResponse:
+    """获取用户画像，不存在时自动创建默认画像。"""
+    profile = await session.scalar(
+        select(UserProfile).where(UserProfile.user_id == context.user_id)
+    )
+    if profile is None:
+        profile = UserProfile(user_id=context.user_id)
+        session.add(profile)
+        await session.commit()
+        await session.refresh(profile)
+    return UserProfileResponse.model_validate(profile, from_attributes=True)
+
+
+@router.put("/profile", response_model=UserProfileResponse)
+async def update_profile(
+    request: UserProfileUpdate, context: CurrentContext, session: SessionDep
+) -> UserProfileResponse:
+    """更新用户画像，不存在时自动创建后更新。"""
+    profile = await session.scalar(
+        select(UserProfile).where(UserProfile.user_id == context.user_id)
+    )
+    if profile is None:
+        profile = UserProfile(user_id=context.user_id)
+        session.add(profile)
+    values = request.model_dump(exclude_unset=True)
+    for key, value in values.items():
+        setattr(profile, key, value)
+    await session.commit()
+    await session.refresh(profile)
+    await _invalidate_user_cache(context.user_id)
+    return UserProfileResponse.model_validate(profile, from_attributes=True)
+
+
+@router.get("/profile/nutrition-goal", response_model=NutritionGoalResponse)
+async def get_nutrition_goal(
+    context: CurrentContext, session: SessionDep
+) -> NutritionGoalResponse:
+    """获取当前营养目标快照，不存在时返回 404。"""
+    goal = await session.scalar(
+        select(NutritionGoal).where(NutritionGoal.user_id == context.user_id)
+    )
+    if goal is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="尚未计算营养目标，请先 POST /profile/nutrition-goal",
+        )
+    return NutritionGoalResponse.model_validate(goal, from_attributes=True)
+
+
+@router.post(
+    "/profile/nutrition-goal",
+    response_model=NutritionGoalResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def compute_nutrition_goal_endpoint(
+    context: CurrentContext, session: SessionDep
+) -> NutritionGoalResponse:
+    """根据用户画像按 Mifflin-St Jeor 公式计算营养目标并持久化。
+
+    若已存在营养目标则覆盖更新（``user_id`` 唯一约束）。
+    """
+    profile = await session.scalar(
+        select(UserProfile).where(UserProfile.user_id == context.user_id)
+    )
+    if profile is None:
+        profile = UserProfile(user_id=context.user_id)
+        session.add(profile)
+        await session.flush()
+    goal = await session.scalar(
+        select(NutritionGoal).where(NutritionGoal.user_id == context.user_id)
+    )
+    computed = compute_nutrition_goal(profile)
+    if goal is None:
+        goal = computed
+        session.add(goal)
+    else:
+        for field in (
+            "goal_type", "bmr", "tdee", "target_calories",
+            "protein_g", "carb_g", "fat_g", "activity_level",
+        ):
+            setattr(goal, field, getattr(computed, field))
+    await session.commit()
+    await session.refresh(goal)
+    await _invalidate_user_cache(context.user_id)
+    return NutritionGoalResponse.model_validate(goal, from_attributes=True)
+
+
 @router.get("/meals/nutrition", response_model=NutritionReport)
 async def meal_nutrition(
     context: CurrentContext, session: SessionDep
@@ -858,16 +490,7 @@ async def meal_nutrition(
     goal = await session.scalar(
         select(NutritionGoal).where(NutritionGoal.user_id == context.user_id)
     )
-    targets = (
-        {
-            "calories": goal.target_calories,
-            "protein_g": goal.protein_g,
-            "fat_g": goal.fat_g,
-            "carbs_g": goal.carb_g,
-        }
-        if goal is not None
-        else None
-    )
+    targets = nutrition_goal_to_targets(goal) if goal is not None else None
     recipes = await repository.list_recipes(context.user_id)
     meals = list(plan.meals) if plan is not None else []
     return build_nutrition_report(meals, recipes, targets)
@@ -986,11 +609,9 @@ async def update_shopping_item(
     for key, value in request.item_changes().items():
         setattr(item, key, value)
     await repository.save_item(item)
-    # 采购项从未购买切换为已购买时自动入库，并把核销结果回流为执行反馈
+    # 采购项从未购买切换为已购买时，把核销结果回流为执行反馈
+    # Phase 3 清理：库存入库（restock_from_shopping）随 inventory_items 表删除而移除
     if not was_purchased and item.purchased:
-        await DomainRepository(session).restock_from_shopping(
-            item, user_id=context.user_id
-        )
         actual_price = (
             request.actual_price if request.actual_price is not None else item.price
         )
@@ -1053,66 +674,6 @@ async def shopping_substitutions(
     }
     matches = next((values for key, values in substitutions.items() if key in item.name), [])
     return {"item_id": item.id, "name": item.name, "suggestions": matches}
-
-
-@router.get("/inventory", response_model=InventoryResponse)
-async def list_inventory(context: CurrentContext, session: SessionDep) -> InventoryResponse:
-    """返回家庭库存列表与低库存预警。"""
-    items = await DomainRepository(session).list_inventory(context.user_id)
-    entries = [_inventory_response(item) for item in items]
-    return InventoryResponse(
-        items=entries,
-        count=len(entries),
-        low_stock_count=sum(1 for entry in entries if entry.is_low_stock),
-    )
-
-
-@router.post("/inventory/adjust", response_model=InventoryEntry, status_code=status.HTTP_200_OK)
-async def adjust_inventory(
-    request: InventoryAdjustRequest,
-    context: CurrentContext,
-    session: SessionDep,
-) -> InventoryEntry:
-    """调整库存：delta 为正入库、为负出库。"""
-    item = await DomainRepository(session).adjust_inventory(
-        context.user_id,
-        name=request.name,
-        category=request.category,
-        delta=request.delta,
-        unit=request.unit,
-        quantity=request.quantity,
-        low_stock_threshold=request.low_stock_threshold,
-        note=request.note,
-    )
-    return _inventory_response(item)
-
-
-@router.delete("/inventory/{item_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_inventory(
-    item_id: int, context: CurrentContext, session: SessionDep
-) -> None:
-    deleted = await DomainRepository(session).delete_inventory(item_id, context.user_id)
-    if not deleted:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="库存项不存在")
-
-
-@router.get("/budget", response_model=BudgetSummary)
-async def budget(context: CurrentContext, session: SessionDep) -> BudgetSummary:
-    item = await PlanningRepository(session).get_budget(context.user_id)
-    if item is None:
-        return BudgetSummary(limit=500, estimated=0, saved=500, usage_percent=0, categories={})
-    return _budget_response(item)
-
-
-@router.patch("/budget", response_model=BudgetSummary)
-async def update_budget(
-    request: BudgetUpdate, context: CurrentContext, session: SessionDep
-) -> BudgetSummary:
-    item = await PlanningRepository(session).update_budget(
-        context.user_id,
-        **request.model_dump(exclude_unset=True),
-    )
-    return _budget_response(item)
 
 
 @router.get("/budget/expenses", response_model=list[Expense])
@@ -1347,7 +908,8 @@ async def search_knowledge(
     request: KnowledgeSearchRequest, context: CurrentContext, session: SessionDep
 ) -> KnowledgeSearchResponse:
     profiles: list[MemberProfile] = []
-    events = await CalendarRepository(session).list_event_schemas_for_graph(context.user_id)
+    # Phase 3 清理：calendar_events 表已删除，日程上下文恒为空
+    events: list = []
     domain = await _graph_domain_context(context.user_id, session)
     return await knowledge_service.search(
         request.query,
@@ -1365,7 +927,8 @@ async def bootstrap_knowledge(
 ) -> list[KnowledgeDocument]:
     try:
         profiles: list[MemberProfile] = []
-        events = await CalendarRepository(session).list_event_schemas_for_graph(context.user_id)
+        # Phase 3 清理：calendar_events 表已删除，日程上下文恒为空
+        events: list = []
         domain = await _graph_domain_context(context.user_id, session)
         return await knowledge_service.bootstrap(context.user_id, profiles, events, domain)
     except Exception as exc:
@@ -1673,7 +1236,8 @@ async def create_chat_turn(
     ):
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="请求过于频繁")
     members: list[MemberProfile] = []
-    events = await CalendarRepository(session).list_event_schemas_for_graph(context.user_id)
+    # Phase 3 清理：calendar_events 表已删除，日程上下文恒为空
+    events: list = []
     result = await conversation_service.run_turn(
         session,
         session_id=str(session_id),
@@ -1703,7 +1267,8 @@ async def stream_chat_turn(
     ):
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="请求过于频繁")
     members: list[MemberProfile] = []
-    events = await CalendarRepository(session).list_event_schemas_for_graph(context.user_id)
+    # Phase 3 清理：calendar_events 表已删除，日程上下文恒为空
+    events: list = []
     stream = conversation_service.stream_turn(
         session,
         session_id=str(session_id),
@@ -1766,7 +1331,8 @@ async def generate_weekly(
         update={"user_id": context.user_id}
     )
     profiles: list[MemberProfile] = []
-    events = await CalendarRepository(session).list_event_schemas_for_graph(context.user_id)
+    # Phase 3 清理：calendar_events 表已删除，日程上下文恒为空
+    events: list = []
     return await planning_service.generate(
         scoped_request, members=profiles, events=events, session=session
     )
@@ -1795,20 +1361,7 @@ async def confirm_plan(
             "message": "计划已存在（幂等确认）",
         }
 
-    profiles: list[MemberProfile] = []
-    current_events = await CalendarRepository(session).list_event_schemas_for_graph(
-        context.user_id
-    )
-    calendar_result = analyze_calendar(current_events, profiles)
-    if calendar_result.has_conflict:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={
-                "message": "当前家庭日程存在未解决冲突，计划暂不能确认",
-                "calendar": calendar_result.model_dump(mode="json"),
-            },
-        )
-
+    # Phase 3 清理：calendar_events 表删除后，确认计划不再做日程冲突校验
     payload = record.payload or {}
     budget_payload = payload.get("budget", {})
     try:
@@ -1824,8 +1377,6 @@ async def confirm_plan(
             },
             meals=payload.get("meals", []),
             shopping=payload.get("shopping", []),
-            tasks=payload.get("tasks", []),
-            budget=budget_payload,
         )
     except IntegrityError:
         await session.rollback()
@@ -1876,19 +1427,18 @@ async def agent_evaluate(
         return evaluate_plan(
             meals=[],
             shopping=[],
-            tasks=[],
             budget=None,
             members=members,
             plan_budget_limit=500.0,
         )
     meals = [_meal_response(item) for item in plan.meals]
     shopping = [_shopping_response(item) for item in plan.shopping_items]
-    tasks = [_task_response(item) for item in plan.tasks]
-    budget = _budget_response(plan.budget_record) if plan.budget_record else None
+    budget = BudgetSummary(
+        estimated=0, limit=plan.budget, saved=plan.budget, usage_percent=0, categories={}
+    )
     evaluation = evaluate_plan(
         meals=meals,
         shopping=shopping,
-        tasks=tasks,
         budget=budget,
         members=members,
         plan_budget_limit=plan.budget,
@@ -1949,7 +1499,8 @@ async def retry_agent_run(
     if resumed is not None:
         return resumed
     members: list[MemberProfile] = []
-    events = await CalendarRepository(session).list_event_schemas_for_graph(context.user_id)
+    # Phase 3 清理：calendar_events 表已删除，日程上下文恒为空
+    events: list = []
     budget_value = (record.payload or {}).get("budget", {})
     budget = float(budget_value.get("limit", 500)) if isinstance(budget_value, dict) else 500
     return await planning_service.generate(
@@ -2003,7 +1554,6 @@ async def compare_plans(
     for name, left_items, right_items, key in (
         ("meals", left.meals, right.meals, "day"),
         ("shopping", left.shopping_items, right.shopping_items, "name"),
-        ("tasks", left.tasks, right.tasks, "title"),
     ):
         before = {str(getattr(item, key)): values(item) for item in left_items}
         after = {str(getattr(item, key)): values(item) for item in right_items}

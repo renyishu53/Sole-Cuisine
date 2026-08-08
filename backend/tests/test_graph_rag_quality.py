@@ -55,7 +55,7 @@ def test_reranker_factory_loads_from_local_path(monkeypatch, tmp_path):
     assert backend is not None
     assert capture[0]["model_ref"] == str(model_dir)
     assert capture[0]["local_files_only"] is True
-    scores = backend.rerank("孩子不吃辣", ["虾仁滑蛋盖饭约18分钟", "番茄鸡蛋面"])
+    scores = backend.rerank("本人不吃辣", ["虾仁滑蛋盖饭约18分钟", "番茄鸡蛋面"])
     assert len(scores) == 2
     assert all(isinstance(s, float) for s in scores)
 
@@ -81,7 +81,7 @@ def test_reranker_factory_disabled_returns_none():
 
 
 def test_entity_extractor_regex_fallback_without_llm():
-    content = "菜系: 儿童友好\n约束: 不吃辣\n角色: 女儿"
+    content = "菜系: 一人食\n约束: 不吃辣\n角色: 本人"
     knowledge = extract_knowledge(content, Settings(_env_file=None, llm_provider="demo"))
     kinds = {kind for kind, _ in knowledge.entities}
     assert "菜系" in kinds and "约束" in kinds
@@ -94,7 +94,7 @@ def test_entity_extractor_regex_fallback_without_llm():
 
 def test_query_rewriter_rule_fallback_detects_kinds():
     spec = rewrite_query(
-        "孩子不吃辣，周三要快手晚餐？",
+        "本人不吃辣，周三要快手晚餐？",
         Settings(_env_file=None, llm_provider="demo"),
     )
     assert "Member" in spec.entity_kinds
@@ -130,7 +130,7 @@ def _response_with_docs(names):
         ],
         graph_hits=[
             GraphSearchHit(
-                subject="小满", relation="HAS_CONSTRAINT", target="不吃辣", detail=""
+                subject="本人", relation="HAS_CONSTRAINT", target="不吃辣", detail=""
             )
         ],
         elapsed_ms=1,
@@ -141,11 +141,11 @@ def _response_with_docs(names):
 @pytest.mark.asyncio
 async def test_rag_eval_recall_and_ndcg():
     case = rag_eval.RagEvalCase(
-        query="儿童友好的快手晚餐有哪些？",
-        expected_documents=["儿童友好快手晚餐"],
+        query="独居快手晚餐有哪些？",
+        expected_documents=["独居快手晚餐指南"],
         expected_entity_kinds=["Member"],
     )
-    service = FakeKnowledgeService(_response_with_docs(["儿童友好快手晚餐", "控糖饮食原则"]))
+    service = FakeKnowledgeService(_response_with_docs(["独居快手晚餐指南", "控糖饮食原则"]))
     response = await rag_eval.evaluate_retrieval(
         service, 1, Settings(_env_file=None), top_k=4, cases=[case]
     )
@@ -153,7 +153,7 @@ async def test_rag_eval_recall_and_ndcg():
     result = response.results[0]
     # 文档与实体类型均命中
     assert result.recall_at_k == 1.0
-    assert result.hit_document_names == ["儿童友好快手晚餐"]
+    assert result.hit_document_names == ["独居快手晚餐指南"]
     assert result.hit_entity_kinds == ["Member"]
     assert 0 < response.mean_ndcg_at_k <= 1.0
 
@@ -161,7 +161,7 @@ async def test_rag_eval_recall_and_ndcg():
 @pytest.mark.asyncio
 async def test_rag_eval_no_hit_yields_zero():
     case = rag_eval.RagEvalCase(query="无关问题", expected_documents=["不存在的文档"])
-    service = FakeKnowledgeService(_response_with_docs(["儿童友好快手晚餐"]))
+    service = FakeKnowledgeService(_response_with_docs(["独居快手晚餐指南"]))
     response = await rag_eval.evaluate_retrieval(
         service, 1, Settings(_env_file=None), top_k=4, cases=[case]
     )

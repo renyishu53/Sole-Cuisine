@@ -18,6 +18,7 @@ async def _create_tables() -> None:
 
     生产环境可改为 ``alembic upgrade head``；此处兜底保证新部署开箱即用。
     """
+    import app.models  # noqa: F401
     from app.db.base import Base
     from app.db.session import engine
 

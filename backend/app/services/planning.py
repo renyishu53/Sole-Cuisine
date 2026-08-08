@@ -4,10 +4,12 @@ from datetime import UTC, datetime
 from time import perf_counter
 from uuid import UUID, uuid4
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.llm import TokenSink, token_sink
 from app.ai.workflow import SoloChefWorkflow
+from app.models import NutritionGoal
 from app.repositories.feedback import FeedbackRepository
 from app.repositories.planning import PlanningRepository
 from app.schemas import (
@@ -20,6 +22,7 @@ from app.schemas import (
     PlanningResponse,
 )
 from app.services.checkpoints import checkpoint_runtime
+from app.services.nutrition import nutrition_goal_to_targets
 
 
 class PlanningService:
@@ -27,7 +30,12 @@ class PlanningService:
         self._workflow = workflow or SoloChefWorkflow()
 
     async def _configure_checkpointer(self, session: AsyncSession | None) -> bool:
-        if session is None or session.get_bind().dialect.name != "postgresql":
+        """配置工作流检查点保存器。
+
+        SoloChef 使用进程内 ``InMemorySaver``，不依赖数据库方言。
+        仅在存在数据库会话时启用——无会话场景（如单元测试 stub）跳过检查点。
+        """
+        if session is None:
             return False
         checkpointer = await checkpoint_runtime.get()
         self._workflow.set_checkpointer(checkpointer)
@@ -50,6 +58,24 @@ class PlanningService:
             return {}
         return {} if profile.is_empty else profile.as_prompt_payload()
 
+    @staticmethod
+    async def _load_nutrition_targets(
+        session: AsyncSession | None, user_id: int
+    ) -> dict[str, float]:
+        """读取用户营养目标，注入工作流 Verifier 做达成率校验。
+
+        无 Session 或未设置目标时返回空字典，Verifier 跳过营养校验。
+        """
+        if session is None:
+            return {}
+        try:
+            goal = await session.scalar(
+                select(NutritionGoal).where(NutritionGoal.user_id == user_id)
+            )
+        except Exception:  # noqa: BLE001 - 目标缺失不应阻断规划
+            return {}
+        return nutrition_goal_to_targets(goal) if goal is not None else {}
+
     async def generate(
         self,
         request: PlanningRequest,
@@ -61,6 +87,7 @@ class PlanningService:
     ) -> PlanningResponse:
         await self._configure_checkpointer(session)
         taste_profile = await self._load_taste_profile(session, request.user_id)
+        nutrition_targets = await self._load_nutrition_targets(session, request.user_id)
         run_id = uuid4()
         started = perf_counter()
         repo = PlanningRepository(session) if session is not None else None
@@ -96,6 +123,7 @@ class PlanningService:
                 run_id=run_id,
                 on_step=persist_step,
                 taste_profile=taste_profile,
+                nutrition_targets=nutrition_targets,
             )
         except asyncio.CancelledError:
             if repo is not None:

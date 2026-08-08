@@ -1,13 +1,12 @@
 """领域智能体专用评测。
 
-对餐食/购物/任务/预算四个领域智能体的产出进行离线指标计算，输出 0-100 分的
+对餐食/购物/预算三个领域智能体的产出进行离线指标计算，输出 0-100 分的
 综合评分与逐项明细，供前端"智能体评测"面板展示与回归对比。评测基于已落库的
-计划数据（餐食、购物、任务、预算）与成员画像，不依赖 LLM 在线调用，可重复执行。
+计划数据（餐食、购物、预算）与成员画像，不依赖 LLM 在线调用，可重复执行。
 
 评测维度：
 - 餐食（meal）：硬约束满足率——餐食食材不触碰成员过敏/忌口的比例。
 - 购物（shopping）：食材覆盖率——餐食所需食材出现在购物清单的比例。
-- 任务（task）：分配公平度——任务时长在成员间的离散程度（变异系数越低越公平）。
 - 预算（budget）：预算可控度——估算金额贴近限额且不超支的程度。
 """
 
@@ -15,7 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from app.schemas import MealItem, MemberProfile, ShoppingItem, TaskItem
+from app.schemas import MealItem, MemberProfile, ShoppingItem
 from app.schemas.domain import (
     AgentEvaluation,
     AgentMetricDetail,
@@ -120,31 +119,6 @@ def _score_shopping(
     )
 
 
-def _score_task(tasks: Sequence[TaskItem]) -> AgentMetricDetail:
-    """任务智能体评测：分配公平度（按时长变异系数）+ 已分配率。"""
-    issues: list[str] = []
-    assignable = [task for task in tasks if task.status != "done"]
-    if not assignable:
-        return AgentMetricDetail(score=100.0, metrics={"task_count": 0})
-
-    assigned = [task for task in assignable if task.assignee]
-    assigned_rate = len(assigned) / len(assignable) if assignable else 0.0
-    # SoloChef 单用户，公平度恒为 100
-    fairness = 100.0
-    score = round(assigned_rate * 40 + fairness * 60, 1)
-    if assigned_rate < 1.0:
-        issues.append(f"{len(assignable) - len(assigned)} 项任务未分配")
-    return AgentMetricDetail(
-        score=score,
-        metrics={
-            "task_count": len(assignable),
-            "assigned_rate": round(assigned_rate, 3),
-            "fairness_score": round(fairness, 1),
-        },
-        issues=issues,
-    )
-
-
 def _score_budget(budget: BudgetSummary | None, plan_budget_limit: float) -> AgentMetricDetail:
     """预算智能体评测：估算金额贴近限额且不超支。"""
     issues: list[str] = []
@@ -186,7 +160,6 @@ def evaluate_plan(
     *,
     meals: Sequence[MealItem],
     shopping: Sequence[ShoppingItem],
-    tasks: Sequence[TaskItem],
     budget: BudgetSummary | None,
     members: Sequence[MemberProfile],
     plan_budget_limit: float = 500.0,
@@ -195,17 +168,15 @@ def evaluate_plan(
     """对一份计划执行领域智能体评测，返回综合评分与明细。"""
     detail_meal = _score_meal(meals, members, bundle)
     detail_shopping = _score_shopping(meals, shopping)
-    detail_task = _score_task(tasks)
     detail_budget = _score_budget(budget, plan_budget_limit)
 
     details = {
         "meal": detail_meal,
         "shopping": detail_shopping,
-        "task": detail_task,
         "budget": detail_budget,
     }
-    # 权重：餐食 35 / 购物 25 / 任务 25 / 预算 15
-    weights = {"meal": 0.35, "shopping": 0.25, "task": 0.25, "budget": 0.15}
+    # 权重：餐食 40 / 购物 30 / 预算 30
+    weights = {"meal": 0.40, "shopping": 0.30, "budget": 0.30}
     overall = round(sum(details[name].score * weights[name] for name in weights), 1)
     issues: list[str] = []
     for name, detail in details.items():

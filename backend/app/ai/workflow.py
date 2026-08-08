@@ -31,10 +31,9 @@ from app.schemas.domain import (
     DomainAgentBundle,
     MealAgentResult,
     ShoppingAgentResult,
-    TaskAgentResult,
 )
-from app.services.calendar_planning import analyze_calendar
 from app.services.knowledge import get_knowledge_service
+from app.services.nutrition import estimate_meal_nutrition
 
 
 class WorkflowState(TypedDict, total=False):
@@ -43,6 +42,8 @@ class WorkflowState(TypedDict, total=False):
     events: list[CalendarEvent]
     #: 历史执行反馈聚合出的口味画像，餐食智能体据此做偏好学习
     taste_profile: dict[str, object]
+    #: 营养目标（TDEE + 宏量分配），由 planning_service 从 DB 加载后注入
+    nutrition_targets: dict[str, float]
     intent: dict[str, object]
     graph_hits: list[GraphSearchHit]
     vector_hits: list[VectorSearchHit]
@@ -52,7 +53,6 @@ class WorkflowState(TypedDict, total=False):
     draft: PlanDraft
     llm_mode: str
     validation_warnings: list[str]
-    calendar_result: CalendarAgentResult
     domain_results: Annotated[list[dict[str, object]], operator.add]
     domain_bundle: DomainAgentBundle
     domain_context: str
@@ -73,6 +73,19 @@ class KnowledgeRetriever(Protocol):
     async def retrieve_vector(
         self, query: str, user_id: int, top_k: int
     ) -> tuple[list[VectorSearchHit], str, str]: ...
+
+
+def _empty_calendar_result() -> CalendarAgentResult:
+    """独居场景移除 Calendar Agent 后，返回无冲突的空结果以保持响应结构兼容。
+
+    日程冲突检测属于遗留家庭域能力（Phase 3 清理 ``calendar_events`` 表时一并移除），
+    当前 ``confirm_plan`` 端点仍独立调用 ``analyze_calendar`` 做确认前复核。
+    """
+    return CalendarAgentResult(
+        status="clear",
+        has_conflict=False,
+        checked_event_count=0,
+    )
 
 
 class SoloChefWorkflow:
@@ -105,10 +118,8 @@ class SoloChefWorkflow:
         builder.add_node("graph_retriever", self._graph_retriever_node)
         builder.add_node("vector_retriever", self._vector_retriever_node)
         builder.add_node("coordinator", self._coordinator_node)
-        builder.add_node("calendar_agent", self._calendar_agent_node)
         builder.add_node("meal_agent", self._meal_agent_node)
         builder.add_node("shopping_agent", self._shopping_agent_node)
-        builder.add_node("task_agent", self._task_agent_node)
         builder.add_node("budget_agent", self._budget_agent_node)
         builder.add_node("domain_coordinator", self._domain_coordinator_node)
         builder.add_node("planner", self._planner_node)
@@ -118,16 +129,14 @@ class SoloChefWorkflow:
         builder.add_edge("intent", "graph_retriever")
         builder.add_edge("intent", "vector_retriever")
         builder.add_edge(["graph_retriever", "vector_retriever"], "coordinator")
-        builder.add_edge("coordinator", "calendar_agent")
         builder.add_edge("coordinator", "meal_agent")
         builder.add_edge("coordinator", "shopping_agent")
-        builder.add_edge("coordinator", "task_agent")
         builder.add_edge("coordinator", "budget_agent")
         builder.add_edge(
-            ["meal_agent", "shopping_agent", "task_agent", "budget_agent"],
+            ["meal_agent", "shopping_agent", "budget_agent"],
             "domain_coordinator",
         )
-        builder.add_edge(["calendar_agent", "domain_coordinator"], "planner")
+        builder.add_edge("domain_coordinator", "planner")
         builder.add_edge("planner", "verifier")
         builder.add_edge("verifier", "final_planner")
         builder.add_edge("final_planner", END)
@@ -148,6 +157,7 @@ class SoloChefWorkflow:
         on_step: Callable[[AgentStep], Awaitable[None]] | None = None,
         resume: bool = False,
         taste_profile: dict[str, object] | None = None,
+        nutrition_targets: dict[str, float] | None = None,
     ) -> PlanningResponse:
         state: WorkflowState = {}
         config: RunnableConfig | None = None
@@ -171,6 +181,7 @@ class SoloChefWorkflow:
                 "members": list(members),
                 "events": list(events),
                 "taste_profile": dict(taste_profile or {}),
+                "nutrition_targets": dict(nutrition_targets or {}),
                 "trace": [],
             }
         async for current in self._graph.astream(
@@ -195,7 +206,7 @@ class SoloChefWorkflow:
             budget=draft.budget,
             conflicts=draft.conflicts,
             suggestions=draft.suggestions,
-            calendar=state["calendar_result"],
+            calendar=_empty_calendar_result(),
             domain=state["domain_bundle"],
             sources=state["sources"],
             trace=state["trace"],
@@ -208,7 +219,7 @@ class SoloChefWorkflow:
             "type": "weekly_plan",
             "user_id": request.user_id,
             "budget": request.budget,
-            "requires": ["meals", "shopping", "tasks", "conflict_check"],
+            "requires": ["meals", "shopping", "budget"],
         }
         return {
             "intent": intent,
@@ -340,7 +351,7 @@ class SoloChefWorkflow:
                     start,
                     "planner",
                     "Planning Agent",
-                    "基于融合上下文生成结构化菜单、采购与家务计划",
+                    "基于融合上下文生成结构化菜单、采购与预算计划",
                     output,
                     status,
                 )
@@ -376,19 +387,6 @@ class SoloChefWorkflow:
             error,
         )
 
-    async def _task_agent_node(self, state: WorkflowState) -> dict[str, object]:
-        result, mode, error = await self._domain_engine.task(
-            state["request"], state.get("members", []), state.get("events", [])
-        )
-        return self._structured_specialist_result(
-            "task_agent",
-            "Task Agent",
-            "产出成员候选顺序、公平规则和默认任务时长",
-            result,
-            mode,
-            error,
-        )
-
     async def _budget_agent_node(self, state: WorkflowState) -> dict[str, object]:
         result, mode, error = await self._domain_engine.budget(
             state["request"], state.get("members", []), state.get("events", [])
@@ -401,34 +399,6 @@ class SoloChefWorkflow:
             mode,
             error,
         )
-
-    async def _calendar_agent_node(self, state: WorkflowState) -> dict[str, object]:
-        start = perf_counter()
-        result = analyze_calendar(
-            state.get("events", []),
-            state.get("members", []),
-        )
-        if result.has_conflict:
-            recommendation = (
-                f"发现 {len(result.conflicts)} 组真实日程冲突，"
-                f"已提供 {len(result.alternative_slots)} 个可用替代时段"
-            )
-        else:
-            recommendation = f"已复核 {result.checked_event_count} 个真实日程实例，未发现重叠"
-        return {
-            "calendar_result": result,
-            "specialist_outputs": [{"agent": "Calendar Agent", "recommendation": recommendation}],
-            "trace": [
-                self._step(
-                    start,
-                    "calendar_agent",
-                    "Calendar Agent",
-                    "检查真实成员日程冲突并搜索可用替代时段",
-                    result.model_dump(mode="json"),
-                    AgentStatus.WARNING if result.has_conflict else AgentStatus.COMPLETED,
-                )
-            ],
-        }
 
     @staticmethod
     def _structured_specialist_result(
@@ -466,7 +436,6 @@ class SoloChefWorkflow:
         }
         meal = MealAgentResult.model_validate(result_by_kind["meal"])
         shopping = ShoppingAgentResult.model_validate(result_by_kind["shopping"])
-        task = TaskAgentResult.model_validate(result_by_kind["task"])
         budget = BudgetAgentResult.model_validate(result_by_kind["budget"])
         merged_constraints = list(
             dict.fromkeys(
@@ -474,7 +443,6 @@ class SoloChefWorkflow:
                     *meal.constraints_applied,
                     f"单餐时长不超过 {meal.max_duration_minutes} 分钟",
                     f"预算预留 {budget.reserve:.2f} 元",
-                    task.fairness_rule,
                     shopping.strategy,
                 ]
             )
@@ -482,7 +450,6 @@ class SoloChefWorkflow:
         bundle = DomainAgentBundle(
             meal=meal,
             shopping=shopping,
-            task=task,
             budget=budget,
             merged_constraints=merged_constraints,
         )
@@ -495,7 +462,7 @@ class SoloChefWorkflow:
                     start,
                     "domain_coordinator",
                     "Domain Coordinator",
-                    "校验并合并四个领域 Agent 的结构化中间结果",
+                    "校验并合并三个领域 Agent 的结构化中间结果",
                     payload,
                 )
             ],
@@ -506,15 +473,7 @@ class SoloChefWorkflow:
         request = state["request"]
         draft = state["draft"]
         warnings: list[str] = []
-        calendar_result = state["calendar_result"]
         domain = state["domain_bundle"]
-        draft.conflicts = [item.message for item in calendar_result.conflicts]
-        for slot in calendar_result.alternative_slots:
-            suggestion = f"日程替代时段：{slot.label}"
-            if suggestion not in draft.suggestions:
-                draft.suggestions.append(suggestion)
-        if calendar_result.has_conflict:
-            warnings.append(f"发现 {len(calendar_result.conflicts)} 组未解决的真实日程冲突")
         if draft.budget.estimated > request.budget:
             warnings.append("模型估算超过预算上限，已将预算摘要限制到上限")
             draft.budget.estimated = request.budget
@@ -573,51 +532,33 @@ class SoloChefWorkflow:
         domain_category_total = sum(domain.budget.category_limits.values())
         if domain_category_total + domain.budget.reserve > domain.budget.limit + 0.01:
             warnings.append("Budget Agent 的分类限额与预留金额超过总预算")
-        allowed_assignees = {item.member_name for item in domain.task.candidates}
-        unknown_assignees = sorted(
-            {task.assignee for task in draft.tasks if task.assignee not in allowed_assignees}
-        )
-        if allowed_assignees and unknown_assignees:
-            warnings.append(f"任务包含未知负责人：{'、'.join(unknown_assignees)}")
-        member_by_id = {member.id: member for member in state.get("members", [])}
-        risky_terms = {"燃气", "刀", "高处", "电器维修", "开车", "重物"}
-        for task in draft.tasks:
-            member = member_by_id.get(task.assignee_member_id or -1)
-            if (
-                member is not None
-                and member.age_group in {"婴幼儿", "儿童"}
-                and any(term in f"{task.title} {task.category}" for term in risky_terms)
-            ):
-                warnings.append(f"儿童成员 {member.name} 被分配高风险任务：{task.title}")
-            if (
-                task.assignee_member_id is None
-                or task.scheduled_start_at is None
-                or task.scheduled_end_at is None
-            ):
-                continue
-            task_start = task.scheduled_start_at.replace(tzinfo=None)
-            task_end = task.scheduled_end_at.replace(tzinfo=None)
-            for event in state.get("events", []):
-                event_start = event.occurrence_start_at or event.start_at
-                event_end = event.occurrence_end_at or event.end_at
-                if (
-                    task.assignee_member_id not in event.participant_ids
-                    or event_start is None
-                    or event_end is None
-                ):
+        # 第 6 项：营养目标达成率校验
+        nutrition_targets = state.get("nutrition_targets") or {}
+        if nutrition_targets:
+            actual_nutrition: dict[str, float] = {}
+            for meal in draft.meals:
+                nutrition, _ = estimate_meal_nutrition(meal, [])
+                for key, value in nutrition.items():
+                    actual_nutrition[key] = actual_nutrition.get(key, 0.0) + value
+            off_target: list[str] = []
+            for key, target_value in nutrition_targets.items():
+                if target_value <= 0:
                     continue
-                if task_start < event_end.replace(tzinfo=None) and task_end > event_start.replace(
-                    tzinfo=None
-                ):
-                    warnings.append(f"任务“{task.title}”与日程“{event.title}”时间冲突")
-                    break
+                actual_value = round(actual_nutrition.get(key, 0.0), 1)
+                percent = actual_value / target_value * 100
+                if percent < 90.0 or percent > 110.0:
+                    direction = "不足" if percent < 90.0 else "超出"
+                    detail = f"目标 {target_value}，实际 {actual_value}，{percent:.0f}%"
+                    off_target.append(f"{key} {direction}（{detail}）")
+            if off_target:
+                warnings.append(f"营养目标偏差：{'；'.join(off_target)}")
+
         warnings = list(dict.fromkeys(warnings))
         output: dict[str, object] = {
             "constraints_checked": constraints,
             "forbidden_terms_checked": sorted(forbidden_terms),
             "warnings": warnings,
             "budget_usage_percent": draft.budget.usage_percent,
-            "calendar": calendar_result.model_dump(mode="json"),
             "domain": domain.model_dump(mode="json"),
         }
         return {
