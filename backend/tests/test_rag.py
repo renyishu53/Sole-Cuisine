@@ -298,7 +298,8 @@ def test_embedding_backend_loads_bge_m3_from_local_path(
         {"model_ref": str(model_dir), "device": "cpu", "local_files_only": True}
     ]
     vectors = cast(Any, backend.function)(["晚餐吃什么", "采购清单"])
-    assert vectors == [[0.1, 0.2], [0.1, 0.2]]
+    # embedding 函数返回原始模型输出（numpy 类数组），由 chroma 统一转 list
+    assert [v.tolist() for v in vectors] == [[0.1, 0.2], [0.1, 0.2]]
 
 
 def test_embedding_backend_never_downloads_implicitly(monkeypatch: pytest.MonkeyPatch) -> None:

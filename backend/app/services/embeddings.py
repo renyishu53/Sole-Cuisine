@@ -30,24 +30,37 @@ class EmbeddingBackend:
 
 
 class SentenceTransformerEmbedding:
-    """Chroma-compatible adapter around a SentenceTransformer model."""
+    """Chroma 1.5.9 兼容的 SentenceTransformer 适配器。
+
+    Chroma 的 ``Collection`` 在写入（documents）与查询（query）路径分别调用
+    ``__call__`` 与 ``embed_query``，且期望返回 **numpy 数组**——由 chroma 的
+    ``convert_np_embeddings_to_list`` 统一转成 list。因此这里直接返回
+    ``model.encode`` 的原始 numpy 输出，不要提前 ``tolist()``（否则 query 路径
+    会因 ``list`` 没有 ``.tolist()`` 而抛 ``AttributeError``）。
+    """
 
     def __init__(self, model: SupportsEncode) -> None:
         self._model = model
 
-    def __call__(self, input: list[str]) -> list[list[float]]:
-        vectors = self._model.encode(list(input), normalize_embeddings=True)
-        return [_to_list(vector) for vector in vectors]
+    #: 兼容 chroma 1.5.9 的 legacy embedding function 探测（避免弃用警告）
+    is_legacy: bool = False
+
+    def __call__(self, input: list[str]) -> Any:
+        return self._model.encode(list(input), normalize_embeddings=True)
+
+    def embed_documents(self, documents: list[str]) -> Any:
+        """Chroma 文档写入路径接口（与 ``__call__`` 等价）。"""
+        return self(list(documents))
+
+    def embed_query(self, input: str | list[str]) -> Any:
+        """Chroma 1.5.9 查询路径接口：查询文本（单条或列表）→ numpy 向量。"""
+        if isinstance(input, str):
+            input = [input]
+        return self(list(input))
 
     @staticmethod
     def name() -> str:
         return "bge-m3-sentence-transformers"
-
-
-def _to_list(vector: Any) -> list[float]:
-    if hasattr(vector, "tolist"):
-        return cast(list[float], vector.tolist())
-    return [float(value) for value in vector]
 
 
 def create_embedding_backend(settings: Settings) -> EmbeddingBackend:
