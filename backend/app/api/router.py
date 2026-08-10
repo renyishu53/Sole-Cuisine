@@ -1419,16 +1419,23 @@ async def agent_prompts(_: CurrentContext) -> PromptRegistryResponse:
 async def agent_evaluate(
     context: CurrentContext, session: SessionDep
 ) -> AgentEvaluation:
-    """对活跃计划执行领域智能体评测，输出综合评分与逐项明细。"""
+    """对活跃计划执行领域智能体评测，输出综合评分与逐项明细。
+
+    忌口约束来自单人 ``UserProfile.constraints``，是 SoloChef 忌口校验的唯一
+    数据源（替代了家庭时期的 ``MemberProfile``）。
+    """
     planning = PlanningRepository(session)
+    profile = await session.scalar(
+        select(UserProfile).where(UserProfile.user_id == context.user_id)
+    )
+    constraints = list(profile.constraints) if profile is not None else []
     plan = await planning.get_active_plan(context.user_id)
-    members: list[MemberProfile] = []
     if plan is None:
         return evaluate_plan(
             meals=[],
             shopping=[],
             budget=None,
-            members=members,
+            constraints=constraints,
             plan_budget_limit=500.0,
         )
     meals = [_meal_response(item) for item in plan.meals]
@@ -1440,7 +1447,7 @@ async def agent_evaluate(
         meals=meals,
         shopping=shopping,
         budget=budget,
-        members=members,
+        constraints=constraints,
         plan_budget_limit=plan.budget,
     )
     evaluation.prompt_versions = {

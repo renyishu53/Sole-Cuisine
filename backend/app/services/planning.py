@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.llm import TokenSink, token_sink
 from app.ai.workflow import SoloChefWorkflow
-from app.models import NutritionGoal
+from app.models import NutritionGoal, UserProfile
 from app.repositories.feedback import FeedbackRepository
 from app.repositories.planning import PlanningRepository
 from app.schemas import (
@@ -76,6 +76,28 @@ class PlanningService:
             return {}
         return nutrition_goal_to_targets(goal) if goal is not None else {}
 
+    @staticmethod
+    async def _load_user_profile_constraints(
+        session: AsyncSession | None, user_id: int
+    ) -> tuple[list[str], list[str]]:
+        """读取单人用户画像的忌口/过敏约束与饮食偏好，注入工作流。
+
+        SoloChef 去家庭化后，忌口校验的唯一数据源是 ``UserProfile.constraints``
+        与 ``preferences``。无 Session 或未建档时返回空列表，餐食智能体与
+        Verifier 退回家庭时期遗留的 ``members`` 兼容回退，不影响主链路。
+        """
+        if session is None:
+            return [], []
+        try:
+            profile = await session.scalar(
+                select(UserProfile).where(UserProfile.user_id == user_id)
+            )
+        except Exception:  # noqa: BLE001 - 画像缺失不应阻断规划
+            return [], []
+        if profile is None:
+            return [], []
+        return list(profile.constraints), list(profile.preferences)
+
     async def generate(
         self,
         request: PlanningRequest,
@@ -88,6 +110,9 @@ class PlanningService:
         await self._configure_checkpointer(session)
         taste_profile = await self._load_taste_profile(session, request.user_id)
         nutrition_targets = await self._load_nutrition_targets(session, request.user_id)
+        user_constraints, user_preferences = await self._load_user_profile_constraints(
+            session, request.user_id
+        )
         run_id = uuid4()
         started = perf_counter()
         repo = PlanningRepository(session) if session is not None else None
@@ -124,6 +149,8 @@ class PlanningService:
                 on_step=persist_step,
                 taste_profile=taste_profile,
                 nutrition_targets=nutrition_targets,
+                user_constraints=user_constraints,
+                user_preferences=user_preferences,
             )
         except asyncio.CancelledError:
             if repo is not None:

@@ -96,7 +96,6 @@ def test_demo_langgraph_workflow_has_parallel_specialists() -> None:
     assert {"meal_agent", "shopping_agent", "budget_agent"} <= names
     assert len(response.meals) == 7
     assert response.budget.estimated <= request.budget
-    assert response.calendar.has_conflict is False
     assert response.conflicts == []
 
 

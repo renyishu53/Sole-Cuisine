@@ -27,7 +27,6 @@ from app.schemas.domain import (
     AgentStatus,
     AgentStep,
     BudgetAgentResult,
-    CalendarAgentResult,
     DomainAgentBundle,
     MealAgentResult,
     ShoppingAgentResult,
@@ -40,6 +39,11 @@ class WorkflowState(TypedDict, total=False):
     request: PlanningRequest
     members: list[MemberProfile]
     events: list[CalendarEvent]
+    #: 单人用户画像的忌口/过敏约束（来自 UserProfile.constraints），SoloChef
+    #: 忌口校验的优先数据源；members 仅为家庭时期遗留兼容回退
+    user_constraints: list[str]
+    #: 单人用户画像的饮食偏好（来自 UserProfile.preferences）
+    user_preferences: list[str]
     #: 历史执行反馈聚合出的口味画像，餐食智能体据此做偏好学习
     taste_profile: dict[str, object]
     #: 营养目标（TDEE + 宏量分配），由 planning_service 从 DB 加载后注入
@@ -73,19 +77,6 @@ class KnowledgeRetriever(Protocol):
     async def retrieve_vector(
         self, query: str, user_id: int, top_k: int
     ) -> tuple[list[VectorSearchHit], str, str]: ...
-
-
-def _empty_calendar_result() -> CalendarAgentResult:
-    """独居场景移除 Calendar Agent 后，返回无冲突的空结果以保持响应结构兼容。
-
-    日程冲突检测属于遗留家庭域能力（Phase 3 清理 ``calendar_events`` 表时一并移除），
-    当前 ``confirm_plan`` 端点仍独立调用 ``analyze_calendar`` 做确认前复核。
-    """
-    return CalendarAgentResult(
-        status="clear",
-        has_conflict=False,
-        checked_event_count=0,
-    )
 
 
 class SoloChefWorkflow:
@@ -158,6 +149,8 @@ class SoloChefWorkflow:
         resume: bool = False,
         taste_profile: dict[str, object] | None = None,
         nutrition_targets: dict[str, float] | None = None,
+        user_constraints: Sequence[str] = (),
+        user_preferences: Sequence[str] = (),
     ) -> PlanningResponse:
         state: WorkflowState = {}
         config: RunnableConfig | None = None
@@ -182,6 +175,8 @@ class SoloChefWorkflow:
                 "events": list(events),
                 "taste_profile": dict(taste_profile or {}),
                 "nutrition_targets": dict(nutrition_targets or {}),
+                "user_constraints": list(user_constraints),
+                "user_preferences": list(user_preferences),
                 "trace": [],
             }
         async for current in self._graph.astream(
@@ -206,7 +201,6 @@ class SoloChefWorkflow:
             budget=draft.budget,
             conflicts=draft.conflicts,
             suggestions=draft.suggestions,
-            calendar=_empty_calendar_result(),
             domain=state["domain_bundle"],
             sources=state["sources"],
             trace=state["trace"],
@@ -364,6 +358,8 @@ class SoloChefWorkflow:
             state.get("members", []),
             state.get("events", []),
             state.get("taste_profile"),
+            constraints=state.get("user_constraints", []),
+            preferences=state.get("user_preferences", []),
         )
         return self._structured_specialist_result(
             "meal_agent",
@@ -484,6 +480,9 @@ class SoloChefWorkflow:
         constraints = [
             hit.target for hit in state.get("graph_hits", []) if hit.relation == "HAS_CONSTRAINT"
         ]
+        # SoloChef 单人画像忌口约束（来自 UserProfile.constraints，优先取用）；
+        # members 仅为家庭时期遗留兼容回退，SoloChef 真实运行时为空
+        constraints.extend(state.get("user_constraints", []))
         constraints.extend(
             constraint for member in state.get("members", []) for constraint in member.constraints
         )
@@ -569,7 +568,7 @@ class SoloChefWorkflow:
                     start,
                     "verifier",
                     "Verifier Agent",
-                    "执行预算、餐食完整性与成员忌口确定性校验",
+                    "执行预算、餐食完整性与用户忌口确定性校验",
                     output,
                     AgentStatus.WARNING if warnings else AgentStatus.COMPLETED,
                 )

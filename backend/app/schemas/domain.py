@@ -930,7 +930,6 @@ class PlanningResponse(BaseModel):
     budget: BudgetSummary
     conflicts: list[str]
     suggestions: list[str]
-    calendar: CalendarAgentResult
     domain: DomainAgentBundle
     sources: list[str]
     trace: list[AgentStep]

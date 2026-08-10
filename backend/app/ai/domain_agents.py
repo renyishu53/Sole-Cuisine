@@ -60,30 +60,45 @@ class StructuredDomainAgentEngine:
     async def meal(
         self,
         request: PlanningRequest,
-        members: Sequence[MemberProfile],
-        events: Sequence[CalendarEvent],
+        members: Sequence[MemberProfile] = (),
+        events: Sequence[CalendarEvent] = (),
         taste_profile: Mapping[str, object] | None = None,
+        constraints: Sequence[str] = (),
+        preferences: Sequence[str] = (),
     ) -> tuple[MealAgentResult, str, str]:
         """规划餐食筛选策略。
+
+        SoloChef 单人场景下，忌口/偏好约束来自 ``UserProfile.constraints`` /
+        ``preferences``（经 workflow state 注入，优先取用）；``members`` 为家庭
+        时期遗留参数，保留为空以兼容旧调用，当 ``constraints`` / ``preferences``
+        缺省时回退到从 ``members`` 提取。
 
         ``taste_profile`` 由 :meth:`app.repositories.FeedbackRepository.taste_profile`
         从历史执行反馈聚合而来。它同时作用于两条路径：LLM 路径写进提示词输入，
         确定性回退路径直接参与标签排序与排除项计算——保证没有 LLM 时反馈依然被学习。
         """
-        constraints = sorted({item for member in members for item in member.constraints})
-        preferences = sorted({item for member in members for item in member.preferences})
+        hard_constraints = (
+            sorted(set(constraints))
+            if constraints
+            else sorted({item for member in members for item in member.constraints})
+        )
+        user_preferences = (
+            sorted(set(preferences))
+            if preferences
+            else sorted({item for member in members for item in member.preferences})
+        )
         profile = taste_profile or {}
         liked = [str(tag) for tag in _as_sequence(profile.get("liked_tags"))]
         disliked = [str(tag) for tag in _as_sequence(profile.get("disliked_tags"))]
         rejected = [str(name) for name in _as_sequence(profile.get("rejected_dishes"))]
-        # 反馈学到的偏好排在成员静态偏好之前，负向标签一律剔除
+        # 反馈学到的偏好排在单人画像静态偏好之前，负向标签一律剔除
         merged_tags = [
-            tag for tag in (*liked, *preferences) if tag not in disliked
+            tag for tag in (*liked, *user_preferences) if tag not in disliked
         ]
         fallback = MealAgentResult(
             strategy=_meal_strategy(liked, disliked),
-            constraints_applied=constraints,
-            excluded_ingredients=sorted({*constraints, *disliked, *rejected}),
+            constraints_applied=hard_constraints,
+            excluded_ingredients=sorted({*hard_constraints, *disliked, *rejected}),
             preferred_tags=list(dict.fromkeys(merged_tags)) or ["日常友好", "营养均衡"],
             max_duration_minutes=25 if "快手" in request.prompt or "快手" in liked else 40,
         )
@@ -100,8 +115,8 @@ class StructuredDomainAgentEngine:
     async def shopping(
         self,
         request: PlanningRequest,
-        members: Sequence[MemberProfile],
-        events: Sequence[CalendarEvent],
+        members: Sequence[MemberProfile] = (),
+        events: Sequence[CalendarEvent] = (),
     ) -> tuple[ShoppingAgentResult, str, str]:
         fallback = ShoppingAgentResult(
             strategy="按标准化食材名和分类合并，同类数量保留可追溯来源",
@@ -121,8 +136,8 @@ class StructuredDomainAgentEngine:
     async def budget(
         self,
         request: PlanningRequest,
-        members: Sequence[MemberProfile],
-        events: Sequence[CalendarEvent],
+        members: Sequence[MemberProfile] = (),
+        events: Sequence[CalendarEvent] = (),
     ) -> tuple[BudgetAgentResult, str, str]:
         limit = request.budget
         fallback = BudgetAgentResult(
