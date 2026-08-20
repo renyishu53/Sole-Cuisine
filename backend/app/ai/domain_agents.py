@@ -7,12 +7,58 @@ from pydantic import BaseModel
 
 from app.ai.prompts import PromptVersion, get_active
 from app.core.config import Settings
-from app.schemas import CalendarEvent, MemberProfile, PlanningRequest
+from app.schemas import PlanningRequest
 from app.schemas.domain import (
     BudgetAgentResult,
+    BudgetSelfCheck,
     MealAgentResult,
     ShoppingAgentResult,
 )
+
+
+def reconcile_budget(result: BudgetAgentResult, budget_limit: float) -> BudgetAgentResult:
+    """确定性兜底：确保 分类限额之和 + 预留金额 == 周预算。
+
+    如果 AI 生成的结果不满足等式，自动按比例压缩/扩展各分类限额，
+    使等式成立。这样前端永远收不到"分类限额超预算"的硬冲突。
+    """
+    category_sum = sum(result.category_limits.values())
+    total_check = category_sum + result.reserve
+    expected = budget_limit
+
+    if abs(total_check - expected) < 0.01:
+        # 已经自洽，只填充 self_check
+        result.self_check = BudgetSelfCheck(
+            category_sum=round(category_sum, 2),
+            total_check=round(total_check, 2),
+            expected=expected,
+            matched=True,
+        )
+        return result
+
+    # 不满足等式，按比例调整分类限额
+    allocatable = max(0, expected - result.reserve)
+    if category_sum > 0:
+        scale = allocatable / category_sum
+        result.category_limits = {
+            k: round(v * scale, 2) for k, v in result.category_limits.items()
+        }
+    else:
+        # 分类限额全为 0，等额分配
+        n = len(result.category_limits) or 1
+        each = round(allocatable / n, 2)
+        result.category_limits = {k: each for k in result.category_limits}
+
+    # 重新计算并填充 self_check
+    new_category_sum = sum(result.category_limits.values())
+    result.self_check = BudgetSelfCheck(
+        category_sum=round(new_category_sum, 2),
+        total_check=round(new_category_sum + result.reserve, 2),
+        expected=expected,
+        matched=abs(new_category_sum + result.reserve - expected) < 0.01,
+    )
+    return result
+
 
 ResultT = TypeVar("ResultT", bound=BaseModel)
 
@@ -60,33 +106,29 @@ class StructuredDomainAgentEngine:
     async def meal(
         self,
         request: PlanningRequest,
-        members: Sequence[MemberProfile] = (),
-        events: Sequence[CalendarEvent] = (),
         taste_profile: Mapping[str, object] | None = None,
         constraints: Sequence[str] = (),
         preferences: Sequence[str] = (),
+        prep_time_max: int | None = None,
+        kitchenware: Sequence[str] = (),
     ) -> tuple[MealAgentResult, str, str]:
         """规划餐食筛选策略。
 
         SoloChef 单人场景下，忌口/偏好约束来自 ``UserProfile.constraints`` /
-        ``preferences``（经 workflow state 注入，优先取用）；``members`` 为家庭
-        时期遗留参数，保留为空以兼容旧调用，当 ``constraints`` / ``preferences``
-        缺省时回退到从 ``members`` 提取。
+        ``preferences``（经 workflow state 注入，优先取用），``constraints`` /
+        ``preferences`` 缺省时回退到空约束。
+
+        生活约束（阶段1）：``prep_time_max`` 直接决定 ``max_duration_minutes``，
+        优先于"快手"启发式；``kitchenware`` 进入硬约束，供规划器排除需要清单之外
+        厨具的菜式。
 
         ``taste_profile`` 由 :meth:`app.repositories.FeedbackRepository.taste_profile`
         从历史执行反馈聚合而来。它同时作用于两条路径：LLM 路径写进提示词输入，
         确定性回退路径直接参与标签排序与排除项计算——保证没有 LLM 时反馈依然被学习。
         """
-        hard_constraints = (
-            sorted(set(constraints))
-            if constraints
-            else sorted({item for member in members for item in member.constraints})
-        )
-        user_preferences = (
-            sorted(set(preferences))
-            if preferences
-            else sorted({item for member in members for item in member.preferences})
-        )
+        hard_constraints = sorted(set(constraints))
+        user_preferences = sorted(set(preferences))
+        available_tools = sorted(set(kitchenware))
         profile = taste_profile or {}
         liked = [str(tag) for tag in _as_sequence(profile.get("liked_tags"))]
         disliked = [str(tag) for tag in _as_sequence(profile.get("disliked_tags"))]
@@ -95,79 +137,92 @@ class StructuredDomainAgentEngine:
         merged_tags = [
             tag for tag in (*liked, *user_preferences) if tag not in disliked
         ]
+
+        # 生活约束：备餐时间上限优先于"快手"启发式；厨具清单进入硬约束
+        if prep_time_max is not None:
+            max_duration = max(5, min(240, prep_time_max))
+        else:
+            max_duration = 25 if "快手" in request.prompt or "快手" in liked else 40
+        life_constraints: list[str] = []
+        if available_tools:
+            life_constraints.append(f"仅使用厨具：{'、'.join(available_tools)}")
+
         fallback = MealAgentResult(
             strategy=_meal_strategy(liked, disliked),
-            constraints_applied=hard_constraints,
+            constraints_applied=[*hard_constraints, *life_constraints],
             excluded_ingredients=sorted({*hard_constraints, *disliked, *rejected}),
             preferred_tags=list(dict.fromkeys(merged_tags)) or ["日常友好", "营养均衡"],
-            max_duration_minutes=25 if "快手" in request.prompt or "快手" in liked else 40,
+            max_duration_minutes=max_duration,
         )
+
+        extra_payload: dict[str, object] = {}
+        if profile:
+            extra_payload["taste_profile"] = dict(profile)
+        if available_tools or prep_time_max is not None:
+            extra_payload["lifestyle"] = {
+                "prep_time_max_minutes": prep_time_max,
+                "kitchenware": available_tools,
+            }
         return await self._generate(
             MealAgentResult,
             get_active("meal"),
             request,
-            members,
-            events,
             fallback,
-            extra_payload={"taste_profile": dict(profile)} if profile else None,
+            extra_payload=extra_payload or None,
         )
 
     async def shopping(
         self,
         request: PlanningRequest,
-        members: Sequence[MemberProfile] = (),
-        events: Sequence[CalendarEvent] = (),
     ) -> tuple[ShoppingAgentResult, str, str]:
         fallback = ShoppingAgentResult(
             strategy="按标准化食材名和分类合并，同类数量保留可追溯来源",
             merge_keys=["name", "category"],
             preferred_categories=["蔬菜", "肉蛋奶", "主食", "调味品"],
-            purchase_windows=["周中补货", "周末集中采购"],
+            purchase_windows=["按需采购"],
         )
         return await self._generate(
             ShoppingAgentResult,
             get_active("shopping"),
             request,
-            members,
-            events,
             fallback,
         )
 
     async def budget(
         self,
         request: PlanningRequest,
-        members: Sequence[MemberProfile] = (),
-        events: Sequence[CalendarEvent] = (),
     ) -> tuple[BudgetAgentResult, str, str]:
         limit = request.budget
+        # 确定性回退：预留 10%，分类限额之和严格等于 limit - reserve
+        reserve = round(limit * 0.1, 2)
+        allocatable = round(limit - reserve, 2)
         fallback = BudgetAgentResult(
-            strategy="预留 10% 弹性金额，分类限额之和不超过总预算",
+            strategy="预留 10% 弹性金额，分类限额之和严格等于可分配总额",
             limit=limit,
-            reserve=round(limit * 0.1, 2),
+            reserve=reserve,
             warning_threshold_percent=85,
             category_limits={
-                "肉蛋奶": round(limit * 0.38, 2),
-                "蔬菜": round(limit * 0.24, 2),
-                "主食": round(limit * 0.15, 2),
-                "其他": round(limit * 0.13, 2),
+                "肉蛋奶": round(allocatable * 0.42, 2),
+                "蔬菜": round(allocatable * 0.26, 2),
+                "主食": round(allocatable * 0.17, 2),
+                "其他": round(allocatable - round(allocatable * 0.42, 2) - round(allocatable * 0.26, 2) - round(allocatable * 0.17, 2), 2),
             },
         )
-        return await self._generate(
+        result, mode, error = await self._generate(
             BudgetAgentResult,
             get_active("budget"),
             request,
-            members,
-            events,
             fallback,
         )
+        # 第二层防御：确定性兜底，确保分类之和 + 预留 == 周预算
+        result = reconcile_budget(result, limit)
+        return result, mode, error
 
     async def _generate(
         self,
         schema: type[ResultT],
         prompt: PromptVersion,
         request: PlanningRequest,
-        members: Sequence[MemberProfile],
-        events: Sequence[CalendarEvent],
         fallback: ResultT,
         extra_payload: Mapping[str, object] | None = None,
     ) -> tuple[ResultT, str, str]:
@@ -181,8 +236,6 @@ class StructuredDomainAgentEngine:
             return fallback, f"deterministic:v{prompt.version}", ""
         payload: dict[str, object] = {
             "request": request.model_dump(),
-            "members": [member.model_dump() for member in members],
-            "events": [event.model_dump(mode="json") for event in events[:30]],
         }
         if extra_payload:
             payload.update(extra_payload)

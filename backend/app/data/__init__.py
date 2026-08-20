@@ -32,6 +32,22 @@ class IngredientDatabase(TypedDict):
     ingredients: dict[str, IngredientNutrition]
 
 
+class SubstitutionPair(TypedDict):
+    """单条食材替代关系：原食材 → 替代食材 + 原因 + 相似度。"""
+
+    source: str
+    target: str
+    reason: str
+    similarity: float
+
+
+class SubstitutionDatabase(TypedDict):
+    """食材替代关系库顶层结构，含元信息与替代对列表。"""
+
+    _meta: dict[str, object]
+    pairs: list[list]  # [source, target, reason, similarity]
+
+
 @lru_cache(maxsize=1)
 def load_ingredient_nutrition() -> dict[str, IngredientNutrition]:
     """加载食材营养库，返回食材名 → 营养字典的映射。
@@ -42,3 +58,24 @@ def load_ingredient_nutrition() -> dict[str, IngredientNutrition]:
     with path.open(encoding="utf-8") as handle:
         database: IngredientDatabase = json.load(handle)
     return dict(database["ingredients"])
+
+
+@lru_cache(maxsize=1)
+def load_ingredient_substitutions() -> list[SubstitutionPair]:
+    """加载食材替代关系库，返回扁平化的替代对列表。
+
+    JSON 中存储为 ``[source, target, reason, similarity]`` 四元组数组，
+    此处转为字典列表便于上层消费。双向替代在图谱同步时显式写入正反两条边。
+    """
+    path = _DATA_DIR / "ingredient_substitutions.json"
+    with path.open(encoding="utf-8") as handle:
+        database: SubstitutionDatabase = json.load(handle)
+    return [
+        SubstitutionPair(
+            source=str(pair[0]),
+            target=str(pair[1]),
+            reason=str(pair[2]),
+            similarity=float(pair[3]),
+        )
+        for pair in database["pairs"]
+    ]

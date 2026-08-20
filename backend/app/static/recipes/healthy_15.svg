@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400" width="400" height="400">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#3a7d6b"/>
+      <stop offset="100%" stop-color="#2d6253"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="80%" cy="20%" r="50%">
+      <stop offset="0%" stop-color="rgba(255,255,255,.25)"/>
+      <stop offset="100%" stop-color="rgba(255,255,255,0)"/>
+    </radialGradient>
+  </defs>
+  <rect width="400" height="400" fill="url(#bg)"/>
+  <rect width="400" height="400" fill="url(#glow)"/>
+  <g transform="translate(280,150)" fill="rgba(255,255,255,.18)" stroke="rgba(255,255,255,.35)" stroke-width="2"><circle cx="0" cy="0" r="30"/><circle cx="0" cy="0" r="16" fill="none"/></g>
+  <g transform="translate(40,50)">
+    <rect width="68" height="28" rx="14" fill="#eaf3ec"/>
+    <text x="34" y="19" text-anchor="middle" font-family="Microsoft YaHei, PingFang SC, sans-serif" font-size="14" font-weight="700" fill="#1f574a">健康</text>
+  </g>
+  <g font-family="Microsoft YaHei, PingFang SC, sans-serif" text-anchor="middle">
+    <text x="200" y="210" font-size="34" font-weight="700" fill="#ffffff">鸡肉蔬菜三明治</text>
+    <text x="200" y="340" font-size="14" fill="#d3ebe3" opacity="0.85">SoloChef 营养菜谱</text>
+  </g>
+  <line x1="160" y1="360" x2="240" y2="360" stroke="rgba(255,255,255,.4)" stroke-width="2" stroke-linecap="round"/>
+</svg>

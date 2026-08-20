@@ -1,7 +1,6 @@
-"""Neo4j 图谱存储（去家庭化版，以 user_id 隔离）。
+"""Neo4j 图谱存储（以 user_id 隔离）。
 
-原 ``:Family`` / ``:Member`` 节点改为 ``:User`` 单节点；所有 Cypher 属性
-``family_id`` 改为 ``user_id``。
+
 """
 
 from collections.abc import Sequence
@@ -9,7 +8,7 @@ from collections.abc import Sequence
 from neo4j import AsyncDriver, AsyncGraphDatabase
 
 from app.core.config import Settings
-from app.schemas import CalendarEvent, GraphSearchHit
+from app.schemas import GraphSearchHit
 from app.services.query_rewriter import QuerySpec
 
 
@@ -30,19 +29,13 @@ class Neo4jGraphStore:
         self,
         user_id: int,
         profile: dict[str, object] | None,
-        events: Sequence[CalendarEvent],
         domain: dict[str, list[dict[str, object]]] | None = None,
     ) -> None:
-        """同步用户画像、日历事件与领域数据到 Neo4j。"""
+        """同步用户画像与领域数据到 Neo4j（SoloChef 去家庭化：无日程/成员节点）。"""
         driver = self._get_driver()
-        event_rows = [event.model_dump(mode="json") for event in events]
         async with driver.session() as session:
             await session.run(
                 "MATCH (m:Member {user_id: $user_id}) DETACH DELETE m",
-                user_id=user_id,
-            )
-            await session.run(
-                "MATCH (e:Event {user_id: $user_id}) DETACH DELETE e",
                 user_id=user_id,
             )
             await session.run(
@@ -62,19 +55,6 @@ class Neo4jGraphStore:
                 goal_type=(profile or {}).get("goal_type", ""),
                 preferences=(profile or {}).get("preferences", []),
                 constraints=(profile or {}).get("constraints", []),
-            )
-            await session.run(
-                """
-                UNWIND $events AS event
-                MERGE (e:Event {user_id: $user_id, id: event.id})
-                SET e.title = event.title, e.day = event.day, e.time = event.time,
-                    e.category = event.category, e.conflict = event.conflict
-                WITH e
-                MERGE (u:User {id: $user_id})
-                MERGE (u)-[:HAS_EVENT]->(e)
-                """,
-                user_id=user_id,
-                events=event_rows,
             )
             if domain:
                 await session.run(
@@ -273,6 +253,94 @@ class Neo4jGraphStore:
                 """,
                 user_id=user_id,
                 feedback_type=feedback_type,
+                limit=limit,
+            )
+            return list(await result.data())
+
+    async def sync_ingredient_substitutions(
+        self, pairs: Sequence[dict[str, object]]
+    ) -> int:
+        """把显式替代关系写入图谱：``(:Ingredient)-[:SUBSTITUTABLE_FOR {reason, similarity}]->(:Ingredient)``。
+
+        全局节点（不带 ``user_id``），因为食材替代关系是领域常识而非用户私有数据。
+        每对写入正反两条边，便于双向检索。返回写入的边数。
+
+        Args:
+            pairs: 替代对列表，每项含 ``source`` / ``target`` / ``reason`` / ``similarity``。
+
+        Returns:
+            成功写入的边数（双向计数）。
+        """
+        if not pairs:
+            return 0
+        rows = [
+            {
+                "source": str(pair["source"]),
+                "target": str(pair["target"]),
+                "reason": str(pair.get("reason", "")),
+                "similarity": float(pair.get("similarity", 0.8)),
+            }
+            for pair in pairs
+        ]
+        async with self._get_driver().session() as session:
+            result = await session.run(
+                """
+                UNWIND $rows AS row
+                MERGE (s:Ingredient {name: row.source})
+                MERGE (t:Ingredient {name: row.target})
+                MERGE (s)-[r:SUBSTITUTABLE_FOR]->(t)
+                SET r.reason = row.reason, r.similarity = row.similarity
+                MERGE (t)-[r2:SUBSTITUTABLE_FOR]->(s)
+                SET r2.reason = row.reason, r2.similarity = row.similarity
+                RETURN count(r) AS edges
+                """,
+                rows=rows,
+            )
+            record = await result.single()
+        return int(record["edges"]) if record else 0
+
+    async def find_substitutions(
+        self, ingredient_name: str, limit: int = 5
+    ) -> list[dict[str, object]]:
+        """按食材名查询图中的显式替代关系。
+
+        匹配策略：先精确等值，再退化为包含匹配（如"牛腩"匹配"牛肉"）。
+        返回 ``[{name, reason, similarity}]`` 列表，按相似度降序。
+
+        Args:
+            ingredient_name: 购物项名称（可能是"番茄 2 个"等带量描述）。
+            limit: 最多返回的替代数。
+
+        Returns:
+            替代建议列表，无命中时返回空列表。
+        """
+        async with self._get_driver().session() as session:
+            # 先精确等值匹配（reason/similarity 在关系 r 上）
+            result = await session.run(
+                """
+                MATCH (s:Ingredient {name: $name})-[r:SUBSTITUTABLE_FOR]->(t:Ingredient)
+                RETURN t.name AS name, coalesce(r.reason, '') AS reason,
+                       coalesce(r.similarity, 0.8) AS similarity
+                ORDER BY r.similarity DESC, t.name
+                LIMIT $limit
+                """,
+                name=ingredient_name.strip(),
+                limit=limit,
+            )
+            records = list(await result.data())
+            if records:
+                return records
+            # 退化：包含匹配（处理"番茄 2 个"等带量描述）
+            result = await session.run(
+                """
+                MATCH (s:Ingredient)-[r:SUBSTITUTABLE_FOR]->(t:Ingredient)
+                WHERE s.name CONTAINS $keyword
+                RETURN t.name AS name, coalesce(r.reason, '') AS reason,
+                       coalesce(r.similarity, 0.8) AS similarity
+                ORDER BY r.similarity DESC, t.name
+                LIMIT $limit
+                """,
+                keyword=ingredient_name.strip(),
                 limit=limit,
             )
             return list(await result.data())

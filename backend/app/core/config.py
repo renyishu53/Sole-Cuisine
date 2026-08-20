@@ -22,14 +22,18 @@ class Settings(BaseSettings):
     neo4j_uri: str = "bolt://localhost:7687"
     neo4j_user: str = "neo4j"
     neo4j_password: str = "solochef_password"
-    chroma_host: str = "localhost"
-    chroma_port: int = 8001
-    chroma_collection: str = "solochef_knowledge"
-    chroma_ssl: bool = False
+    milvus_host: str = "localhost"
+    milvus_port: int = 19530
+    milvus_collection: str = "solochef_knowledge"
+    milvus_user: str = ""
+    milvus_password: str = ""
     rag_enabled: bool = True
     rag_top_k: int = 4
     chunk_size: int = 600
     chunk_overlap: int = 100
+    # 应用启动时是否自动执行知识库 bootstrap（遍历 knowledge_docs/ 幂等入库）。
+    # 依赖 Milvus/Neo4j 已启动；基础服务不可达时降级跳过，不阻断启动。
+    auto_bootstrap_knowledge: bool = True
 
     # ── 语义向量模型（BGE-M3 可选增强）─────────────────────────────
     embedding_provider: str = "auto"  # auto | bge-m3 | default
@@ -49,7 +53,27 @@ class Settings(BaseSettings):
     llm_model: str = "deepseek-chat"
     llm_base_url: str = "https://api.deepseek.com/v1"
     llm_timeout_seconds: float = 60.0
+    plan_generation_timeout_seconds: float = 45.0
     ai_fallback_enabled: bool = True
+    # 领域智能体默认使用确定性规则，避免与主规划器串联多次外部模型等待。
+    domain_agents_llm_enabled: bool = False
+    # 图谱实体抽取是增强功能。默认使用本地正则抽取，避免启动期因外部 LLM
+    # 响应格式或网络问题阻塞 API；需要更丰富关系时可显式设为 true。
+    entity_extraction_llm_enabled: bool = False
+
+    # ── 多模态视觉模型（Qwen-VL 可选增强）─────────────────────────
+    vlm_enabled: bool = False
+    vlm_api_key: str = ""
+    vlm_model: str = "qwen-vl-max"
+    vlm_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    vlm_timeout_seconds: float = 90.0
+    vlm_max_image_size: int = 5  # 单张图片最大 MB
+    vlm_max_image_dimension: int = 2048  # 长边像素上限
+    vlm_rate_limit_per_minute: int = 10
+    # P3 Planner 分段生成：meals → shopping → budget 三阶段独立 LLM 调用。
+    # 默认关闭——当前 Verifier 兜底已够用；启用后每阶段聚焦小 prompt 提升质量，
+    # 任一阶段失败自动回退到单次生成模式（向后兼容）。
+    planner_segmented_enabled: bool = False
     jwt_secret_key: str = "dev-only-change-this-secret-key-now"
     jwt_algorithm: str = "HS256"
     jwt_issuer: str = "solochef-api"
@@ -78,6 +102,10 @@ class Settings(BaseSettings):
     @property
     def real_llm_enabled(self) -> bool:
         return self.llm_provider != "demo" and bool(self.llm_api_key)
+
+    @property
+    def vlm_enabled_real(self) -> bool:
+        return self.vlm_enabled and bool(self.vlm_api_key)
 
     @property
     def jwt_uses_development_secret(self) -> bool:

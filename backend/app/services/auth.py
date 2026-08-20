@@ -129,5 +129,10 @@ class AuthService:
             ),
             refresh_token=refresh_token,
             expires_in=self._settings.access_token_minutes * 60,
-            user=UserSummary(id=user.id, phone=user.phone, display_name=user.display_name),
+            user=UserSummary(
+                id=user.id,
+                phone=user.phone,
+                display_name=user.display_name,
+                avatar_url=user.avatar_url,
+            ),
         )

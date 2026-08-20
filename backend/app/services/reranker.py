@@ -46,7 +46,11 @@ class RerankBackend:
 
 
 def create_rerank_backend(settings: Settings) -> RerankBackend | None:
-    """Resolve the reranker backend, returning ``None`` when unavailable."""
+    """Resolve the reranker backend, returning ``None`` when unavailable.
+
+    依赖 ``FlagEmbedding`` 包与本地 bge-reranker-v2-m3 模型文件；二者任一缺失
+    即优雅降级为 ``None``（检索链路继续用首阶段排序，不中断）。绝不触发隐式下载。
+    """
     if not settings.rerank_enabled:
         return None
     try:
@@ -75,3 +79,4 @@ def create_rerank_backend(settings: Settings) -> RerankBackend | None:
         model_name=f"bge-reranker-v2-m3 ({model_ref})",
         label="二阶段精排模型 bge-reranker-v2-m3",
     )
+  

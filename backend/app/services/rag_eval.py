@@ -2,7 +2,7 @@
 
 构建评测集（query + 期望命中文档/实体类型），对当前检索链路计算
 Recall@k 与 nDCG@k，并通过 ``GET /api/v1/admin/rag/eval`` 暴露。评测基于已落库
-的 Chroma 向量与 Neo4j 图数据，**不依赖 LLM 在线调用**，可重复执行、可回归对比。
+的向量库与 Neo4j 图数据，**不依赖 LLM 在线调用**，可重复执行、可回归对比。
 
 指标说明：
 - Recall@k：期望命中项是否在 top_k 结果中出现（命中占比）。
@@ -25,7 +25,10 @@ from app.schemas import (
 )
 
 # 评测集：与引导文档主题对齐，覆盖菜谱/营养/备餐/用户约束/日程。
+# Phase 3 扩充：新增 30 篇菜谱知识库文档后，补充针对性评测用例，
+# 覆盖高蛋白/低脂/素食/快手/汤面等典型查询场景。
 EVAL_SET: list[RagEvalCase] = [
+    # ── 原始引导文档评测（5 条）──
     RagEvalCase(
         query="独居快手晚餐有哪些？",
         expected_documents=["独居快手晚餐指南"],
@@ -47,6 +50,108 @@ EVAL_SET: list[RagEvalCase] = [
     RagEvalCase(
         query="工作日 30 分钟以内的晚餐怎么安排？",
         expected_documents=["独居快手晚餐指南", "独居备餐与食材复用"],
+    ),
+    # ── 菜谱知识库扩充评测（15 条，针对 30 篇导入菜谱）──
+    RagEvalCase(
+        query="虾仁滑蛋盖饭怎么做？高蛋白低脂的快手晚餐",
+        expected_documents=["虾仁滑蛋盖饭.md"],
+    ),
+    RagEvalCase(
+        query="麻婆豆腐的做法，素食蛋白质来源",
+        expected_documents=["麻婆豆腐.md"],
+    ),
+    RagEvalCase(
+        query="番茄鸡蛋面简单做法，一人食面条",
+        expected_documents=["番茄鸡蛋面.md"],
+    ),
+    RagEvalCase(
+        query="清蒸鲈鱼的做法，低脂海鲜晚餐",
+        expected_documents=["清蒸鲈鱼.md"],
+    ),
+    RagEvalCase(
+        query="宫保鸡丁怎么炒？经典川菜家常做法",
+        expected_documents=["宫保鸡丁.md"],
+    ),
+    RagEvalCase(
+        query="土豆炖牛肉，适合周末慢炖的硬菜",
+        expected_documents=["土豆炖牛肉.md"],
+    ),
+    RagEvalCase(
+        query="蒜蓉西兰花，清淡蔬菜晚餐",
+        expected_documents=["蒜蓉西兰花.md"],
+    ),
+    RagEvalCase(
+        query="蛋炒饭一个人吃怎么做？剩饭利用",
+        expected_documents=["蛋炒饭.md"],
+    ),
+    RagEvalCase(
+        query="鱼香肉丝做法，下饭菜推荐",
+        expected_documents=["鱼香肉丝.md"],
+    ),
+    RagEvalCase(
+        query="肉末蒸蛋，嫩滑口感家常蒸菜",
+        expected_documents=["肉末蒸蛋.md"],
+    ),
+    RagEvalCase(
+        query="红烧茄子，素菜下饭做法",
+        expected_documents=["红烧茄子.md"],
+    ),
+    RagEvalCase(
+        query="葱爆羊肉，快手肉类晚餐",
+        expected_documents=["葱爆羊肉.md"],
+    ),
+    RagEvalCase(
+        query="地三鲜做法，东北家常素菜",
+        expected_documents=["地三鲜.md"],
+    ),
+    RagEvalCase(
+        query="番茄龙利鱼，低脂白肉鱼做法",
+        expected_documents=["番茄龙利鱼.md"],
+    ),
+    RagEvalCase(
+        query="韭菜炒鸡蛋，简单快手家常菜",
+        expected_documents=["韭菜炒鸡蛋.md"],
+    ),
+    # ── 目标×餐次×约束多维评测（针对 P1 新增 frontmatter 文档）──
+    RagEvalCase(
+        query="减脂期晚餐吃什么？低脂高蛋白",
+        expected_documents=["低脂凉拌鸡丝.md"],
+    ),
+    RagEvalCase(
+        query="增肌期高蛋白午餐怎么吃",
+        expected_documents=["香煎鸡胸配糙米.md"],
+    ),
+    RagEvalCase(
+        query="有没有快手汤品和凉拌菜",
+        expected_documents=["番茄蛋花汤.md", "凉拌黄瓜.md"],
+    ),
+    RagEvalCase(
+        query="乳糖不耐的人怎么替代牛奶",
+        expected_documents=["乳糖不耐替代指南.md"],
+    ),
+    RagEvalCase(
+        query="独居早餐快速做法",
+        expected_documents=["燕麦香蕉早餐杯.md", "鸡蛋吐司快手早餐.md"],
+    ),
+    RagEvalCase(
+        query="剩饭剩菜怎么利用减少浪费",
+        expected_documents=["剩饭剩菜变身.md"],
+    ),
+    RagEvalCase(
+        query="一周食材怎么采购复用不浪费",
+        expected_documents=["一周食材复用方案.md"],
+    ),
+    RagEvalCase(
+        query="麸质过敏不能吃面食怎么办",
+        expected_documents=["无麸质主食替代指南.md"],
+    ),
+    RagEvalCase(
+        query="减脂期蒸菜推荐",
+        expected_documents=["蒜蓉蒸娃娃菜.md"],
+    ),
+    RagEvalCase(
+        query="增肌晚餐高蛋白推荐",
+        expected_documents=["牛肉炖蛋.md"],
     ),
 ]
 

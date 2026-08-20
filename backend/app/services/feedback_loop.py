@@ -1,4 +1,4 @@
-"""执行反馈闭环：把执行结果从 MySQL 回流到 Neo4j 与 Chroma。
+"""执行反馈闭环：把执行结果从 MySQL 回流到 Neo4j 与向量库。
 
 项目没有 ORM 事件钩子（``event.listen`` / ``after_commit``），因此"计划 → 执行 →
 反馈 → 检索/记忆"这一环必须显式编排。本模块提供唯一入口
@@ -10,7 +10,7 @@
 3. **回向量库**：按反馈类型维护一份滚动文档（固定 ``document_id``），
    下一轮 RAG 检索即可召回"上次这道菜太辣"这类历史反馈。
 
-外部依赖（Neo4j / Chroma）不可用时只降级记录同步状态，绝不影响主业务链路；
+外部依赖（Neo4j / 向量库）不可用时只降级记录同步状态，绝不影响主业务链路；
 未同步的记录留在 ``plan_feedback.synced_to_*`` 上，可由补偿任务重放。
 """
 
@@ -19,9 +19,10 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import PlanFeedback
+from app.models import PlanFeedback, UserProfile
 from app.repositories.feedback import FeedbackRepository
 from app.services.knowledge import KnowledgeService, get_knowledge_service
 
@@ -31,6 +32,7 @@ logger = logging.getLogger(__name__)
 TASK_COMPLETION = "task_completion"
 MEAL_REPLACEMENT = "meal_replacement"
 MEAL_RATING = "meal_rating"
+MEAL_CHECKIN = "meal_checkin"
 SHOPPING_VERIFICATION = "shopping_verification"
 EXPENSE_RECORD = "expense_record"
 
@@ -38,9 +40,21 @@ FEEDBACK_LABELS: dict[str, str] = {
     TASK_COMPLETION: "任务执行",
     MEAL_REPLACEMENT: "餐食替换",
     MEAL_RATING: "餐食评价",
+    MEAL_CHECKIN: "餐食打卡",
     SHOPPING_VERIFICATION: "采购核销",
     EXPENSE_RECORD: "支出记录",
 }
+
+# 餐食未吃偏差枚举 → 中文标签，用于反馈叙事与前端展示
+MEAL_DEVIATION_LABELS: dict[str, str] = {
+    "not_available": "没买到",
+    "no_appetite": "不想吃",
+    "ate_other": "吃了别的",
+}
+
+# 阶段5：忌口自动纳入——某食材标签连续 N 次负反馈后写入 UserProfile.constraints
+CONSTRAINT_RULE_THRESHOLD = 3
+_CONSTRAINT_MEAL_TYPES: tuple[str, ...] = (MEAL_REPLACEMENT, MEAL_RATING, MEAL_CHECKIN)
 
 # ── 情感与口味词典（无 LLM 时的确定性判定）────────────────────────────
 _POSITIVE_PHRASES: tuple[str, ...] = (
@@ -94,9 +108,43 @@ def extract_taste_tags(*sources: str | Iterable[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(tag for tag in tags if tag))
 
 
+# ── 口味画像五维向量（§7.4：辣/清淡/甜/咸/酸）─────────────────────────
+# 每个维度用「同义词集合」做精确匹配：标签本身是标准词（如「低盐」）时只落到
+# 它真正所属的维度，避免子串交叉（如「甜」误入「酸甜」→ 酸、「低盐」误入「盐」）。
+_TASTE_DIMENSIONS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("spicy", "辣", ("辣", "麻辣", "香辣", "辣味")),
+    ("light", "清淡", ("清淡", "淡", "低盐", "低糖", "低脂", "少油", "低卡", "素食")),
+    ("sweet", "甜", ("甜", "糖", "甜味")),
+    ("salty", "咸", ("咸", "盐")),
+    ("sour", "酸", ("酸", "酸味")),
+)
+
+
+def taste_vector_from_tags(
+    liked_tags: Iterable[str], disliked_tags: Iterable[str]
+) -> list[dict[str, str | float]]:
+    """把喜欢/不喜欢标签映射为五维口味向量（每维 -1..1）。
+
+    正值表示偏好、负值表示回避、0 表示中性或暂无信号。非口味的结构化标签
+    （如「牛肉」「汤」）不落任何维度，自然为 0。
+    """
+    liked = {str(tag).strip() for tag in liked_tags if str(tag).strip()}
+    disliked = {str(tag).strip() for tag in disliked_tags if str(tag).strip()}
+
+    dimensions: list[dict[str, str | float]] = []
+    for key, label, synonyms in _TASTE_DIMENSIONS:
+        score = sum(1 for tag in liked if tag in synonyms) - sum(
+            1 for tag in disliked if tag in synonyms
+        )
+        dimensions.append(
+            {"key": key, "label": label, "score": max(-1.0, min(1.0, float(score)))}
+        )
+    return dimensions
+
+
 @dataclass(frozen=True, slots=True)
 class FeedbackSignal:
-    """一次执行反馈的规范化描述，跨 MySQL / Neo4j / Chroma 共用。"""
+    """一次执行反馈的规范化描述，跨 MySQL / Neo4j / 向量库 共用。"""
 
     user_id: int
     feedback_type: str
@@ -163,7 +211,7 @@ class FeedbackLoopService:
 
     @property
     def knowledge(self) -> KnowledgeService:
-        # 延迟解析，避免导入期就构造 Chroma / Neo4j 客户端
+        # 延迟解析，避免导入期就构造向量库 / Neo4j 客户端
         if self._knowledge is None:
             self._knowledge = get_knowledge_service()
         return self._knowledge
@@ -197,18 +245,59 @@ class FeedbackLoopService:
         )
         vector_ok, vector_note = await self._push_vector(signal, history)
         await repository.mark_synced(feedback, graph=graph_ok, vector=vector_ok)
-        notes = tuple(note for note in (graph_note, vector_note) if note)
+        notes = [note for note in (graph_note, vector_note) if note]
+        # 阶段5：负向餐食反馈触发忌口自动纳入，新纳入的标签作为通知回流
+        if signal.feedback_type in _CONSTRAINT_MEAL_TYPES and sentiment == "negative":
+            constrained = await self.apply_constraint_rules(session, signal.user_id)
+            if constrained:
+                notes.append(f"已自动纳入忌口：{'、'.join(constrained)}")
         return FeedbackSyncResult(
             feedback_id=feedback.id,
             sentiment=sentiment,
             deviation=signal.deviation,
             graph_synced=graph_ok,
             vector_synced=vector_ok,
-            notes=notes,
+            notes=tuple(notes),
         )
 
+    async def apply_constraint_rules(self, session: AsyncSession, user_id: int) -> list[str]:
+        """阶段5：把连续 N 次负反馈的食材标签自动纳入用户忌口。
+
+        从最新往回遍历餐食类反馈，对每个标签统计"连续负向"次数（被正向/中性
+        反馈打断即清零）；达到 :data:`CONSTRAINT_RULE_THRESHOLD` 且尚未在
+        ``UserProfile.constraints`` 中的标签自动追加并落库。返回本次新纳入的
+        标签列表，供接口/周报生成"已自动纳入忌口"通知。
+        """
+        repository = FeedbackRepository(session)
+        records = await repository.list_recent(
+            user_id, feedback_types=_CONSTRAINT_MEAL_TYPES, limit=40
+        )
+        tag_events: dict[str, list[str]] = {}
+        for record in records:
+            for tag in record.tags:
+                if tag:
+                    tag_events.setdefault(tag, []).append(record.sentiment)
+        triggered = [
+            tag
+            for tag, sentiments in tag_events.items()
+            if _consecutive_negative(sentiments) >= CONSTRAINT_RULE_THRESHOLD
+        ]
+        if not triggered:
+            return []
+        profile = await session.scalar(
+            select(UserProfile).where(UserProfile.user_id == user_id)
+        )
+        if profile is None:
+            return []
+        constraints = list(profile.constraints or [])
+        newly = [tag for tag in triggered if tag not in constraints]
+        if newly:
+            profile.constraints = constraints + newly
+            await session.commit()
+        return newly
+
     async def replay(self, session: AsyncSession, row: PlanFeedback) -> FeedbackSyncResult:
-        """重放一条已落库但未回流成功的反馈（Neo4j / Chroma 恢复后的补偿路径）。"""
+        """重放一条已落库但未回流成功的反馈（Neo4j / 向量库 恢复后的补偿路径）。"""
         repository = FeedbackRepository(session)
         signal = _row_signal(row)
         graph_ok, graph_note = (
@@ -274,6 +363,17 @@ class FeedbackLoopService:
             logger.warning("feedback vector sync failed: %s", exc)
             return False, f"向量回流失败：{type(exc).__name__}"
         return True, ""
+
+
+def _consecutive_negative(sentiments: Sequence[str]) -> int:
+    """从最新往回统计连续负向反馈次数（正向/中性反馈即打断）。"""
+    run = 0
+    for sentiment in sentiments:
+        if sentiment == "negative":
+            run += 1
+        else:
+            break
+    return run
 
 
 def _row_signal(row: PlanFeedback) -> FeedbackSignal:

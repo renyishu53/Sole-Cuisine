@@ -44,6 +44,16 @@ class ConversationRepository:
             .options(selectinload(ChatSession.messages))
         )
 
+    async def get_message(
+        self, message_id: int, user_id: int
+    ) -> ChatMessage | None:
+        """按消息 ID 查询单条消息（带 user_id 隔离）。"""
+        return await self._session.scalar(
+            select(ChatMessage).where(
+                ChatMessage.id == message_id, ChatMessage.user_id == user_id
+            )
+        )
+
     async def add_message(
         self,
         chat: ChatSession,

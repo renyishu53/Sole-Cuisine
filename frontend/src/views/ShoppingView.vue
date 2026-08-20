@@ -1,14 +1,16 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
-import { Check, Merge, Package, Pencil, Plus, Search, ShoppingCart, Trash2, X } from 'lucide-vue-next'
+import { computed, reactive, ref, watch } from 'vue'
+import { Check, Copy, Download, Merge, MoreHorizontal, Pencil, Plus, RefreshCw, Search, Sparkles, Trash2, Undo2, X } from 'lucide-vue-next'
+import { useRouter } from 'vue-router'
 import { api, apiErrorMessage } from '../api'
 import AsyncState from '../components/AsyncState.vue'
 import { useResource } from '../composables/useResource'
 import { useToast } from '../composables/useToast'
-import type { InventoryAdjustInput, InventoryResponse, ShoppingItem, ShoppingItemInput } from '../types'
+import type { ShoppingImpactResponse, ShoppingItem, ShoppingItemInput, ShoppingSubstitutionAction, ShoppingSubstitutionResponse } from '../types'
 
 const { data, loading, error, load } = useResource(api.shopping)
 const { show: showToast } = useToast()
+const router = useRouter()
 const search = ref('')
 const dialogOpen = ref(false)
 const editing = ref<ShoppingItem | null>(null)
@@ -22,11 +24,39 @@ const actionError = ref('')
 const merging = ref(false)
 const mergeMessage = ref('')
 const conversionNotes = ref<{ name: string; original: string; converted: string }[]>([])
+// ── G08：购物替代图谱化 —— 图谱显式关系 + 营养相似度兜底 ─
+const substOpen = ref(false)
+const substItem = ref<ShoppingItem | null>(null)
+const substResult = ref<ShoppingSubstitutionResponse | null>(null)
+const substLoading = ref(false)
+const substError = ref('')
 const form = reactive({ name: '', category: '未分类', quantity: '1', price: 0, source: '手工添加', purchased: false })
-const filtered = computed(() => data.value?.filter(item => item.name.includes(search.value.trim())) || [])
+const impactOpen = ref(false)
+const impactItem = ref<ShoppingItem | null>(null)
+const impactAction = ref('修改')
+const impactResult = ref<ShoppingImpactResponse | null>(null)
+const impactDesired = ref<ShoppingItemInput | null>(null)
+const removeConfirmOpen = ref(false)
+const removeTarget = ref<ShoppingItem | null>(null)
+
+/* ───────── 统计 ───────── */
 const total = computed(() => data.value?.reduce((sum, item) => sum + item.price, 0) || 0)
 const purchased = computed(() => data.value?.filter(item => item.purchased).reduce((sum, item) => sum + item.price, 0) || 0)
-const progress = computed(() => data.value?.length ? data.value.filter(item => item.purchased).length / data.value.length * 100 : 0)
+const purchasedCount = computed(() => data.value?.filter(item => item.purchased).length ?? 0)
+const progress = computed(() => data.value?.length ? purchasedCount.value / data.value.length * 100 : 0)
+
+/* ───────── 品类筛选 chips ───────── */
+const filterKey = ref('全部')
+const filterKeys = computed<string[]>(() => {
+  const keys = new Set<string>()
+  for (const item of data.value || []) keys.add(item.category || '未分类')
+  return ['全部', ...[...keys].sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'))]
+})
+watch(filterKey, () => { search.value = '' })
+
+const filtered = computed(() => (data.value || [])
+  .filter(item => item.name.includes(search.value.trim()))
+  .filter(item => filterKey.value === '全部' || (item.category || '未分类') === filterKey.value))
 
 function openCreate() {
   editing.value = null
@@ -37,12 +67,50 @@ function openEdit(item: ShoppingItem) {
   editing.value = item; Object.assign(form, item); actionError.value = ''; dialogOpen.value = true
 }
 function payload(): ShoppingItemInput { return { name: form.name.trim(), category: form.category.trim(), quantity: form.quantity.trim(), price: form.price, source: form.source.trim(), purchased: form.purchased } }
+async function inspectImpact(item: ShoppingItem, action: string, desired: ShoppingItemInput | null = null): Promise<boolean> {
+  try {
+    const result = await api.shoppingImpact(item.id)
+    if (!result.has_impact) return false
+    impactItem.value = item
+    impactAction.value = action
+    impactResult.value = result
+    impactDesired.value = desired
+    impactOpen.value = true
+    return true
+  } catch (reason) {
+    showToast(apiErrorMessage(reason, '计划影响检查失败'), 'error')
+    return true
+  }
+}
+function goToRevision() {
+  const item = impactItem.value
+  if (!item) return
+  const action = impactAction.value
+  const desired = impactDesired.value
+  const prompt = action === '删除'
+    ? `删除购物清单中的“${item.name}”，请为受影响餐食生成替代食材并同步采购和预算。`
+    : action === '替换'
+      ? `替换购物清单中的“${item.name}”，请同步调整受影响餐食、采购和预算，并生成可预览的新计划。`
+      : `将购物清单中的“${item.name}”调整为“${desired?.name || item.name}”，数量改为“${desired?.quantity || item.quantity}”，请同步受影响餐食、采购和预算。`
+  impactOpen.value = false
+  void router.push({ path: '/planner', query: { mode: 'revise', prompt } })
+}
+function closeImpact() {
+  impactOpen.value = false
+  impactItem.value = null
+  impactResult.value = null
+  impactDesired.value = null
+}
 async function save() {
   if (!form.name.trim() || submitting.value) return
   submitting.value = true; actionError.value = ''
   try {
-    if (editing.value) await api.updateShoppingItem(editing.value.id, payload())
-    else await api.createShoppingItem(payload())
+    if (editing.value) {
+      const changes = payload()
+      const structuralChange = changes.name !== editing.value.name || changes.quantity !== editing.value.quantity
+      if (structuralChange && await inspectImpact(editing.value, '修改', changes)) return
+      await api.updateShoppingItem(editing.value.id, changes)
+    } else await api.createShoppingItem(payload())
     showToast(editing.value ? '购物条目已更新' : '购物条目已添加', 'success')
     await load(); dialogOpen.value = false
   } catch (reason) { actionError.value = apiErrorMessage(reason, '购物条目保存失败') }
@@ -50,7 +118,6 @@ async function save() {
 }
 async function togglePurchased(item: ShoppingItem) {
   if (!item.purchased) {
-    // 标记已购买前采集核销信息，实付金额/备注会回流为执行反馈（预算偏差）
     verifyItem.value = item
     actualPrice.value = item.price
     verifyNote.value = ''
@@ -77,9 +144,22 @@ async function confirmVerify() {
   finally { submitting.value = false }
 }
 async function removeItem(item: ShoppingItem) {
-  if (!window.confirm(`删除"${item.name}"？`)) return
+  removeTarget.value = item
+  removeConfirmOpen.value = true
+}
+function closeRemoveConfirm() {
+  removeConfirmOpen.value = false
+  removeTarget.value = null
+}
+async function confirmRemove() {
+  const item = removeTarget.value
+  if (!item || submitting.value) return
+  closeRemoveConfirm()
+  if (await inspectImpact(item, '删除')) return
+  submitting.value = true
   try { await api.deleteShoppingItem(item.id); showToast('已删除', 'success'); await load() }
   catch (reason) { showToast(apiErrorMessage(reason, '购物条目删除失败'), 'error') }
+  finally { submitting.value = false }
 }
 async function mergeItems() {
   if (merging.value) return
@@ -93,68 +173,204 @@ async function mergeItems() {
   } catch (reason) { showToast(apiErrorMessage(reason, '购物项合并失败'), 'error') }
   finally { merging.value = false }
 }
-// ── 2.5 库存管理 ──
-const inventoryOpen = ref(false)
-const inventoryLoading = ref(false)
-const inventoryData = ref<InventoryResponse | null>(null)
-const inventoryError = ref('')
-const inventoryAdjustOpen = ref(false)
-const inventoryAdjusting = ref(false)
-const adjustForm = reactive<InventoryAdjustInput>({ name: '', category: '未分类', delta: 1, unit: '个', quantity: '', low_stock_threshold: 0, note: '' })
-
-async function loadInventory() {
-  inventoryLoading.value = true; inventoryError.value = ''
-  try { inventoryData.value = await api.listInventory() }
-  catch (reason) { inventoryError.value = apiErrorMessage(reason, '库存加载失败') }
-  finally { inventoryLoading.value = false }
-}
-async function openInventory() {
-  inventoryOpen.value = true
-  await loadInventory()
-}
-function openAdjust() {
-  Object.assign(adjustForm, { name: '', category: '未分类', delta: 1, unit: '个', quantity: '', low_stock_threshold: 0, note: '' })
-  inventoryAdjustOpen.value = true
-}
-async function submitAdjust() {
-  if (!adjustForm.name.trim() || inventoryAdjusting.value) return
-  inventoryAdjusting.value = true
+// ── G08：获取购物项的替代建议 ──
+async function openSubstitutions(item: ShoppingItem) {
+  if (substLoading.value) return
+  substItem.value = item
+  substResult.value = null
+  substError.value = ''
+  substOpen.value = true
+  substLoading.value = true
   try {
-    await api.adjustInventory({
-      name: adjustForm.name.trim(),
-      category: (adjustForm.category || '未分类').trim(),
-      delta: adjustForm.delta,
-      unit: (adjustForm.unit || '个').trim(),
-      quantity: adjustForm.quantity || null,
-      low_stock_threshold: adjustForm.low_stock_threshold ?? null,
-      note: adjustForm.note,
-    })
-    showToast('库存已更新', 'success')
-    inventoryAdjustOpen.value = false
-    await loadInventory()
-  } catch (reason) { showToast(apiErrorMessage(reason, '库存调整失败'), 'error') }
-  finally { inventoryAdjusting.value = false }
+    substResult.value = await api.shoppingSubstitutions(item.id, 5)
+  } catch (reason) {
+    substError.value = apiErrorMessage(reason, '替代建议获取失败')
+  } finally {
+    substLoading.value = false
+  }
 }
-async function removeInventory(id: number, name: string) {
-  if (!window.confirm(`删除库存「${name}」？`)) return
-  try { await api.deleteInventory(id); showToast('已删除', 'success'); await loadInventory() }
-  catch (reason) { showToast(apiErrorMessage(reason, '库存删除失败'), 'error') }
+function sourceLabel(source: string): string {
+  return source === 'graph' ? '图谱' : '营养近似'
 }
-onMounted(loadInventory)
+// ── 任务 B：食材替换确认闭环 —— 接受/拒绝/换一个 ─
+const substitutingId = ref<number | null>(null)
+async function resolveSubstitution(item: ShoppingItem, action: ShoppingSubstitutionAction, name?: string) {
+  if (substitutingId.value !== null) return
+  if (action !== 'reject') {
+    if (await inspectImpact(item, '替换')) return
+  }
+  substitutingId.value = item.id
+  try {
+    const result = await api.acceptShoppingSubstitution(item.id, { action, name })
+    Object.assign(item, result)
+    if (action === 'accept') showToast('已确认替换', 'success')
+    else if (action === 'reject') showToast('已回退到原食材', 'success')
+    else showToast(`已换成「${result.name}」`, 'success')
+  } catch (reason) {
+    showToast(apiErrorMessage(reason, '替换操作失败'), 'error')
+  } finally {
+    substitutingId.value = null
+  }
+}
+function isPendingSubstitution(item: ShoppingItem): boolean {
+  return !!item.substituted_from && item.substituted_accepted == null
+}
+function similarityPercent(similarity: number): string {
+  return `${Math.round(similarity * 100)}%`
+}
+function nutritionLabel(key: string): string {
+  const labels: Record<string, string> = {
+    calories: '热量', protein_g: '蛋白质', fat_g: '脂肪', carbs_g: '碳水',
+  }
+  return labels[key] || key
+}
+
+// ── 行操作：checkbox + ⋯ 溢出菜单 ──
+const menuItemId = ref<number | null>(null)
+function toggleItemMenu(id: number) { menuItemId.value = menuItemId.value === id ? null : id }
+function closeItemMenu() { menuItemId.value = null }
+function menuTogglePurchased(item: ShoppingItem) { closeItemMenu(); togglePurchased(item) }
+function menuOpenEdit(item: ShoppingItem) { closeItemMenu(); openEdit(item) }
+function menuOpenSubstitutions(item: ShoppingItem) { closeItemMenu(); openSubstitutions(item) }
+function menuRemove(item: ShoppingItem) { closeItemMenu(); removeItem(item) }
+function menuResolve(item: ShoppingItem, action: ShoppingSubstitutionAction) { closeItemMenu(); resolveSubstitution(item, action) }
+
+/* ── 页级  溢出菜单：智能合并 / 复制清单 / 导出 ── */
+const pageMenuOpen = ref(false)
+function pageMerge() { pageMenuOpen.value = false; mergeItems() }
+function pageCopy() { pageMenuOpen.value = false; copyList() }
+function pageExport() { pageMenuOpen.value = false; exportList() }
+
+/* 复制清单：平铺文本 */
+async function copyList() {
+  if (!data.value?.length) { showToast('清单为空，无可复制内容', 'error'); return }
+  const lines = [`SoloChef 购物清单（共 ${data.value.length} 项 · 估价 ¥${total.value}）`]
+  for (const item of data.value) lines.push(`  ${item.purchased ? '[x]' : '[ ]'} ${item.name} · ${item.quantity} · ¥${item.price}`)
+  lines.push(``, `已购 ${purchasedCount.value}/${data.value.length} 项 · 已购金额 ¥${purchased.value} · 待购 ¥${total.value - purchased.value}`)
+  try {
+    await navigator.clipboard.writeText(lines.join('\n'))
+    showToast('清单已复制到剪贴板', 'success')
+  } catch { showToast('复制失败，请手动选择文本复制', 'error') }
+}
+
+/* 导出清单：CSV（带 UTF-8 BOM，Excel 可直接打开） */
+function exportList() {
+  if (!data.value?.length) { showToast('清单为空，无可导出内容', 'error'); return }
+  const header = ['名称', '数量', '估价(元)', '实付(元)', '分类', '来源', '已购']
+  const rows = data.value.map(item => [
+    item.name, item.quantity, String(item.price),
+    item.actual_price != null ? String(item.actual_price) : '',
+    item.category, item.source, item.purchased ? '是' : '否',
+  ])
+  const escape = (cell: string) => `"${cell.replace(/"/g, '""')}"`
+  const csv = [header, ...rows].map(row => row.map(escape).join(',')).join('\n')
+  const blob = new Blob([`\uFEFF${csv}`], { type: 'text/csv;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = `solochef-购物清单-${new Date().toISOString().slice(0, 10)}.csv`
+  anchor.click()
+  URL.revokeObjectURL(url)
+  showToast('清单已导出为 CSV', 'success')
+}
 </script>
 
 <template>
   <AsyncState :loading="loading" :error="error" @retry="load">
-    <div v-if="data" class="shopping-layout">
-      <section class="panel shopping-main">
-        <div class="section-toolbar inner"><div><h2>本周采购清单</h2><p>{{ data.filter(item => item.purchased).length }} / {{ data.length }} 项已购买</p></div><div class="toolbar-group"><label class="search-field"><Search :size="16" /><input v-model="search" placeholder="搜索物品" /></label><button class="button secondary" @click="openInventory"><Package :size="16" />库存管理<span v-if="inventoryData?.low_stock_count" class="badge-warn">{{ inventoryData.low_stock_count }}</span></button><button class="button secondary" :disabled="merging" @click="mergeItems"><Merge :size="16" />{{ merging ? '合并中' : '智能合并' }}</button><button class="button primary" @click="openCreate"><Plus :size="16" />添加物品</button></div></div>
+    <div v-if="data" class="shop2 page-stack">
+      <!-- ═ 页头：标题 + 统计行 + 添加/⋮ ══ -->
+      <header class="shop2-hero">
+        <div class="shop2-hero-head">
+          <h2>购物清单</h2>
+          <div class="shop2-hero-actions">
+            <button class="button primary" @click="openCreate"><Plus :size="16" />添加商品</button>
+            <div class="shopping-more shop2-page-more">
+              <button class="icon-button" aria-label="更多操作" aria-haspopup="menu" :aria-expanded="pageMenuOpen" @click="pageMenuOpen = !pageMenuOpen"><MoreHorizontal :size="18" /></button>
+              <Transition name="dropdown">
+                <div v-if="pageMenuOpen" class="more-menu" role="menu">
+                  <button role="menuitem" :disabled="merging" @click="pageMerge"><Merge :size="15" />{{ merging ? '合并中…' : '智能合并重复项' }}</button>
+                  <button role="menuitem" @click="pageCopy"><Copy :size="15" />复制清单</button>
+                  <button role="menuitem" @click="pageExport"><Download :size="15" />导出 CSV</button>
+                </div>
+              </Transition>
+            </div>
+          </div>
+        </div>
+        <p class="shop2-stats">共 {{ data.length }} 项 · 估价 ¥{{ total }} · 剩余 ¥{{ total - purchased }} · 已购 {{ purchasedCount }} 项</p>
         <div class="shopping-progress"><i :style="{ width: `${progress}%` }" /></div>
-        <template v-if="filtered.length"><div v-for="category in [...new Set(filtered.map(item => item.category))]" :key="category" class="shopping-group"><header><h3>{{ category }}</h3><span>¥{{ filtered.filter(item => item.category === category).reduce((sum, item) => sum + item.price, 0) }}</span></header><div v-for="item in filtered.filter(row => row.category === category)" :key="item.id" class="shopping-item" :class="{ checked: item.purchased }"><button class="check-button" :aria-label="item.purchased ? '标记未购买' : '标记已购买'" @click="togglePurchased(item)"><span class="custom-check"><Check :size="14" /></span></button><span><strong>{{ item.name }}</strong><small>{{ item.quantity }} · {{ item.source }}</small></span><b>¥{{ item.price }}</b><span class="shopping-actions"><button class="icon-button" title="编辑" @click="openEdit(item)"><Pencil :size="14" /></button><button class="icon-button danger" title="删除" @click="removeItem(item)"><Trash2 :size="14" /></button></span></div></div></template>
-        <div v-else class="state-box"><strong>{{ search ? '没有匹配的物品' : '购物清单为空' }}</strong><p>{{ search ? '调整搜索条件后重试。' : '添加第一项采购物品，勾选状态会保存到个人清单。' }}</p><button v-if="!search" class="button primary" @click="openCreate"><Plus :size="16" />添加物品</button></div>
-        <div v-if="conversionNotes.length" class="conversion-notes"><h4>单位换算明细</h4><ul><li v-for="(note, idx) in conversionNotes" :key="idx"><strong>{{ note.name }}</strong>：{{ note.original }} → {{ note.converted }}</li></ul></div>
-        <p v-if="mergeMessage" class="operation-success">{{ mergeMessage }}</p><p v-if="actionError && !dialogOpen" class="knowledge-error" aria-live="polite">{{ actionError }}</p>
-      </section>
-      <aside class="page-stack"><section class="panel receipt"><span class="metric-icon green"><ShoppingCart /></span><h3>采购预算</h3><div><span>清单估价</span><strong>¥{{ total }}</strong></div><div><span>已购买估价</span><strong>¥{{ purchased }}</strong></div><div><span>待购买估价</span><strong class="positive">¥{{ total - purchased }}</strong></div><hr /><p>金额会随购物条目的新增、修改和删除实时更新。</p></section><section class="panel tip-card"><span class="eyebrow">采购状态</span><h3>{{ Math.round(progress) }}% 已完成</h3><p>所有勾选操作都会实时保存，并用于下次预算估算。</p></section></aside>
+      </header>
+
+      <p v-if="actionError && !dialogOpen" class="knowledge-error" aria-live="polite">{{ actionError }}</p>
+
+      <!-- ══ 筛选行：品类 chips + 搜索 ══ -->
+      <div class="shop2-filter-row">
+        <div class="shop2-chips" role="tablist" aria-label="品类筛选">
+          <button
+            v-for="key in filterKeys"
+            :key="key"
+            role="tab"
+            :aria-selected="filterKey === key"
+            :class="{ active: filterKey === key }"
+            @click="filterKey = key"
+          >{{ key }}</button>
+        </div>
+        <label class="search-field"><Search :size="15" /><input v-model="search" placeholder="搜索物品" /></label>
+      </div>
+
+      <!-- ══ 平铺列表 ══ -->
+      <template v-if="filtered.length">
+        <div class="shop2-flat-list">
+          <div
+            v-for="item in filtered"
+            :key="item.id"
+            class="shopping-item"
+            :class="{ checked: item.purchased, substituted: isPendingSubstitution(item) }"
+          >
+            <button class="check-button" :aria-label="item.purchased ? '标记未购买' : '标记已购买'" @click="togglePurchased(item)">
+              <span class="custom-check"><Check :size="14" /></span>
+            </button>
+            <span class="shopping-name">
+              <strong>
+                {{ item.name }}
+                <em v-if="isPendingSubstitution(item)" class="subst-flag pending">已替换</em>
+                <em v-else-if="item.substituted_accepted" class="subst-flag accepted">已确认</em>
+              </strong>
+              <small v-if="isPendingSubstitution(item)" class="subst-origin">原：{{ item.substituted_from }} · 待确认</small>
+              <small v-else>{{ item.quantity }}</small>
+            </span>
+            <b>¥{{ item.price }}</b>
+            <span class="shopping-actions">
+              <div class="shopping-more">
+                <button class="icon-button more-button" :aria-label="item.name + ' 更多操作'" aria-haspopup="menu" :aria-expanded="menuItemId === item.id" @click="toggleItemMenu(item.id)"><MoreHorizontal :size="16" /></button>
+                <Transition name="dropdown">
+                  <div v-if="menuItemId === item.id" class="more-menu" role="menu">
+                    <template v-if="isPendingSubstitution(item)">
+                      <button role="menuitem" :disabled="substitutingId === item.id" @click="menuResolve(item, 'accept')"><Check :size="15" />确认替换</button>
+                      <button role="menuitem" :disabled="substitutingId === item.id" @click="menuResolve(item, 'reject')"><X :size="15" />回退原食材</button>
+                      <button role="menuitem" :disabled="substitutingId === item.id" @click="menuResolve(item, 'swap')"><RefreshCw :size="15" />换一个</button>
+                    </template>
+                    <template v-else>
+                      <button v-if="!item.purchased" role="menuitem" @click="menuTogglePurchased(item)"><Check :size="15" />标记已购</button>
+                      <button v-else role="menuitem" @click="menuTogglePurchased(item)"><Undo2 :size="15" />标记未购</button>
+                      <button role="menuitem" @click="menuOpenSubstitutions(item)"><Sparkles :size="15" />查找替换品</button>
+                      <button role="menuitem" @click="menuOpenEdit(item)"><Pencil :size="15" />修改数量</button>
+                      <button class="danger-item" role="menuitem" @click="menuRemove(item)"><Trash2 :size="15" />移除…</button>
+                    </template>
+                  </div>
+                </Transition>
+              </div>
+            </span>
+          </div>
+        </div>
+      </template>
+      <div v-else class="state-box">
+        <strong>{{ search || filterKey !== '全部' ? '没有匹配的物品' : '购物清单为空' }}</strong>
+        <p>{{ search || filterKey !== '全部' ? '调整筛选或搜索条件后重试。' : '添加第一项采购物品，勾选状态会保存到个人清单。' }}</p>
+        <button v-if="!search && filterKey === '全部'" class="button primary" @click="openCreate"><Plus :size="16" />添加商品</button>
+      </div>
+
+      <div v-if="conversionNotes.length" class="conversion-notes"><h4>单位换算明细</h4><ul><li v-for="(note, idx) in conversionNotes" :key="idx"><strong>{{ note.name }}</strong>：{{ note.original }} → {{ note.converted }}</li></ul></div>
+      <p v-if="mergeMessage" class="operation-success">{{ mergeMessage }}</p>
     </div>
   </AsyncState>
 
@@ -162,42 +378,180 @@ onMounted(loadInventory)
 
   <div v-if="verifyOpen" class="dialog-backdrop" @click.self="verifyOpen = false"><section class="member-dialog" role="dialog" aria-modal="true" aria-label="采购核销"><header><div><h2>采购核销 · {{ verifyItem?.name }}</h2><p>实付金额与备注会回流为执行反馈，让预算智能体下一轮更准。</p></div><button class="icon-button" aria-label="关闭" @click="verifyOpen = false"><X :size="18" /></button></header><form @submit.prevent="confirmVerify"><div class="member-form-grid"><label><span>预估金额</span><input :value="verifyItem ? verifyItem.price : 0" type="number" step="0.01" min="0" disabled /></label><label><span>实付金额</span><input v-model.number="actualPrice" type="number" step="0.01" min="0" required /></label><label class="wide"><span>核销备注（可选）</span><input v-model="verifyNote" maxlength="500" placeholder="例如：促销价、缺货换了品牌" /></label></div><p v-if="actionError" class="knowledge-error" aria-live="polite">{{ actionError }}</p><footer><span class="dialog-spacer" /><button type="button" class="button secondary" @click="verifyOpen = false">取消</button><button class="button primary" :disabled="submitting">{{ submitting ? '核销中' : '确认核销' }}</button></footer></form></section></div>
 
-  <div v-if="inventoryOpen" class="dialog-backdrop" @click.self="inventoryOpen = false"><section class="member-dialog inventory-dialog" role="dialog" aria-modal="true" aria-label="库存管理"><header><div><h2><Package :size="18" />个人食材库存</h2><p>跟踪食材现存量与低库存阈值，采购入库后自动累加。</p></div><button class="icon-button" aria-label="关闭" @click="inventoryOpen = false"><X :size="18" /></button></header><div class="history-toolbar"><div class="inventory-summary"><span>共 <strong>{{ inventoryData?.count || 0 }}</strong> 项</span><span v-if="inventoryData?.low_stock_count" class="low-stock-flag">低库存 <strong>{{ inventoryData.low_stock_count }}</strong> 项</span></div><button class="button secondary" :disabled="inventoryLoading" @click="loadInventory">{{ inventoryLoading ? '加载中' : '刷新' }}</button><button class="button primary" @click="openAdjust"><Plus :size="15" />调整库存</button></div><div v-if="inventoryLoading" class="state-box"><strong>加载中...</strong></div><div v-else-if="inventoryError" class="knowledge-error">{{ inventoryError }}</div><div v-else-if="inventoryData && inventoryData.items.length" class="inventory-list"><div v-for="item in inventoryData.items" :key="item.id" class="inventory-item" :class="{ low: item.is_low_stock }"><div class="inv-main"><strong>{{ item.name }}</strong><small>{{ item.category }} · {{ item.quantity || `${item.quantity_value} ${item.unit}` }}<span v-if="item.note"> · {{ item.note }}</span></small></div><div class="inv-side"><i :class="item.is_low_stock ? 'tag-warn' : 'tag-ok'">{{ item.is_low_stock ? '低库存' : '充足' }}</i><span class="threshold">阈值 {{ item.low_stock_threshold }} {{ item.unit }}</span><button class="icon-button danger" title="删除" @click="removeInventory(item.id, item.name)"><Trash2 :size="14" /></button></div></div></div><div v-else class="state-box"><strong>暂无库存记录</strong><p>采购物品入库后会自动累加到库存，也可手动「调整库存」。</p></div></section></div>
+  <div v-if="removeConfirmOpen && removeTarget" class="dialog-backdrop" @click.self="closeRemoveConfirm"><section class="member-dialog remove-confirm-dialog" role="dialog" aria-modal="true" aria-label="移除购物条目"><header><div><h2>移除购物条目</h2><p>确认后将从当前周计划的采购清单中移除该物品。</p></div><button class="icon-button" aria-label="关闭" @click="closeRemoveConfirm"><X :size="18" /></button></header><div class="remove-confirm-body"><strong>{{ removeTarget.name }}</strong><span>{{ removeTarget.category }} · {{ removeTarget.quantity }} · ¥{{ removeTarget.price }}</span><p>如果该食材被当前餐食使用，系统会先提示受影响的餐食，不会直接破坏计划。</p></div><footer><button type="button" class="button secondary" @click="closeRemoveConfirm">取消</button><button type="button" class="button danger" :disabled="submitting" @click="confirmRemove">{{ submitting ? '处理中…' : '确认移除' }}</button></footer></section></div>
 
-  <div v-if="inventoryAdjustOpen" class="dialog-backdrop" @click.self="inventoryAdjustOpen = false"><section class="member-dialog" role="dialog" aria-modal="true" aria-label="调整库存"><header><div><h2>调整库存</h2><p>正数入库、负数出库，按物品名称合并；不存在则新建。</p></div><button class="icon-button" aria-label="关闭" @click="inventoryAdjustOpen = false"><X :size="18" /></button></header><form @submit.prevent="submitAdjust"><div class="member-form-grid"><label><span>物品名称</span><input v-model="adjustForm.name" maxlength="120" required /></label><label><span>分类</span><input v-model="adjustForm.category" maxlength="40" /></label><label><span>增减数量</span><input v-model.number="adjustForm.delta" type="number" step="0.01" required /></label><label><span>单位</span><input v-model="adjustForm.unit" maxlength="20" /></label><label class="wide"><span>显示数量（可选）</span><input v-model="adjustForm.quantity" maxlength="40" placeholder="如：2 斤 / 留空则自动" /></label><label><span>低库存阈值</span><input v-model.number="adjustForm.low_stock_threshold" type="number" min="0" step="0.01" /></label><label class="wide"><span>备注</span><input v-model="adjustForm.note" maxlength="500" /></label></div><footer><span class="dialog-spacer" /><button type="button" class="button secondary" @click="inventoryAdjustOpen = false">取消</button><button class="button primary" :disabled="inventoryAdjusting || !adjustForm.name.trim()">{{ inventoryAdjusting ? '保存中' : '保存调整' }}</button></footer></form></section></div>
+  <div v-if="impactOpen && impactResult" class="dialog-backdrop" @click.self="closeImpact"><section class="member-dialog impact-dialog" role="dialog" aria-modal="true" aria-label="计划影响提示"><header><div><h2>这项修改会影响餐食</h2><p>{{ impactResult.message }}</p></div><button class="icon-button" aria-label="关闭" @click="closeImpact"><X :size="18" /></button></header><div class="impact-body"><p>当前操作：{{ impactAction }}“{{ impactItem?.name }}”。请先通过调整计划生成替代方案，确认前不会修改现有计划。</p><ul><li v-for="meal in impactResult.affected_meals" :key="meal.id"><strong>{{ meal.day }} {{ meal.meal_type }}</strong><span>{{ meal.name }}</span></li></ul></div><footer><button type="button" class="button secondary" @click="closeImpact">取消</button><button type="button" class="button primary" @click="goToRevision">进入调整计划</button></footer></section></div>
+
+  <!-- G08 购物替代图谱化：图谱显式关系 + 营养相似度兜底 -->
+  <div v-if="substOpen" class="dialog-backdrop" @click.self="substOpen = false"><section class="member-dialog subst-dialog" role="dialog" aria-modal="true" aria-label="购物替代建议"><header><div><h2>替代建议 · {{ substItem?.name }}</h2><p>图谱显式关系优先，营养相似度兜底。</p></div><button class="icon-button" aria-label="关闭" @click="substOpen = false"><X :size="18" /></button></header><div class="subst-body">
+    <p v-if="substLoading" class="subst-state">正在查询图谱与营养库…</p>
+    <p v-else-if="substError" class="knowledge-error" aria-live="polite">{{ substError }}</p>
+    <template v-else-if="substResult && substResult.suggestions.length">
+      <div class="subst-summary">来源：<span v-if="substResult.source_summary.graph" class="subst-badge graph">图谱 {{ substResult.source_summary.graph }}</span><span v-if="substResult.source_summary.nutrition" class="subst-badge nutrition">营养近似 {{ substResult.source_summary.nutrition }}</span></div>
+      <ul class="subst-list">
+        <li v-for="(s, idx) in substResult.suggestions" :key="idx" class="subst-item">
+          <div class="subst-head"><strong>{{ s.name }}</strong><span class="subst-badge" :class="s.source">{{ sourceLabel(s.source) }} · {{ similarityPercent(s.similarity) }}</span></div>
+          <p v-if="s.reason" class="subst-reason">{{ s.reason }}</p>
+          <div v-if="s.nutrition" class="subst-nutrition"><span v-for="(value, key) in s.nutrition" :key="key">{{ nutritionLabel(String(key)) }} {{ Math.round(value) }}</span></div>
+        </li>
+      </ul>
+    </template>
+    <p v-else class="subst-state">暂无替代建议——该食材可能不在营养库中，或图谱未录入替代关系。</p>
+  </div><footer><span class="dialog-spacer" /><button type="button" class="button secondary" @click="substOpen = false">关闭</button></footer></section></div>
+
 </template>
 
 <style scoped>
+/* ── 页头 ── */
+.shop2-hero {
+  padding: 20px 24px;
+  background: linear-gradient(135deg, var(--primary-light) 0%, #e0efe8 100%);
+  border: 1px solid #dbe7e0;
+  border-radius: var(--radius-lg);
+}
+.impact-dialog { width: min(520px, calc(100vw - 32px)); }
+.remove-confirm-dialog { width: min(520px, calc(100vw - 32px)); }
+.remove-confirm-body { display: grid; gap: 7px; padding: 20px 22px 0; }
+.remove-confirm-body strong { font-size: var(--font-md); color: var(--text); }
+.remove-confirm-body span { color: var(--muted); font-size: var(--font-sm); }
+.remove-confirm-body p { margin: 8px 0 0; color: var(--muted); font-size: var(--font-sm); line-height: 1.6; }
+.impact-body { display: grid; gap: 12px; padding: 0 20px 16px; }
+.impact-body p { margin: 0; color: var(--muted); font-size: var(--font-sm); line-height: 1.6; }
+.impact-body ul { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.impact-body li { display: flex; align-items: baseline; gap: 10px; padding: 8px 10px; border-left: 3px solid var(--orange); background: #fff8f1; font-size: var(--font-sm); }
+.impact-body li strong { min-width: 86px; color: var(--text); }
+.impact-body li span { color: var(--muted); }
+.shop2-hero-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.shop2-hero-head h2 {
+  font-size: var(--font-xl); margin: 0; color: var(--text);
+}
+.shop2-hero-actions { display: flex; align-items: center; gap: 10px; flex: none; }
+.shop2-hero-actions .button.primary { height: 44px; padding: 0 18px; }
+.shop2-page-more { position: relative; }
+.shop2-stats { margin: 8px 0 12px; font-size: var(--font-sm); color: #3d5a4e; }
+.shop2-hero .shopping-progress { border-radius: 4px; }
+@media (max-width: 720px) {
+  .shop2-hero-head { flex-direction: column; align-items: stretch; }
+  .shop2-hero-actions { justify-content: stretch; }
+  .shop2-hero-actions .button.primary { flex: 1; }
+}
+
+/* 筛选行：chips + 搜索 */
+.shop2-filter-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  flex-wrap: wrap;
+}
+.shop2-chips { display: flex; gap: 8px; flex-wrap: wrap; }
+.shop2-chips button {
+  min-height: 40px; padding: 0 16px;
+  border: 1px solid var(--line); border-radius: 20px;
+  background: #fff; color: var(--muted);
+  font-size: var(--font-sm); font-weight: 600; cursor: pointer;
+  transition: border-color var(--transition-base), color var(--transition-base), background var(--transition-base);
+}
+.shop2-chips button:hover { border-color: #a9beb5; color: var(--text); }
+.shop2-chips button:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.shop2-chips button.active {
+  background: var(--primary-light); border-color: var(--primary); color: var(--primary);
+}
+.search-field {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 0 12px; height: 40px;
+  border: 1px solid var(--line); border-radius: 20px;
+  background: #fff;
+}
+.search-field input {
+  border: 0; outline: none; background: transparent;
+  font-size: var(--font-sm); color: var(--text); width: 120px;
+}
+.search-field:focus-within { border-color: var(--primary); }
+@media (max-width: 860px) { .shop2-filter-row { align-items: flex-start; flex-direction: column; } }
+
+/* ── 平铺列表 ── */
+.shop2-flat-list {
+  display: flex; flex-direction: column; gap: 0;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+.shopping-item {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid #edf0ee;
+  transition: background var(--transition-base);
+}
+.shopping-item:last-child { border-bottom: 0; }
+.shopping-item:hover { background: #f7f9f8; }
+.shopping-item.checked { background: #f0f7f4; }
+.shopping-item.checked .shopping-name strong { color: #8a958f; text-decoration: line-through; }
+.shopping-item.substituted { background: #fdf6ee; border-left: 3px solid var(--orange, #d97757); }
+
+.check-button {
+  width: 36px; height: 36px; border-radius: 50%;
+  display: grid; place-items: center;
+  border: 2px solid #c5d0cb; background: #fff;
+  cursor: pointer; flex: none;
+  transition: border-color var(--transition-base), background var(--transition-base);
+}
+.check-button:hover { border-color: var(--primary); }
+.check-button:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.custom-check { display: grid; place-items: center; color: var(--primary); }
+.shopping-item.checked .check-button { background: var(--primary); border-color: var(--primary); }
+.shopping-item.checked .custom-check { color: #fff; }
+
+.shopping-name { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 2px; }
+.shopping-name strong { display: flex; align-items: center; gap: 6px; font-size: var(--font-base); color: var(--text); }
+.shopping-name small { font-size: var(--font-xs); color: var(--muted); }
+.shopping-item b { font-size: var(--font-md); color: var(--text); flex: none; }
+
+/* ── 溢出菜单 ── */
+.shopping-actions { position: relative; flex: none; }
+.shopping-more { position: relative; }
+.shopping-actions .more-button { width: 30px; height: 30px; color: #5a6c63; }
+.shopping-actions .more-button:hover { border-color: #b7c6c0; color: var(--primary); }
+.more-menu { position: absolute; right: 0; top: calc(100% + 6px); z-index: 40; min-width: 176px; padding: 6px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-md); box-shadow: var(--shadow-lg); display: grid; gap: 2px; }
+.more-menu button { display: flex; align-items: center; gap: 10px; width: 100%; padding: 9px 10px; border: 0; background: transparent; border-radius: 6px; font-size: var(--font-sm); font-weight: 600; color: var(--text); text-align: left; cursor: pointer; }
+.more-menu button:hover { background: #f1f5f2; color: var(--primary); }
+.more-menu button:disabled { opacity: .5; cursor: not-allowed; }
+.more-menu button.danger-item { color: var(--red); }
+.more-menu button.danger-item:hover { background: #fdf1ec; color: var(--red); }
+.dropdown-enter-active, .dropdown-leave-active { transition: opacity var(--transition-fast), transform var(--transition-fast); transform-origin: top right; }
+.dropdown-enter-from, .dropdown-leave-to { opacity: 0; transform: translateY(-4px) scale(.98); }
+
+/* 替换徽标 */
+.subst-flag { font-style: normal; font-size: 9px; font-weight: 600; line-height: 1; padding: 3px 6px; border-radius: 10px; white-space: nowrap; }
+.subst-flag.pending { background: #fef3e8; color: #d97757; }
+.subst-flag.accepted { background: var(--primary-light, #e8f2ed); color: var(--primary, #2F7D68); }
+.subst-origin { color: #d97757; }
+
+/* G08 购物替代图谱化 */
+.subst-dialog { max-width: 520px; }
+.subst-body { padding: 16px 20px; min-height: 120px; }
+.subst-state { font-size: var(--font-sm); color: var(--muted); text-align: center; padding: 24px 0; }
+.subst-summary { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; font-size: var(--font-sm); color: var(--muted); }
+.subst-badge { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 10px; font-size: var(--font-xs); font-weight: 500; }
+.subst-badge.graph { background: var(--primary-light, #e8f2ed); color: var(--primary, #2F7D68); }
+.subst-badge.nutrition { background: #fef3e8; color: var(--orange, #d97757); }
+.subst-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+.subst-item { padding: 12px; border: 1px solid var(--line, #e2e8e4); border-radius: 8px; background: var(--surface, #faf9f5); }
+.subst-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.subst-head strong { font-size: var(--font-md); color: var(--text, #1f2933); }
+.subst-reason { margin: 6px 0 0; font-size: var(--font-sm); color: var(--muted); line-height: 1.5; }
+.subst-nutrition { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.subst-nutrition span { font-size: var(--font-xs); padding: 2px 6px; background: var(--bg, #f5f4ef); border-radius: 4px; color: var(--muted); }
+
+/* 通用 */
 .conversion-notes { margin-top: 12px; padding: 10px 12px; background: #f0f7f4; border: 1px solid #d4e6dc; border-radius: 6px; }
-.conversion-notes h4 { margin: 0 0 6px; font-size: 12px; color: #3a7d6b; }
+.conversion-notes h4 { margin: 0 0 6px; font-size: 12px; color: #2F7D68; }
 .conversion-notes ul { margin: 0; padding-left: 16px; }
 .conversion-notes li { font-size: 12px; color: #5a6c63; line-height: 1.6; }
-.history-dialog { max-width: 560px; }
-.history-toolbar { display: flex; gap: 10px; align-items: center; padding: 12px 20px; border-bottom: 1px solid var(--line); }
-.history-summary { display: flex; gap: 24px; padding: 14px 20px; border-bottom: 1px solid var(--line); }
-.history-summary > div { display: flex; flex-direction: column; gap: 2px; }
-.history-summary span { font-size: 11px; color: #8a958f; }
-.history-summary strong { font-size: 18px; color: #2d3436; }
-.history-category-summary { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 20px; border-bottom: 1px solid var(--line); }
-.category-chip { font-size: 11px; padding: 3px 8px; background: #f0f7f4; border-radius: 10px; color: #3a7d6b; }
-.history-list { max-height: 360px; overflow-y: auto; padding: 8px 20px; }
-.history-item { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid #f0f2ed; }
-.history-item:last-child { border-bottom: none; }
-.history-item small { display: block; font-size: 11px; color: #8a958f; margin-top: 2px; }
-.history-item b { font-size: 15px; color: #2d3436; }
-.badge-warn { display: inline-flex; align-items: center; justify-content: center; min-width: 18px; height: 18px; margin-left: 6px; padding: 0 5px; border-radius: 9px; background: #fde7e7; color: #c0392b; font-size: 11px; font-weight: 600; }
-.inventory-dialog { max-width: 600px; }
-.inventory-dialog h2 { display: inline-flex; align-items: center; gap: 8px; }
-.inventory-summary { display: flex; gap: 16px; align-items: center; font-size: 13px; color: #5a6c63; }
-.inventory-summary strong { color: #2d3436; }
-.low-stock-flag strong { color: #c0392b; }
-.inventory-list { max-height: 420px; overflow-y: auto; padding: 8px 20px; }
-.inventory-item { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid #f0f2ed; }
-.inventory-item:last-child { border-bottom: none; }
-.inventory-item.low .inv-main strong { color: #c0392b; }
-.inv-main small { display: block; font-size: 11px; color: #8a958f; margin-top: 2px; }
-.inv-side { display: flex; align-items: center; gap: 10px; }
-.inv-side .threshold { font-size: 11px; color: #8a958f; }
-.tag-ok { font-size: 11px; padding: 2px 8px; border-radius: 10px; background: #e6f4ec; color: #3a7d6b; font-style: normal; }
-.tag-warn { font-size: 11px; padding: 2px 8px; border-radius: 10px; background: #fdf3e7; color: #b8804a; font-style: normal; }
+.icon-button.ok { border-color: #b7d8c9; background: #eaf4ef; color: var(--primary, #2F7D68); }
+.icon-button.ok:hover { background: #dfeee6; border-color: var(--primary, #2F7D68); }
+.icon-button:disabled { opacity: .5; }
+
+@media (prefers-reduced-motion: reduce) {
+  .shopping-item { transition: none; }
+  .check-button { transition: none; }
+}
 </style>

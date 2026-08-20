@@ -218,3 +218,34 @@ class DomainRepository:
         await self._session.commit()
         await self._session.refresh(meal)
         return meal
+
+    async def add_shopping_item(
+        self, user_id: int, **values: object
+    ) -> PlanShoppingItem:
+        """为活跃计划新增一条购物项（用于餐食替换后的清单联动）。"""
+        plan = await PlanningRepository(self._session).get_active_plan(user_id)
+        if plan is None:
+            raise ValueError("没有活跃计划，无法添加购物项")
+        item = PlanShoppingItem(plan_id=plan.id, **values)
+        self._session.add(item)
+        await self._session.commit()
+        await self._session.refresh(item)
+        return item
+
+    async def remove_shopping_by_source(
+        self, user_id: int, source: str
+    ) -> list[PlanShoppingItem]:
+        """删除来源标记为 ``source`` 的购物项，返回被删除的 ORM 对象列表。
+
+        餐食替换只管理自己打标的清单项（``source == "餐食:{meal_id}"``），
+        不触碰规划阶段生成或用户手工添加的条目，避免误删其他餐食共享的食材。
+        """
+        plan = await PlanningRepository(self._session).get_active_plan(user_id)
+        if plan is None:
+            return []
+        removed = [item for item in plan.shopping_items if item.source == source]
+        for item in removed:
+            await self._session.delete(item)
+        if removed:
+            await self._session.commit()
+        return removed

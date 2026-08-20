@@ -6,11 +6,13 @@ import { api, apiErrorMessage } from '../api'
 import { useAppStore } from '../stores/app'
 
 type AuthMode = 'login' | 'register' | 'reset'
+type LoginMethod = 'password' | 'sms'
 
 const route = useRoute()
 const router = useRouter()
 const store = useAppStore()
 const mode = ref<AuthMode>('login')
+const loginMethod = ref<LoginMethod>('password')
 const phone = ref('')
 const verificationCode = ref('')
 const password = ref('')
@@ -27,8 +29,9 @@ let countdownTimer: ReturnType<typeof setInterval> | undefined
 
 const title = computed(() => mode.value === 'login' ? '欢迎回来' : mode.value === 'register' ? '创建 SoloChef 账号' : '重置密码')
 const subtitle = computed(() => mode.value === 'login' ? '登录后继续管理你的营养备餐计划' : mode.value === 'register' ? '验证手机号后创建个人账号并自动登录' : '验证手机号后设置新密码')
-const showCode = computed(() => mode.value !== 'login' || true)
-const showPassword = computed(() => mode.value !== 'login' || true)
+// 登录模式下按 loginMethod 切换显示密码或验证码；注册/重置模式两者都需要
+const showCode = computed(() => mode.value !== 'login' || loginMethod.value === 'sms')
+const showPassword = computed(() => mode.value !== 'login' || loginMethod.value === 'password')
 const rawPhone = computed(() => phone.value.replace(/\s/g, ''))
 const phoneValid = computed(() => /^1\d{10}$/.test(rawPhone.value))
 const codeValid = computed(() => /^\d{6}$/.test(verificationCode.value))
@@ -44,14 +47,15 @@ const passwordStrength = computed(() => {
   return Math.min(score, 4)
 })
 const strengthLabel = computed(() => ['弱', '较弱', '中等', '较强', '强'][passwordStrength.value])
-const strengthColor = computed(() => ['#c2413d', '#d97757', '#e6a817', '#8baa63', '#3a7d6b'][passwordStrength.value])
+const strengthColor = computed(() => ['#c2413d', '#d97757', '#e6a817', '#8baa63', '#2F7D68'][passwordStrength.value])
 const passwordError = computed(() => passwordTouched.value && password.value.length > 0 && password.value.length < 8 ? '密码至少需要8位' : '')
 const canSendCode = computed(() => phoneValid.value && countdown.value === 0 && !sendingCode.value && !loading.value)
 const canSubmit = computed(() => {
   if (loading.value || !phoneValid.value) return false
   if (mode.value === 'register') return codeValid.value && password.value.length >= 8 && !!displayName.value.trim()
   if (mode.value === 'reset') return codeValid.value && password.value.length >= 8
-  return codeValid.value || password.value.length >= 8
+  // 登录模式：按所选方式校验对应字段
+  return loginMethod.value === 'password' ? password.value.length >= 8 : codeValid.value
 })
 
 function changeMode(next: AuthMode) {
@@ -61,6 +65,7 @@ function changeMode(next: AuthMode) {
   phoneTouched.value = false
   passwordTouched.value = false
   verificationCode.value = ''
+  password.value = ''
 }
 
 function formatPhone(value: string) {
@@ -129,13 +134,25 @@ async function submit() {
     error.value = '请填写你的称呼'
     return
   }
-  if (showCode.value && !codeValid.value && !(mode.value === 'login' && password.value.length >= 8)) {
-    error.value = '请输入 6 位短信验证码或填写密码'
-    return
-  }
-  if (showPassword.value && password.value.length < 8 && !(mode.value === 'login' && codeValid.value)) {
-    error.value = '密码至少需要 8 位'
-    return
+  // 登录模式按所选方式校验；注册/重置模式两者都校验
+  if (mode.value === 'login') {
+    if (loginMethod.value === 'password' && password.value.length < 8) {
+      error.value = '密码至少需要 8 位'
+      return
+    }
+    if (loginMethod.value === 'sms' && !codeValid.value) {
+      error.value = '请输入 6 位短信验证码'
+      return
+    }
+  } else {
+    if (!codeValid.value) {
+      error.value = '请输入 6 位短信验证码'
+      return
+    }
+    if (password.value.length < 8) {
+      error.value = '密码至少需要 8 位'
+      return
+    }
   }
 
   loading.value = true
@@ -151,7 +168,7 @@ async function submit() {
     }
     const session = mode.value === 'register'
       ? await api.register({ phone: rawPhone.value, verification_code: verificationCode.value, password: password.value, display_name: displayName.value.trim() })
-      : (mode.value === 'login' && password.value.length >= 8)
+      : loginMethod.value === 'password'
         ? await api.login(rawPhone.value, password.value)
         : await api.smsLogin({ phone: rawPhone.value, code: verificationCode.value })
     store.setSession(session)
@@ -195,9 +212,12 @@ onUnmounted(() => {
         </div>
         <label v-if="mode === 'register'">你的称呼<input v-model="displayName" autocomplete="name" placeholder="例如：小王" /></label>
         <label>手机号<input v-model="phone" inputmode="numeric" autocomplete="tel" maxlength="13" placeholder="请输入手机号" :class="{ invalid: phoneError }" @blur="phoneTouched = true" /><span v-if="phoneError" class="field-hint error">{{ phoneError }}</span><span v-else-if="phoneTouched && phoneValid" class="field-hint success"><CheckCircle2 :size="12" />手机号格式正确</span></label>
-        <label v-if="showPassword && mode === 'login'">密码登录<div class="password-field"><input v-model="password" :type="visible ? 'text' : 'password'" autocomplete="current-password" maxlength="72" placeholder="输入密码登录" :class="{ invalid: passwordError }" @blur="passwordTouched = true" /><button type="button" :aria-label="visible ? '隐藏密码' : '显示密码'" @click="visible = !visible"><component :is="visible ? EyeOff : Eye" :size="17" /></button></div><span v-if="passwordError" class="field-hint error">{{ passwordError }}</span></label>
-        <div v-if="mode === 'login'" class="form-options"><label><input type="checkbox" checked />保持登录</label><button type="button" class="link-button" @click="changeMode('reset')">忘记密码？</button></div>
-        <div v-if="mode === 'login'" class="form-divider"><span>或 短信验证码登录</span></div>
+        <div v-if="mode === 'login'" class="auth-mode segmented login-method-switch" aria-label="登录方式">
+          <button type="button" :class="{ active: loginMethod === 'password' }" @click="loginMethod = 'password'">密码登录</button>
+          <button type="button" :class="{ active: loginMethod === 'sms' }" @click="loginMethod = 'sms'">验证码登录</button>
+        </div>
+        <label v-if="showPassword && mode === 'login'">密码<div class="password-field"><input v-model="password" :type="visible ? 'text' : 'password'" autocomplete="current-password" maxlength="72" placeholder="输入密码登录" :class="{ invalid: passwordError }" @blur="passwordTouched = true" /><button type="button" :aria-label="visible ? '隐藏密码' : '显示密码'" @click="visible = !visible"><component :is="visible ? EyeOff : Eye" :size="17" /></button></div><span v-if="passwordError" class="field-hint error">{{ passwordError }}</span></label>
+        <div v-if="mode === 'login' && loginMethod === 'password'" class="form-options"><button type="button" class="link-button" @click="changeMode('reset')">忘记密码？</button></div>
         <label v-if="showCode">短信验证码<div class="verification-field"><input v-model="verificationCode" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="输入 6 位验证码" /><button type="button" class="button secondary send-code" :disabled="!canSendCode" @click="sendCode"><Loader2 v-if="sendingCode" :size="14" class="spin" /><Send v-else :size="14" />{{ countdown ? `${countdown}s 后重发` : '发送验证码' }}</button></div><span class="field-hint"><MessageSquareText :size="12" />验证码 5 分钟内有效</span></label>
         <label v-if="showPassword && mode !== 'login'">{{ mode === 'reset' ? '新密码' : '密码' }}<div class="password-field"><input v-model="password" :type="visible ? 'text' : 'password'" autocomplete="new-password" maxlength="72" placeholder="至少 8 位" :class="{ invalid: passwordError }" @blur="passwordTouched = true" /><button type="button" :aria-label="visible ? '隐藏密码' : '显示密码'" @click="visible = !visible"><component :is="visible ? EyeOff : Eye" :size="17" /></button></div><span v-if="passwordError" class="field-hint error">{{ passwordError }}</span><div v-if="passwordTouched && password.length > 0" class="strength-bar"><div class="strength-fill" :style="{ width: `${(passwordStrength / 4) * 100}%`, background: strengthColor }" /><span :style="{ color: strengthColor }">密码强度：{{ strengthLabel }}</span></div></label>
         <p v-if="error" class="form-error" aria-live="polite"><XCircle :size="16" />{{ error }}</p>

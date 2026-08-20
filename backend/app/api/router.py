@@ -1,17 +1,27 @@
 from base64 import b64encode
 from collections import defaultdict
+from contextlib import suppress
 from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Any
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from app.ai.assistant_router import assistant_router_workflow
 from app.ai.evaluation import evaluate_plan
 from app.ai.llm import LLMGenerationError, smoke_test_llm
 from app.ai.prompts import agent_names, get_active, list_versions
+from app.ai.vision import (
+    ImageDecodeError,
+    ImageTooLargeError,
+    VisionError,
+    get_vision_service,
+    preprocess_image,
+)
 from app.api.dependencies import CurrentContext, OwnerContext, SessionDep
 from app.core.config import get_settings
 from app.models import (
@@ -27,10 +37,13 @@ from app.repositories import (
     FeedbackRepository,
     PlanningRepository,
 )
+from app.repositories.planning import is_current_weekly_plan
 from app.schemas import (
     AgentRun,
     AIServiceStatus,
     Dashboard,
+    IntentDecision,
+    IntentRequest,
     KnowledgeDocument,
     KnowledgeSearchRequest,
     KnowledgeSearchResponse,
@@ -39,9 +52,11 @@ from app.schemas import (
     MealItem,
     MealItemCreate,
     MealItemUpdate,
-    MemberProfile,
     PlanningRequest,
     PlanningResponse,
+    ReviseConfirmResponse,
+    RevisePreviewResponse,
+    ReviseRequest,
     ShoppingItem,
     ShoppingItemCreate,
     ShoppingItemUpdate,
@@ -49,6 +64,7 @@ from app.schemas import (
     WeeklyPlanSummary,
 )
 from app.schemas.domain import (
+    ActivePlanOverview,
     AgentEvaluation,
     AgentStatus,
     ArchivedPlanResponse,
@@ -64,6 +80,7 @@ from app.schemas.domain import (
     ChatSessionSummary,
     ChatSessionUpdate,
     ChatTurnResponse,
+    DayNutritionComparison,
     DeadLetterItem,
     Expense,
     ExpenseCreate,
@@ -72,42 +89,79 @@ from app.schemas.domain import (
     FeedbackEntry,
     FeedbackOverviewResponse,
     FeedbackSyncInfo,
+    MealCheckinRequest,
     MealReplacementRequest,
     MealReplacementResponse,
+    NutritionComparison,
     NutritionGoalResponse,
     NutritionReport,
+    PlanConfirmationResponse,
     PromptRegistryResponse,
     PromptVersionInfo,
     QueueStats,
     RagEvalResponse,
     Recipe,
+    RecipeCategory,
+    RecipeDetail,
     RecipeInput,
+    RecipeListResponse,
+    RecipeSummary,
+    RecipeTipsResponse,
     RecipeUpdate,
     ShoppingMergeResponse,
+    ShoppingImpactResponse,
+    ShoppingSubstitutionDecision,
+    ShoppingSubstitutionResponse,
+    ShoppingSyncResult,
+    SubstitutionSeedResponse,
+    SubstitutionSuggestion,
     SyncConsistencyResponse,
+    TasteDimension,
     TasteProfileResponse,
+    TasteVectorResponse,
+    TodayNutrient,
+    TodayNutritionResponse,
     UserProfileResponse,
     UserProfileUpdate,
+    VisionResult,
+    VisionScene,
+    WeeklyReportPeriod,
+    WeeklyReportResponse,
+    WeekNutrient,
+    WeekNutritionResponse,
 )
 from app.services.conversation import conversation_service
 from app.services.documents import DocumentParseError
 from app.services.domain import domain_operations_service
 from app.services.feedback_loop import (
     EXPENSE_RECORD,
+    MEAL_CHECKIN,
+    MEAL_DEVIATION_LABELS,
     SHOPPING_VERIFICATION,
     FeedbackSignal,
     FeedbackSyncResult,
     extract_taste_tags,
     feedback_loop_service,
+    taste_vector_from_tags,
 )
 from app.services.knowledge import get_knowledge_service
 from app.services.nutrition import (
+    build_nutrition_hints,
     build_nutrition_report,
     compute_nutrition_goal,
+    compute_recipe_nutrition,
+    nutrition_delta,
     nutrition_goal_to_targets,
 )
+from app.services.plan_revise import plan_revise_service
 from app.services.planning import planning_service
+from app.services.recipe import recipe_service
 from app.services.runtime import runtime_state
+from app.services.substitution import (
+    get_substitution_service,
+    seed_substitution_graph,
+)
+from app.services.weekly_report import weekly_report_service
 from app.worker import celery_app
 
 router = APIRouter()
@@ -117,6 +171,14 @@ knowledge_service = get_knowledge_service()
 
 async def _invalidate_user_cache(user_id: int) -> None:
     await runtime_state.delete_prefix(f"dashboard:{user_id}:")
+
+
+async def _profile_complete(session: SessionDep, user_id: int) -> bool:
+    """判断用户是否已完成建档：以是否已计算营养目标（nutrition_goals 行）为准。"""
+    goal = await session.scalar(
+        select(NutritionGoal).where(NutritionGoal.user_id == user_id)
+    )
+    return goal is not None
 
 
 @router.get("/health")
@@ -144,11 +206,15 @@ async def llm_smoke(_: OwnerContext) -> LLMSmokeResponse:
 @router.get("/dashboard", response_model=Dashboard)
 async def dashboard(context: CurrentContext, session: SessionDep) -> Dashboard:
     cache_key = f"dashboard:{context.user_id}:{context.user_id}"
+    now = datetime.now(UTC)
+    repo = PlanningRepository(session)
+    expired_count = await repo.expire_old_plans(context.user_id)
+    if expired_count > 0:
+        await runtime_state.delete(cache_key)
     cached = await runtime_state.get_json(cache_key)
     if cached is not None:
         return Dashboard.model_validate(cached)
-    now = datetime.now(UTC)
-    active_plan = await PlanningRepository(session).get_active_plan(context.user_id)
+    active_plan = await repo.get_active_plan(context.user_id)
     greeting = _time_based_greeting(now.hour) + f"，{context.display_name}"
     date_label = _format_date_label(now.date())
     placeholder_meal = MealItem(
@@ -185,8 +251,10 @@ async def dashboard(context: CurrentContext, session: SessionDep) -> Dashboard:
             budget=plan_budget,
             notices=notices,
             week_progress=0,
+            plan_expired=False,
         )
     else:
+        plan_expired = await repo.has_expired_plan(context.user_id)
         notices = _build_real_notices(empty_budget, has_plan=False)
         response = Dashboard(
             user_name=context.display_name,
@@ -198,12 +266,14 @@ async def dashboard(context: CurrentContext, session: SessionDep) -> Dashboard:
             budget=empty_budget,
             notices=notices,
             week_progress=0,
+            plan_expired=plan_expired,
         )
     await runtime_state.set_json(cache_key, response.model_dump(mode="json"), ttl=30)
     return response
 
 
 _WEEKDAY_CN = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+_PRODUCT_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
 def _time_based_greeting(hour: int) -> str:
@@ -281,6 +351,48 @@ def _shopping_response(item: object) -> ShoppingItem:
     return ShoppingItem.model_validate(item, from_attributes=True)
 
 
+def _normalize_food_name(value: str) -> str:
+    """Normalize ingredient names for plan dependency checks."""
+    return "".join(character for character in value.casefold() if character.isalnum())
+
+
+def _shopping_impact_response(plan: WeeklyPlan, item: object) -> ShoppingImpactResponse:
+    item_name = str(getattr(item, "name", ""))
+    normalized_item = _normalize_food_name(item_name)
+    affected = []
+    if normalized_item:
+        for meal in plan.meals:
+            ingredients = meal.ingredients or []
+            if any(
+                normalized_item in normalized_ingredient
+                or normalized_ingredient in normalized_item
+                for ingredient in ingredients
+                if (normalized_ingredient := _normalize_food_name(str(ingredient)))
+            ):
+                affected.append(
+                    {
+                        "id": meal.id,
+                        "day": meal.day,
+                        "meal_type": meal.meal_type,
+                        "name": meal.name,
+                    }
+                )
+    meal_labels = "、".join(
+        f"{meal['day']}{meal['meal_type']}《{meal['name']}》" for meal in affected
+    )
+    return ShoppingImpactResponse(
+        item_id=int(getattr(item, "id")),
+        item_name=item_name,
+        has_impact=bool(affected),
+        affected_meals=affected,
+        message=(
+            f"“{item_name}”被{meal_labels}使用，结构性修改需要通过调整计划生成新版本。"
+            if affected
+            else "该条目未被当前计划餐食直接引用，可以安全修改。"
+        ),
+    )
+
+
 def _recipe_response(recipe: RecipeRecord) -> Recipe:
     return Recipe.model_validate(recipe, from_attributes=True)
 
@@ -335,6 +447,11 @@ def _job_response(job: object) -> BackgroundJobResponse:
     return BackgroundJobResponse.model_validate(job, from_attributes=True)
 
 
+def _compute_is_expired(plan: WeeklyPlan) -> bool:
+    """A weekly plan is valid only for its creation week and complete 21-meal coverage."""
+    return not is_current_weekly_plan(plan)
+
+
 def _plan_summary_response(plan: WeeklyPlan) -> WeeklyPlanSummary:
     return WeeklyPlanSummary(
         id=plan.id,
@@ -349,10 +466,12 @@ def _plan_summary_response(plan: WeeklyPlan) -> WeeklyPlanSummary:
         meal_count=len(plan.meals),
         task_count=0,
         shopping_count=len(plan.shopping_items),
+        is_expired=_compute_is_expired(plan),
     )
 
 
-def _plan_detail_response(plan: WeeklyPlan) -> WeeklyPlanDetail:
+def _plan_detail_response(plan: WeeklyPlan, week_nutrition: WeekNutritionResponse | None = None) -> WeeklyPlanDetail:
+    estimated_cost = sum(float(item.price or 0) for item in plan.shopping_items)
     return WeeklyPlanDetail(
         id=plan.id,
         status=plan.status,
@@ -361,9 +480,13 @@ def _plan_detail_response(plan: WeeklyPlan) -> WeeklyPlanDetail:
         parent_plan_id=plan.parent_plan_id,
         prompt=plan.prompt,
         budget=plan.budget,
+        estimated_cost=estimated_cost,
         summary=plan.summary,
         conflicts=plan.conflicts,
-        suggestions=plan.suggestions,
+        conflict_details=plan.conflict_details,
+        auto_fixes=plan.auto_fixes,
+        needs_manual_review=plan.needs_manual_review,
+        manual_review_hint=plan.manual_review_hint,
         run_id=plan.run_id,
         created_at=plan.created_at,
         updated_at=plan.updated_at,
@@ -371,12 +494,16 @@ def _plan_detail_response(plan: WeeklyPlan) -> WeeklyPlanDetail:
         shopping=[_shopping_response(item) for item in plan.shopping_items],
         tasks=[],
         budget_record=None,
+        week_nutrition=week_nutrition,
+        is_expired=_compute_is_expired(plan),
     )
 
 
 @router.get("/meals", response_model=list[MealItem])
 async def meals(context: CurrentContext, session: SessionDep) -> list[MealItem]:
-    plan = await PlanningRepository(session).get_active_plan(context.user_id)
+    repo = PlanningRepository(session)
+    await repo.expire_old_plans(context.user_id)
+    plan = await repo.get_active_plan(context.user_id)
     return [_meal_response(item) for item in plan.meals] if plan is not None else []
 
 
@@ -402,27 +529,47 @@ async def get_profile(context: CurrentContext, session: SessionDep) -> UserProfi
         session.add(profile)
         await session.commit()
         await session.refresh(profile)
-    return UserProfileResponse.model_validate(profile, from_attributes=True)
+    response = UserProfileResponse.model_validate(profile, from_attributes=True)
+    response.profile_complete = await _profile_complete(session, context.user_id)
+    return response
+
+
+# 阶段6：影响规划的四个关键档案字段，任一变更即触发 needs_replan 提示。
+_REPLAN_SENSITIVE_FIELDS = ("goal_type", "activity_level", "constraints", "budget_limit")
 
 
 @router.put("/profile", response_model=UserProfileResponse)
 async def update_profile(
     request: UserProfileUpdate, context: CurrentContext, session: SessionDep
 ) -> UserProfileResponse:
-    """更新用户画像，不存在时自动创建后更新。"""
+    """更新用户画像，不存在时自动创建后更新。
+
+    规划触发检测（阶段6）：当影响规划的四个关键字段——``goal_type``（目标）、
+    ``activity_level``（活动量）、``constraints``（忌口）、``budget_limit``（预算）——
+    任一从旧值变更到新值时（非首次建档），在响应中置 ``needs_replan=True``，
+    提示前端"关键字段已变更，是否重新生成下周计划"。
+    """
     profile = await session.scalar(
         select(UserProfile).where(UserProfile.user_id == context.user_id)
     )
-    if profile is None:
+    is_new = profile is None
+    if is_new:
         profile = UserProfile(user_id=context.user_id)
         session.add(profile)
     values = request.model_dump(exclude_unset=True)
+    needs_replan = not is_new and any(
+        field in values and getattr(profile, field) != values[field]
+        for field in _REPLAN_SENSITIVE_FIELDS
+    )
     for key, value in values.items():
         setattr(profile, key, value)
     await session.commit()
     await session.refresh(profile)
     await _invalidate_user_cache(context.user_id)
-    return UserProfileResponse.model_validate(profile, from_attributes=True)
+    response = UserProfileResponse.model_validate(profile, from_attributes=True)
+    response.needs_replan = needs_replan
+    response.profile_complete = await _profile_complete(session, context.user_id)
+    return response
 
 
 @router.get("/profile/nutrition-goal", response_model=NutritionGoalResponse)
@@ -438,7 +585,9 @@ async def get_nutrition_goal(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="尚未计算营养目标，请先 POST /profile/nutrition-goal",
         )
-    return NutritionGoalResponse.model_validate(goal, from_attributes=True)
+    response = NutritionGoalResponse.model_validate(goal, from_attributes=True)
+    response.hints = build_nutrition_hints(goal)
+    return response
 
 
 @router.post(
@@ -449,9 +598,10 @@ async def get_nutrition_goal(
 async def compute_nutrition_goal_endpoint(
     context: CurrentContext, session: SessionDep
 ) -> NutritionGoalResponse:
-    """根据用户画像按 Mifflin-St Jeor 公式计算营养目标并持久化。
+    """根据用户画像计算营养目标并持久化。
 
-    若已存在营养目标则覆盖更新（``user_id`` 唯一约束）。
+    蛋白质系数基于 DRIs 2023 RNI + ISSN 运动营养立场声明，
+    根据目标类型 × 活动水平动态调整。若已存在营养目标则覆盖更新。
     """
     profile = await session.scalar(
         select(UserProfile).where(UserProfile.user_id == context.user_id)
@@ -476,7 +626,9 @@ async def compute_nutrition_goal_endpoint(
     await session.commit()
     await session.refresh(goal)
     await _invalidate_user_cache(context.user_id)
-    return NutritionGoalResponse.model_validate(goal, from_attributes=True)
+    response = NutritionGoalResponse.model_validate(goal, from_attributes=True)
+    response.hints = build_nutrition_hints(goal)
+    return response
 
 
 @router.get("/meals/nutrition", response_model=NutritionReport)
@@ -505,6 +657,47 @@ async def meal_taste_profile(
     必须声明在 ``/meals/{meal_id}`` 之前，否则会被路径参数路由抢先匹配。
     """
     return await _taste_profile_response(session, context.user_id)
+
+
+@router.get("/meals/today/nutrition", response_model=TodayNutritionResponse)
+async def today_nutrition(
+    context: CurrentContext, session: SessionDep
+) -> TodayNutritionResponse:
+    """按当日已吃餐食聚合今日营养目标达成进度。
+
+    当日由服务器本地日期的星期映射到计划的 ``day`` 中文标签（周一~周日），
+    只累计 ``eaten=True`` 的餐食，返回 {目标, 已摄入, 剩余, 达成率} 四条进度。
+    无营养目标快照时回退成年人兜底基准（与 :func:`build_nutrition_report` 一致）。
+    """
+    planning = PlanningRepository(session)
+    plan = await planning.get_active_plan(context.user_id)
+    goal = await session.scalar(
+        select(NutritionGoal).where(NutritionGoal.user_id == context.user_id)
+    )
+    targets = nutrition_goal_to_targets(goal) if goal is not None else None
+    recipes = await DomainRepository(session).list_recipes(context.user_id)
+
+    day_label = _WEEKDAY_CN[datetime.now(UTC).weekday()]
+    today_meals = [item for item in plan.meals if item.day == day_label] if plan else []
+    eaten_meals = [item for item in today_meals if item.eaten]
+
+    report = build_nutrition_report(eaten_meals, recipes, targets)
+    nutrients = {
+        key: TodayNutrient(
+            target=entry.target,
+            consumed=entry.actual,
+            remaining=round(entry.target - entry.actual, 1),
+            percent=entry.percent,
+        )
+        for key, entry in report.nutrients.items()
+    }
+    return TodayNutritionResponse(
+        day=day_label,
+        meal_count=len(today_meals),
+        eaten_count=len(eaten_meals),
+        nutrients=nutrients,
+        overall_percent=report.overall_percent,
+    )
 
 
 @router.get("/meals/{meal_id}", response_model=MealItem)
@@ -548,7 +741,7 @@ async def replace_meal(
     context: CurrentContext,
     session: SessionDep,
 ) -> MealReplacementResponse:
-    item, sync = await domain_operations_service.replace_meal(
+    outcome = await domain_operations_service.replace_meal(
         session,
         user_id=context.user_id,
         meal_id=meal_id,
@@ -556,14 +749,102 @@ async def replace_meal(
         rating=request.rating,
         tags=request.tags,
     )
-    if item is None:
+    if outcome is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="餐食记录不存在")
     await _invalidate_user_cache(context.user_id)
     return MealReplacementResponse(
-        meal=_meal_response(item),
-        feedback=_feedback_sync_info(sync),
+        meal=_meal_response(outcome.meal),
+        feedback=_feedback_sync_info(outcome.feedback),
         taste_profile=await _taste_profile_response(session, context.user_id),
+        meal_nutrition=NutritionComparison(
+            before=outcome.meal_nutrition_before,
+            after=outcome.meal_nutrition_after,
+            delta=nutrition_delta(outcome.meal_nutrition_before, outcome.meal_nutrition_after),
+            calibrated_before=outcome.meal_calibrated_before,
+            calibrated_after=outcome.meal_calibrated_after,
+        ),
+        day_nutrition=DayNutritionComparison(
+            day=outcome.day,
+            before=outcome.day_nutrition_before,
+            after=outcome.day_nutrition_after,
+            delta=nutrition_delta(outcome.day_nutrition_before, outcome.day_nutrition_after),
+        ),
+        shopping_sync=ShoppingSyncResult(
+            added=outcome.shopping_added,
+            removed=outcome.shopping_removed,
+            merged_groups=outcome.shopping_merged_groups,
+            removed_duplicates=outcome.shopping_removed_duplicates,
+        ),
     )
+
+
+@router.post("/meals/{meal_id}/checkin", response_model=MealItem)
+async def checkin_meal(
+    meal_id: int,
+    request: MealCheckinRequest,
+    context: CurrentContext,
+    session: SessionDep,
+) -> MealItem:
+    """餐食"已吃"打卡：记录已吃时间或未吃偏差，并回流到反馈闭环。
+
+    已吃（``eaten=True``）时清除偏差，记录 ``eaten_at``；
+    未吃（``eaten=False``）时落 ``deviation_type`` + ``deviation_reason``，
+    负向信号供下一轮餐食智能体回避（如"没买到 → 换更易采购的食材"）。
+    """
+    repository = PlanningRepository(session)
+    meal = await repository.get_meal_item(meal_id, context.user_id)
+    if meal is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="餐食记录不存在")
+    meal_plan = await session.get(WeeklyPlan, meal.plan_id)
+    if meal_plan is not None and meal_plan.status == "confirmed" and meal_plan.run_id is not None:
+        today_index = datetime.now(_PRODUCT_TIMEZONE).date().weekday()
+        try:
+            meal_day_index = _WEEKDAY_CN.index(meal.day)
+        except ValueError:
+            meal_day_index = None
+        if meal_day_index is not None and meal_day_index > today_index:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="不能打卡未来日期的餐食",
+            )
+    meal.eaten = request.eaten
+    meal.eaten_at = datetime.now(UTC) if request.eaten else None
+    if request.eaten:
+        meal.deviation_type = None
+        meal.deviation_reason = ""
+    else:
+        meal.deviation_type = request.deviation_type
+        meal.deviation_reason = request.deviation_reason
+    await repository.save_item(meal)
+
+    # 取消打卡只是撤销执行状态；只有打卡成功或提交明确偏差时才写入反馈，
+    # 避免同一餐因反复点击打卡/取消而生成互相矛盾的正负反馈。
+    if request.eaten or request.deviation_type or request.deviation_reason.strip():
+        if request.eaten:
+            content = "已吃"
+            sentiment = "positive"
+            tags: tuple[str, ...] = ()
+        else:
+            label = MEAL_DEVIATION_LABELS.get(request.deviation_type or "", request.deviation_type or "未吃")
+            content = f"{label}：{request.deviation_reason}".strip("：")
+            sentiment = "negative"
+            tags = extract_taste_tags(request.deviation_reason, meal.tags)
+        await feedback_loop_service.capture(
+            session,
+            FeedbackSignal(
+                user_id=context.user_id,
+                feedback_type=MEAL_CHECKIN,
+                subject=meal.name,
+                content=content,
+                reference_type="plan_meal_item",
+                reference_id=meal_id,
+                tags=tags,
+                sentiment=sentiment,
+                source="user",
+            ),
+        )
+    await _invalidate_user_cache(context.user_id)
+    return _meal_response(meal)
 
 
 @router.get("/shopping", response_model=list[ShoppingItem])
@@ -581,6 +862,21 @@ async def create_shopping_item(
         **request.model_dump(),
     )
     return _shopping_response(item)
+
+
+@router.get("/shopping/{item_id}/impact", response_model=ShoppingImpactResponse)
+async def shopping_item_impact(
+    item_id: int, context: CurrentContext, session: SessionDep
+) -> ShoppingImpactResponse:
+    """Return the meals that depend on a shopping item before structural edits."""
+    repository = PlanningRepository(session)
+    item = await repository.get_shopping_item(item_id, context.user_id)
+    if item is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="购物条目不存在")
+    plan = await repository.get_plan(item.plan_id, context.user_id)
+    if plan is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="关联计划不存在")
+    return _shopping_impact_response(plan, item)
 
 
 @router.get("/shopping/{item_id}", response_model=ShoppingItem)
@@ -606,7 +902,20 @@ async def update_shopping_item(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="购物条目不存在")
     was_purchased = item.purchased
     planned_price = item.price
-    for key, value in request.item_changes().items():
+    changes = request.item_changes()
+    structural_change = any(
+        key in changes and changes[key] != getattr(item, key)
+        for key in ("name", "quantity")
+    )
+    if structural_change:
+        plan = await repository.get_plan(item.plan_id, context.user_id)
+        impact = _shopping_impact_response(plan, item) if plan is not None else None
+        if impact is not None and impact.has_impact:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=impact.model_dump(),
+            )
+    for key, value in changes.items():
         setattr(item, key, value)
     await repository.save_item(item)
     # 采购项从未购买切换为已购买时，把核销结果回流为执行反馈
@@ -643,6 +952,13 @@ async def delete_shopping_item(item_id: int, context: CurrentContext, session: S
     item = await repository.get_shopping_item(item_id, context.user_id)
     if item is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="购物条目不存在")
+    plan = await repository.get_plan(item.plan_id, context.user_id)
+    impact = _shopping_impact_response(plan, item) if plan is not None else None
+    if impact is not None and impact.has_impact:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=impact.model_dump(),
+        )
     await repository.delete_item(item)
 
 
@@ -659,21 +975,144 @@ async def merge_shopping(context: CurrentContext, session: SessionDep) -> Shoppi
     )
 
 
-@router.get("/shopping/{item_id}/substitutions")
+@router.get(
+    "/shopping/{item_id}/substitutions",
+    response_model=ShoppingSubstitutionResponse,
+)
 async def shopping_substitutions(
-    item_id: int, context: CurrentContext, session: SessionDep
-) -> dict[str, Any]:
+    item_id: int,
+    context: CurrentContext,
+    session: SessionDep,
+    limit: int = Query(default=5, ge=1, le=10, description="返回替代建议数量"),
+) -> ShoppingSubstitutionResponse:
+    """G08 购物替代图谱化：图谱显式关系 + 营养相似度兜底。
+
+    优先查询 Neo4j ``SUBSTITUTABLE_FOR`` 边（人工标注的权威替代）；
+    图谱无命中时按食材营养库四维向量余弦相似度返回 Top-N 近似替代。
+    外部依赖不可用时只降级返回空列表，不阻断主业务。
+    """
     item = await PlanningRepository(session).get_shopping_item(item_id, context.user_id)
     if item is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="购物项不存在")
-    substitutions = {
-        "牛肉": ["鸡胸肉", "豆腐"],
-        "牛奶": ["无糖豆浆", "低脂牛奶"],
-        "白米": ["糙米", "燕麦米"],
-        "花生油": ["菜籽油", "橄榄油"],
-    }
-    matches = next((values for key, values in substitutions.items() if key in item.name), [])
-    return {"item_id": item.id, "name": item.name, "suggestions": matches}
+
+    service = get_substitution_service()
+    suggestions = await service.suggest(item.name, limit=limit)
+
+    # 按来源统计命中数，便于前端区分"权威替代"与"营养近似"
+    source_summary: dict[str, int] = {}
+    for suggestion in suggestions:
+        source_summary[suggestion.source] = source_summary.get(suggestion.source, 0) + 1
+
+    return ShoppingSubstitutionResponse(
+        item_id=item.id,
+        name=item.name,
+        suggestions=[
+            SubstitutionSuggestion(
+                name=s.name,
+                reason=s.reason,
+                similarity=s.similarity,
+                source=s.source,
+                nutrition=s.nutrition,
+            )
+            for s in suggestions
+        ],
+        source_summary=source_summary,
+    )
+
+
+@router.post("/shopping/{item_id}/auto-substitute", response_model=ShoppingItem)
+async def auto_substitute_shopping_item(
+    item_id: int, context: CurrentContext, session: SessionDep
+) -> ShoppingItem:
+    """食材替换确认闭环：自动召回等价品替换当前购物项。
+
+    对购物项名称召回 Top-1 替代建议（图谱显式关系优先，营养相似度兜底），
+    有命中时把名称替换为替代品并记录 ``substituted_from``（原食材名）、
+    ``substituted_accepted=None``（待用户确认）。无命中时原样返回
+    （``substituted_from`` 保持 None），由前端提示"暂无替代"。
+    """
+    repository = PlanningRepository(session)
+    item = await repository.get_shopping_item(item_id, context.user_id)
+    if item is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="购物项不存在")
+
+    service = get_substitution_service()
+    suggestions = await service.suggest(item.name, limit=1)
+    if not suggestions:
+        return _shopping_response(item)
+
+    item.substituted_from = item.name
+    item.name = suggestions[0].name
+    item.substituted_accepted = None
+    await repository.save_item(item)
+    return _shopping_response(item)
+
+
+@router.post("/shopping/{item_id}/substitution/accept", response_model=ShoppingItem)
+async def accept_shopping_substitution(
+    item_id: int,
+    request: ShoppingSubstitutionDecision,
+    context: CurrentContext,
+    session: SessionDep,
+) -> ShoppingItem:
+    """食材替换确认闭环：接受 / 拒绝 / 换一个。
+
+    - ``accept``：确认替换（``substituted_accepted=True``）。
+    - ``reject``：回退到 ``substituted_from`` 并清空替换标记。
+    - ``swap``：换成指定替代品（或自动召回下一条），保持待确认状态。
+    """
+    repository = PlanningRepository(session)
+    item = await repository.get_shopping_item(item_id, context.user_id)
+    if item is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="购物项不存在")
+
+    original = item.substituted_from
+    if original is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="该购物项没有待确认的替换"
+        )
+
+    if request.action == "accept":
+        item.substituted_accepted = True
+    elif request.action == "reject":
+        item.name = original
+        item.substituted_from = None
+        item.substituted_accepted = None
+    else:  # swap
+        next_name = request.name
+        if not next_name:
+            service = get_substitution_service()
+            suggestions = await service.suggest(original, limit=10)
+            next_name = next((s.name for s in suggestions if s.name != item.name), None)
+        if not next_name:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="没有更多替代建议"
+            )
+        item.name = next_name
+        item.substituted_accepted = None
+
+    await repository.save_item(item)
+    return _shopping_response(item)
+
+
+@router.post(
+    "/admin/substitutions/seed",
+    response_model=SubstitutionSeedResponse,
+)
+async def seed_substitutions(_: OwnerContext) -> SubstitutionSeedResponse:
+    """把 ``ingredient_substitutions.json`` 种子数据同步到 Neo4j 图谱。
+
+    幂等操作，重复调用只会 MERGE 不会重复创建。Neo4j 不可用时返回 0。
+    """
+    from app.data import load_ingredient_substitutions
+
+    pairs = load_ingredient_substitutions()
+    seeded = await seed_substitution_graph()
+    return SubstitutionSeedResponse(
+        seeded_edges=seeded,
+        total_pairs=len(pairs),
+        note="替代关系已同步至图谱" if seeded else "图谱不可用或无写入，请检查 Neo4j 连接",
+    )
 
 
 @router.get("/budget/expenses", response_model=list[Expense])
@@ -729,6 +1168,24 @@ async def budget_analytics(context: CurrentContext, session: SessionDep) -> Budg
     return await domain_operations_service.budget_analytics(session, context.user_id)
 
 
+@router.get("/reports/weekly", response_model=WeeklyReportResponse)
+async def weekly_report(
+    context: CurrentContext,
+    session: SessionDep,
+    week_start: date | None = Query(default=None),
+) -> WeeklyReportResponse:
+    """Return a weekly review, optionally for a selected natural week."""
+    return await weekly_report_service.build_report(session, context.user_id, week_start)
+
+
+@router.get("/reports/weekly/periods", response_model=list[WeeklyReportPeriod])
+async def weekly_report_periods(
+    context: CurrentContext, session: SessionDep
+) -> list[WeeklyReportPeriod]:
+    """List natural weeks that have confirmed plans and can be reviewed."""
+    return await weekly_report_service.list_periods(session, context.user_id)
+
+
 @router.get("/feedback", response_model=FeedbackOverviewResponse)
 async def feedback_overview(
     context: CurrentContext,
@@ -756,11 +1213,24 @@ async def feedback_overview(
 async def resync_feedback(
     context: CurrentContext, session: SessionDep
 ) -> FeedbackOverviewResponse:
-    """补偿重放：把此前因 Neo4j / Chroma 不可用而未回流的反馈再推一次。"""
+    """补偿重放：把此前因 Neo4j / 向量库 不可用而未回流的反馈再推一次。"""
     repository = FeedbackRepository(session)
     for row in await repository.pending_sync(context.user_id):
         await feedback_loop_service.replay(session, row)
     return await feedback_overview(context, session)
+
+
+@router.get("/feedback/taste-vector", response_model=TasteVectorResponse)
+async def taste_vector(
+    context: CurrentContext, session: SessionDep
+) -> TasteVectorResponse:
+    """五维口味画像向量（§7.4）：辣/清淡/甜/咸/酸，供反馈复盘雷达渲染。"""
+    profile = await FeedbackRepository(session).taste_profile(context.user_id)
+    dimensions = [
+        TasteDimension(**dim)
+        for dim in taste_vector_from_tags(profile.liked_tags, profile.disliked_tags)
+    ]
+    return TasteVectorResponse(dimensions=dimensions, sample_size=profile.sample_size)
 
 
 @router.get("/budget/expenses/history", response_model=ExpenseHistoryResponse)
@@ -795,20 +1265,57 @@ async def expense_history(
     )
 
 
-@router.get("/recipes", response_model=list[Recipe])
-async def list_recipes(context: CurrentContext, session: SessionDep) -> list[Recipe]:
-    records = await DomainRepository(session).list_recipes(context.user_id)
-    return [_recipe_response(record) for record in records]
+@router.get("/recipes", response_model=RecipeListResponse)
+async def list_recipes(
+    category: str | None = None,
+    page: int = 1,
+    page_size: int = 8,
+) -> RecipeListResponse:
+    return recipe_service.list_recipes(category=category, page=page, page_size=page_size)
+
+
+@router.get("/recipes/{recipe_id}", response_model=RecipeDetail)
+async def get_recipe(recipe_id: str) -> RecipeDetail:
+    recipe = recipe_service.get_recipe(recipe_id)
+    if recipe is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="菜谱不存在")
+    return recipe
+
+
+@router.get("/recipes/{recipe_id}/similar", response_model=list[RecipeSummary])
+async def similar_recipes(
+    recipe_id: str, limit: int = Query(default=3, ge=1, le=8)
+) -> list[RecipeSummary]:
+    """返回与当前菜谱标签重叠 / 同分类的相似菜谱（确定性检索，无分页）。"""
+    if recipe_service.get_recipe(recipe_id) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="菜谱不存在")
+    return recipe_service.similar_recipes(recipe_id, limit=limit)
+
+
+@router.get("/recipes/{recipe_id}/tips", response_model=RecipeTipsResponse)
+async def recipe_tips(recipe_id: str) -> RecipeTipsResponse:
+    """营养师小贴士：确定性生成 + 进程内缓存（§8，后续可替换为 LLM 生成）。"""
+    tip = recipe_service.recipe_tip(recipe_id)
+    if tip is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="菜谱不存在")
+    return RecipeTipsResponse(recipe_id=recipe_id, tip=tip)
 
 
 @router.post("/recipes", response_model=Recipe, status_code=status.HTTP_201_CREATED)
 async def create_recipe(
     request: RecipeInput, context: CurrentContext, session: SessionDep
 ) -> Recipe:
+    # 自动计算 nutrition：根据 ingredients 累加食材库营养，填入总营养。
+    # 复用 nutrition.py 的公开函数，保证与 Verifier 兜底估算逻辑一致。
+    values = request.model_dump()
+    values["nutrition"] = compute_recipe_nutrition(
+        ingredients=values.get("ingredients", []),
+        servings=values.get("servings", 2),
+    )
     try:
         recipe = await DomainRepository(session).create_recipe(
             context.user_id,
-            **request.model_dump(),
+            **values,
         )
     except IntegrityError as exc:
         await session.rollback()
@@ -848,7 +1355,7 @@ async def knowledge(context: CurrentContext) -> list[KnowledgeDocument]:
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Chroma 知识库不可用: {type(exc).__name__}",
+            detail=f"向量知识库不可用: {type(exc).__name__}",
         ) from exc
 
 
@@ -907,16 +1414,11 @@ async def upload_knowledge_document(
 async def search_knowledge(
     request: KnowledgeSearchRequest, context: CurrentContext, session: SessionDep
 ) -> KnowledgeSearchResponse:
-    profiles: list[MemberProfile] = []
-    # Phase 3 清理：calendar_events 表已删除，日程上下文恒为空
-    events: list = []
     domain = await _graph_domain_context(context.user_id, session)
     return await knowledge_service.search(
         request.query,
         context.user_id,
         request.top_k,
-        members=profiles,
-        events=events,
         domain=domain,
     )
 
@@ -926,16 +1428,18 @@ async def bootstrap_knowledge(
     context: OwnerContext, session: SessionDep
 ) -> list[KnowledgeDocument]:
     try:
-        profiles: list[MemberProfile] = []
-        # Phase 3 清理：calendar_events 表已删除，日程上下文恒为空
-        events: list = []
         domain = await _graph_domain_context(context.user_id, session)
-        return await knowledge_service.bootstrap(context.user_id, profiles, events, domain)
+        documents = await knowledge_service.bootstrap(context.user_id, domain)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"初始化知识库失败: {type(exc).__name__}",
         ) from exc
+    # G08：顺带把食材替代关系种子同步到图谱（全局领域常识，非用户私有数据）。
+    # 失败不影响知识库初始化结果，可由 /admin/substitutions/seed 手动重试。
+    with suppress(Exception):
+        await seed_substitution_graph()
+    return documents
 
 
 @router.delete("/knowledge/documents/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -1108,7 +1612,7 @@ async def celery_stats(
 async def rag_sync_consistency(
     context: OwnerContext, session: SessionDep
 ) -> SyncConsistencyResponse:
-    """返回 Chroma 与 Neo4j 检索索引的同步一致性快照。"""
+    """返回向量库与 Neo4j 检索索引的同步一致性快照。"""
     del session
     return await knowledge_service.consistency_report(context.user_id)
 
@@ -1174,6 +1678,23 @@ async def create_chat_session(
     return _chat_summary(chat)
 
 
+@router.post("/assistant/intent", response_model=IntentDecision)
+async def classify_assistant_intent(
+    request: IntentRequest, context: CurrentContext, session: SessionDep
+) -> IntentDecision:
+    """Classify free text before selecting a write or read-only subgraph."""
+    # Active-plan context is security-sensitive routing state. The server is
+    # authoritative even when an older client still submits has_active_plan.
+    has_active_plan = (
+        await PlanningRepository(session).get_active_plan(context.user_id) is not None
+    )
+    return await assistant_router_workflow.route(
+        request.prompt,
+        has_active_plan=has_active_plan,
+        entry_context=request.entry_context,
+    )
+
+
 @router.get("/chat/sessions", response_model=list[ChatSessionSummary])
 async def list_chat_sessions(
     context: CurrentContext,
@@ -1235,17 +1756,12 @@ async def create_chat_turn(
         f"chat:{context.user_id}:{context.user_id}", limit=20, window_seconds=60
     ):
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="请求过于频繁")
-    members: list[MemberProfile] = []
-    # Phase 3 清理：calendar_events 表已删除，日程上下文恒为空
-    events: list = []
     result = await conversation_service.run_turn(
         session,
         session_id=str(session_id),
         user_id=context.user_id,
         content=request.content,
         budget=request.budget,
-        members=members,
-        events=events,
     )
     if result is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="对话不存在")
@@ -1266,17 +1782,12 @@ async def stream_chat_turn(
         f"chat:{context.user_id}:{context.user_id}", limit=20, window_seconds=60
     ):
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="请求过于频繁")
-    members: list[MemberProfile] = []
-    # Phase 3 清理：calendar_events 表已删除，日程上下文恒为空
-    events: list = []
     stream = conversation_service.stream_turn(
         session,
         session_id=str(session_id),
         user_id=context.user_id,
         content=request.content,
         budget=request.budget,
-        members=members,
-        events=events,
     )
     return StreamingResponse(
         stream,
@@ -1314,6 +1825,50 @@ async def replay_chat_events(
     return {"events": events, "turn_status": turn_status}
 
 
+@router.post("/chat/vision", response_model=VisionResult)
+async def recognize_image(
+    context: CurrentContext,
+    scene: VisionScene = Form(VisionScene.AUTO),  # noqa: B008
+    image: UploadFile = File(...),  # noqa: B008
+) -> VisionResult:
+    """多模态图片识别：默认自动判断场景，也可指定识别类型。
+
+    频率限制：vlm_rate_limit_per_minute 次/分钟（默认 10），与 chat 文本对话独立计数。
+    """
+    vision_service = get_vision_service()
+    if vision_service is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="视觉模型未启用（检查 VLM_ENABLED 和 VLM_API_KEY）",
+        )
+    if not await runtime_state.allow(
+        f"vision:{context.user_id}",
+        limit=settings.vlm_rate_limit_per_minute,
+        window_seconds=60,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="图片识别请求过于频繁，请稍后再试",
+        )
+
+    raw = await image.read()
+    try:
+        processed = preprocess_image(raw, settings)
+    except ImageTooLargeError as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
+    except ImageDecodeError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    try:
+        result = await vision_service.recognize(processed, scene)
+    except VisionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)
+        ) from exc
+
+    return VisionResult(**result)
+
+
 @router.post(
     "/plans/generate-weekly", response_model=PlanningResponse, status_code=status.HTTP_201_CREATED
 )
@@ -1330,18 +1885,15 @@ async def generate_weekly(
     scoped_request = request.model_copy(
         update={"user_id": context.user_id}
     )
-    profiles: list[MemberProfile] = []
-    # Phase 3 清理：calendar_events 表已删除，日程上下文恒为空
-    events: list = []
     return await planning_service.generate(
-        scoped_request, members=profiles, events=events, session=session
+        scoped_request, session=session
     )
 
 
-@router.post("/plans/{run_id}/confirm")
+@router.post("/plans/{run_id}/confirm", response_model=PlanConfirmationResponse)
 async def confirm_plan(
     run_id: UUID, context: CurrentContext, session: SessionDep
-) -> dict[str, Any]:
+) -> PlanConfirmationResponse:
     repo = PlanningRepository(session)
     record = await repo.get_agent_run(str(run_id), context.user_id)
     if record is None:
@@ -1354,26 +1906,44 @@ async def confirm_plan(
 
     existing = await repo.get_plan_by_run_id(str(run_id), context.user_id)
     if existing is not None:
-        return {
-            "plan_id": existing.id,
-            "run_id": str(run_id),
-            "status": "confirmed",
-            "message": "计划已存在（幂等确认）",
-        }
+        persisted = await repo.get_plan(existing.id, context.user_id)
+        if persisted is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Plan not found")
+        return PlanConfirmationResponse(
+            **_plan_detail_response(persisted).model_dump(),
+            plan_id=persisted.id,
+            message="计划已存在（幂等确认）",
+        )
 
     # Phase 3 清理：calendar_events 表删除后，确认计划不再做日程冲突校验
     payload = record.payload or {}
     budget_payload = payload.get("budget", {})
+    budget_limit = float(budget_payload.get("limit", 500))
+    shopping_estimated = round(
+        sum(float(item.get("price", 0) or 0) for item in payload.get("shopping", [])),
+        2,
+    )
+    if shopping_estimated > budget_limit:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"采购清单估价 ¥{shopping_estimated:g} 超过预算 ¥{budget_limit:g}，"
+                "请调整计划后再确认"
+            ),
+        )
     try:
         plan = await repo.create_confirmed_plan(
             user_id=context.user_id,
             run_id=str(run_id),
             prompt=record.prompt,
             plan_values={
-                "budget": budget_payload.get("limit", 500),
+                "budget": budget_limit,
                 "summary": payload.get("summary", ""),
                 "conflicts": payload.get("conflicts", []),
-                "suggestions": payload.get("suggestions", []),
+                "conflict_details": payload.get("conflict_details", []),
+                "auto_fixes": payload.get("auto_fixes", []),
+                "needs_manual_review": payload.get("needs_manual_review", False),
+                "manual_review_hint": payload.get("manual_review_hint", ""),
             },
             meals=payload.get("meals", []),
             shopping=payload.get("shopping", []),
@@ -1383,14 +1953,19 @@ async def confirm_plan(
         existing_plan = await repo.get_plan_by_run_id(str(run_id), context.user_id)
         if existing_plan is None:
             raise
-        plan = existing_plan
+        plan = await repo.get_plan(existing_plan.id, context.user_id)
+        if plan is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Plan not found")
+    else:
+        plan = await repo.get_plan(plan.id, context.user_id)
+        if plan is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Plan not found")
     await _invalidate_user_cache(context.user_id)
-    return {
-        "plan_id": plan.id,
-        "run_id": str(run_id),
-        "status": "confirmed",
-        "message": "计划已保存到家庭空间",
-    }
+    return PlanConfirmationResponse(
+        **_plan_detail_response(plan).model_dump(),
+        plan_id=plan.id,
+        message="计划已保存",
+    )
 
 
 @router.get("/agents/prompts", response_model=PromptRegistryResponse)
@@ -1505,9 +2080,6 @@ async def retry_agent_run(
     )
     if resumed is not None:
         return resumed
-    members: list[MemberProfile] = []
-    # Phase 3 清理：calendar_events 表已删除，日程上下文恒为空
-    events: list = []
     budget_value = (record.payload or {}).get("budget", {})
     budget = float(budget_value.get("limit", 500)) if isinstance(budget_value, dict) else 500
     return await planning_service.generate(
@@ -1516,8 +2088,6 @@ async def retry_agent_run(
             budget=budget,
             user_id=context.user_id,
         ),
-        members=members,
-        events=events,
         session=session,
     )
 
@@ -1525,8 +2095,26 @@ async def retry_agent_run(
 @router.get("/plans", response_model=list[WeeklyPlanSummary])
 async def list_plans(context: CurrentContext, session: SessionDep) -> list[WeeklyPlanSummary]:
     repo = PlanningRepository(session)
+    await repo.expire_old_plans(context.user_id)
     plans = await repo.list_plans(context.user_id)
     return [_plan_summary_response(plan) for plan in plans]
+
+
+@router.get("/plans/active/overview", response_model=ActivePlanOverview)
+async def active_plan_overview(
+    context: CurrentContext, session: SessionDep
+) -> ActivePlanOverview:
+    """Return the active plan and its version history for the execution page."""
+    repository = PlanningRepository(session)
+    await repository.expire_old_plans(context.user_id)
+    plan = await repository.get_active_plan(context.user_id)
+    if plan is None:
+        return ActivePlanOverview()
+    versions = await repository.list_plan_versions(plan.id, context.user_id) or []
+    return ActivePlanOverview(
+        plan=_plan_detail_response(plan),
+        versions=[_plan_summary_response(item) for item in versions],
+    )
 
 
 @router.get("/plans/{plan_id}/versions", response_model=list[WeeklyPlanSummary])
@@ -1592,6 +2180,128 @@ async def derive_plan(
     return _plan_detail_response(derived)
 
 
+@router.post("/plans/{plan_id}/revise", response_model=RevisePreviewResponse)
+async def revise_plan(
+    plan_id: int,
+    request: ReviseRequest,
+    context: CurrentContext,
+    session: SessionDep,
+) -> RevisePreviewResponse:
+    """提交自然语言修改要求，返回修改预览（不落库）。
+
+    预览存到对话消息 ``payload``，前端在右侧对话区展示历史。
+    用户确认后调 ``POST /plans/{plan_id}/revise/{revise_id}/confirm`` 落库。
+    """
+    if not await runtime_state.allow(
+        f"plan_revise:{context.user_id}:{plan_id}", limit=20, window_seconds=60
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="修改请求过于频繁",
+        )
+    repository = PlanningRepository(session)
+    plan = await repository.get_plan(plan_id, context.user_id)
+    if plan is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="计划不存在")
+    try:
+        preview = await plan_revise_service.generate_preview(
+            plan=plan,
+            message=request.message,
+            session=session,
+            user_id=context.user_id,
+            chat_session_id=request.session_id,
+        )
+    except LLMGenerationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"无法解析修改要求：{str(exc)[:300]}",
+        ) from exc
+    return preview
+
+
+@router.post(
+    "/plans/{plan_id}/revise/{revise_id}/confirm",
+    response_model=ReviseConfirmResponse,
+)
+async def confirm_revise(
+    plan_id: int,
+    revise_id: int,
+    context: CurrentContext,
+    session: SessionDep,
+) -> ReviseConfirmResponse:
+    """确认修改预览，派生新版本（带 parent_plan_id）。
+
+    从对话消息 ``payload`` 取出预览时已算好的修改后子项列表，直接落库——
+    不再重复 LLM 调用或业务计算。
+    """
+    repository = PlanningRepository(session)
+    plan = await repository.get_plan(plan_id, context.user_id)
+    if plan is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="计划不存在")
+
+    chat_repository = ConversationRepository(session)
+    message = await chat_repository.get_message(revise_id, context.user_id)
+    if message is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="修改预览不存在")
+    payload = message.payload or {}
+    if payload.get("kind") != "plan_revise_preview":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="消息不是有效的修改预览",
+        )
+    if payload.get("plan_id") != plan_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="修改预览与计划不匹配",
+        )
+    if payload.get("can_confirm") is False:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="本次预览没有产生可应用的计划变化，请修改调整要求后重试",
+        )
+    modified_meals = payload.get("modified_meals") or []
+    modified_shopping = payload.get("modified_shopping") or []
+    modified_budget = payload.get("modified_budget")
+    if isinstance(modified_budget, (int, float)):
+        modified_budget = float(modified_budget)
+    else:
+        modified_budget = plan.budget
+    summary = payload.get("summary") or message.content or "用户确认修改"
+
+    derived = await repository.derive_plan_with_modifications(
+        plan,
+        user_id=context.user_id,
+        prompt=str(payload.get("message") or summary)[:1000],
+        meals=modified_meals,
+        shopping=modified_shopping,
+        budget=modified_budget,
+        summary=summary,
+    )
+    # 把助手消息标为已确认，便于前端展示状态
+    await chat_repository.add_message(
+        await chat_repository.get_session(message.session_id, context.user_id)
+        or await chat_repository.create_session(
+            context.user_id, f"[计划v{plan_id}] 备餐修改对话"
+        ),
+        role="system",
+        content=f"已确认修改，生成新版本 v{derived.version}",
+        payload={
+            "kind": "plan_revise_confirmed",
+            "plan_id": plan_id,
+            "new_plan_id": derived.id,
+            "new_version": derived.version,
+        },
+    )
+    return ReviseConfirmResponse(
+        revise_id=str(revise_id),
+        plan_id=plan_id,
+        new_plan_id=derived.id,
+        new_version=derived.version,
+        parent_plan_id=plan_id,
+        summary=summary,
+    )
+
+
 @router.post("/plans/{plan_id}/activate", response_model=WeeklyPlanDetail)
 async def activate_plan(
     plan_id: int, context: CurrentContext, session: SessionDep
@@ -1651,7 +2361,40 @@ async def list_archived_plans(
 @router.get("/plans/{plan_id}", response_model=WeeklyPlanDetail)
 async def get_plan(plan_id: int, context: CurrentContext, session: SessionDep) -> WeeklyPlanDetail:
     repo = PlanningRepository(session)
+    await repo.expire_old_plans(context.user_id)
     plan = await repo.get_plan(plan_id, context.user_id)
     if plan is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Plan not found")
-    return _plan_detail_response(plan)
+
+    # 计算本周营养达成进度（按已吃餐食聚合）
+    week_nutrition = None
+    goal = await session.scalar(
+        select(NutritionGoal).where(NutritionGoal.user_id == context.user_id)
+    )
+    targets = nutrition_goal_to_targets(goal) if goal is not None else None
+    recipes = await DomainRepository(session).list_recipes(context.user_id)
+    eaten_meals = [item for item in plan.meals if item.eaten]
+    if eaten_meals:
+        report = build_nutrition_report(eaten_meals, recipes, targets)
+        # 周目标 = 日目标 × 7
+        week_targets = {k: v * 7 for k, v in (targets or {}).items()} if targets else {}
+        nutrients = {}
+        percents = []
+        for key, entry in report.nutrients.items():
+            week_target = week_targets.get(key, entry.target * 7)
+            consumed = entry.actual
+            remaining = round(week_target - consumed, 1)
+            percent = round(consumed / week_target * 100, 1) if week_target > 0 else 0.0
+            percent = min(percent, 200.0)
+            nutrients[key] = WeekNutrient(
+                target=week_target, consumed=consumed, remaining=remaining, percent=percent
+            )
+            percents.append(percent)
+        week_nutrition = WeekNutritionResponse(
+            nutrients=nutrients,
+            overall_percent=round(sum(percents) / len(percents), 1) if percents else 0.0,
+            eaten_count=len(eaten_meals),
+            total_count=len(plan.meals),
+        )
+
+    return _plan_detail_response(plan, week_nutrition)

@@ -134,7 +134,7 @@ def _response_with_docs(names):
             )
         ],
         elapsed_ms=1,
-        diagnostics=RetrievalDiagnostics(chroma="connected", neo4j="connected", embedding="x"),
+        diagnostics=RetrievalDiagnostics(vector_store="connected", neo4j="connected", embedding="x"),
     )
 
 

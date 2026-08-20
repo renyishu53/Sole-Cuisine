@@ -32,6 +32,18 @@ const syncError = ref('')
 const totalChunks = computed(() => data.value?.reduce((sum, doc) => sum + doc.chunks, 0) ?? 0)
 const totalDocs = computed(() => data.value?.length ?? 0)
 
+// 目标取向英文词表（bulk/cut/maintain）→ 中文展示标签
+const GOAL_LABELS: Record<string, string> = { bulk: '增肌', cut: '减脂', maintain: '健康维护' }
+function goalLabel(value?: string) { return value ? (GOAL_LABELS[value] ?? value) : '' }
+function metaTags(hit: { goal_type?: string; meal_time?: string; nutrition_focus?: string }) {
+  const tags: string[] = []
+  const goal = goalLabel(hit.goal_type)
+  if (goal) tags.push(goal)
+  if (hit.meal_time && hit.meal_time !== '通用') tags.push(hit.meal_time)
+  if (hit.nutrition_focus && hit.nutrition_focus !== '均衡') tags.push(hit.nutrition_focus)
+  return tags
+}
+
 async function refreshStatus() {
   statusRefreshing.value = true
   try { serviceStatus.value = await api.aiStatus() } catch { serviceStatus.value = null }
@@ -127,17 +139,6 @@ async function loadSync() {
           </div>
         </div>
 
-        <div class="infra-strip" aria-label="AI 基础设施状态">
-          <span><i :class="serviceStatus?.chroma === 'connected' ? 'online' : 'offline'" />知识库 {{ serviceStatus?.chroma === 'connected' ? '正常' : serviceStatus?.chroma || '--' }}</span>
-          <span><i :class="serviceStatus?.neo4j === 'connected' ? 'online' : 'offline'" />关系图谱 {{ serviceStatus?.neo4j === 'connected' ? '正常' : serviceStatus?.neo4j || '--' }}</span>
-          <span><i class="online" />规划引擎 {{ serviceStatus?.langgraph ? '已就绪' : '--' }}</span>
-          <span><i :class="serviceStatus?.embedding ? 'online' : 'offline'" />语义模型 {{ serviceStatus?.embedding || '--' }}</span>
-          <span><i :class="serviceStatus?.reranker && serviceStatus.reranker !== '未启用二阶段精排' ? 'online' : 'offline'" />语义精排 {{ serviceStatus?.reranker || '--' }}</span>
-          <span>AI 模型 · {{ serviceStatus?.llm_configured ? '已配置' : '未配置' }}</span>
-          <button class="infra-action" :disabled="statusRefreshing" @click="refreshStatus"><RefreshCw :size="13" :class="{ spin: statusRefreshing }" />{{ statusRefreshing ? '刷新中' : '刷新状态' }}</button>
-          <button class="infra-action" :disabled="smokeTesting || !serviceStatus?.llm_configured" @click="smokeTest"><Zap :size="13" />{{ smokeTesting ? '测试中' : '连通测试' }}</button>
-        </div>
-        <p v-if="smokeMessage" class="smoke-result" aria-live="polite">{{ smokeMessage }}</p>
 
         <div v-if="data.length" class="document-table">
           <div class="table-head"><span>文档</span><span>分类</span><span>索引状态</span><span>片段</span></div>
@@ -161,7 +162,7 @@ async function loadSync() {
         <div v-if="result" class="retrieval-results">
           <span class="eyebrow">关系 {{ result.graph_hits.length }} 条 · 文档 {{ result.vector_hits.length }} 条 · {{ result.elapsed_ms }}ms</span>
           <article v-for="(hit, index) in result.graph_hits" :key="`graph-${index}`"><strong><Network :size="15" />{{ hit.subject }} · {{ hit.relation }}</strong><p>{{ hit.target }} <span v-if="hit.detail">· {{ hit.detail }}</span></p></article>
-          <article v-for="hit in result.vector_hits" :key="`${hit.document_id}-${hit.chunk_index}`"><strong><BookOpen :size="15" />{{ hit.document_name }}</strong><p>{{ hit.content }}</p><small>相似度 {{ hit.score.toFixed(3) }} · 片段 {{ hit.chunk_index }}</small></article>
+          <article v-for="hit in result.vector_hits" :key="`${hit.document_id}-${hit.chunk_index}`"><strong><BookOpen :size="15" />{{ hit.document_name }}</strong><p>{{ hit.content }}</p><div v-if="metaTags(hit).length" class="hit-tags"><span v-for="tag in metaTags(hit)" :key="tag" class="hit-tag">{{ tag }}</span><span v-if="hit.allergens" class="hit-tag warn">忌口：{{ hit.allergens }}</span></div><small>相似度 {{ hit.score.toFixed(3) }} · 片段 {{ hit.chunk_index }}</small></article>
           <p v-if="!result.graph_hits.length && !result.vector_hits.length" class="empty-result">没有召回结果，请先初始化或上传知识文档。</p>
         </div>
       </aside>
@@ -204,7 +205,7 @@ async function loadSync() {
 
         <div v-if="syncReport" class="sync-report" :class="syncReport.consistent ? 'ok' : 'warn'">
           <strong>{{ syncReport.consistent ? '索引一致' : '存在偏差' }}</strong>
-          <span>知识库 {{ syncReport.chroma_documents }} 文档 / {{ syncReport.chroma_chunks }} 片段 · 图谱 {{ syncReport.neo4j_documents }} 文档 / {{ syncReport.neo4j_entities }} 实体</span>
+          <span>知识库 {{ syncReport.vector_documents }} 文档 / {{ syncReport.vector_chunks }} 片段 · 图谱 {{ syncReport.neo4j_documents }} 文档 / {{ syncReport.neo4j_entities }} 实体</span>
           <ul>
             <li v-for="(note, index) in syncReport.notes" :key="`note-${index}`">{{ note }}</li>
           </ul>
@@ -239,7 +240,7 @@ async function loadSync() {
   .metric-value {
     font-size: var(--font-2xl, 24px);
     font-weight: 700;
-    color: #3a7d6b;
+    color: #2F7D68;
   }
 
   .metric-label {
@@ -272,6 +273,26 @@ async function loadSync() {
       display: block;
       font-size: var(--font-xs, 12px);
       color: #7a8a80;
+    }
+  }
+}
+
+.hit-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 4px 0;
+
+  .hit-tag {
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: var(--font-xs, 12px);
+    color: #2F7D68;
+    background: rgba(47, 125, 104, 0.1);
+
+    &.warn {
+      color: #b0721b;
+      background: rgba(190, 130, 40, 0.12);
     }
   }
 }

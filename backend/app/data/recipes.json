@@ -1,0 +1,331 @@
+[
+  {
+    "id": "recipe_01",
+    "name": "番茄炒蛋",
+    "category": "healthy",
+    "description": "经典家常菜，酸甜开胃，十分钟上桌",
+    "image_url": "/images/recipes/recipe_01.jpg",
+    "rating": 4.6,
+    "calories": 280,
+    "prep_time": 10,
+    "difficulty": "easy",
+    "servings": 1,
+    "tags": ["快手菜", "下饭"],
+    "ingredients": [
+      {"name": "鸡蛋", "amount": "2个"},
+      {"name": "番茄", "amount": "1个"},
+      {"name": "葱花", "amount": "适量"},
+      {"name": "盐", "amount": "少许"},
+      {"name": "白糖", "amount": "少许"}
+    ],
+    "steps": [
+      "鸡蛋打散加少许盐，番茄切块",
+      "热锅倒油，蛋液下锅快速划散盛出",
+      "锅中留油，下番茄翻炒出汁，加少许糖",
+      "倒入炒好的鸡蛋，翻匀撒葱花出锅"
+    ],
+    "nutrition": {"calories": 280, "protein": 16.0, "carbs": 12.0, "fat": 18.0}
+  },
+  {
+    "id": "recipe_02",
+    "name": "蒜蓉西兰花",
+    "category": "healthy",
+    "description": "清爽低卡，保留蔬菜原味",
+    "image_url": "/images/recipes/recipe_02.jpg",
+    "rating": 4.3,
+    "calories": 120,
+    "prep_time": 8,
+    "difficulty": "easy",
+    "servings": 1,
+    "tags": ["低脂", "素菜"],
+    "ingredients": [
+      {"name": "西兰花", "amount": "200g"},
+      {"name": "蒜末", "amount": "3瓣"},
+      {"name": "盐", "amount": "少许"},
+      {"name": "蚝油", "amount": "1勺"}
+    ],
+    "steps": [
+      "西兰花切小朵，盐水浸泡5分钟",
+      "烧水加少许盐和油，西兰花焯水1分钟捞出",
+      "热锅冷油爆香蒜末，下西兰花快速翻炒",
+      "加蚝油和少许盐调味，翻匀出锅"
+    ],
+    "nutrition": {"calories": 120, "protein": 8.0, "carbs": 15.0, "fat": 4.0}
+  },
+  {
+    "id": "recipe_03",
+    "name": "鸡胸肉蔬菜沙拉",
+    "category": "healthy",
+    "description": "清爽健康，营养均衡",
+    "image_url": "/images/recipes/recipe_03.jpg",
+    "rating": 4.7,
+    "calories": 320,
+    "prep_time": 15,
+    "difficulty": "easy",
+    "servings": 1,
+    "tags": ["高蛋白", "减脂"],
+    "ingredients": [
+      {"name": "鸡胸肉", "amount": "150g"},
+      {"name": "混合生菜", "amount": "100g"},
+      {"name": "小番茄", "amount": "6颗"},
+      {"name": "黄瓜", "amount": "半根"},
+      {"name": "橄榄油", "amount": "1勺"},
+      {"name": "黑胡椒", "amount": "少许"}
+    ],
+    "steps": [
+      "鸡胸肉两面撒盐和黑胡椒，平底锅煎至两面金黄",
+      "静置3分钟后切片",
+      "生菜洗净撕小朵，小番茄对半切，黄瓜切片",
+      "所有食材摆盘，淋橄榄油和黑胡椒"
+    ],
+    "nutrition": {"calories": 320, "protein": 38.0, "carbs": 10.0, "fat": 12.0}
+  },
+  {
+    "id": "recipe_04",
+    "name": "蛋炒饭",
+    "category": "healthy",
+    "description": "剩饭变美食，粒粒分明",
+    "image_url": "/images/recipes/recipe_04.jpg",
+    "rating": 4.2,
+    "calories": 450,
+    "prep_time": 10,
+    "difficulty": "easy",
+    "servings": 1,
+    "tags": ["主食", "快手"],
+    "ingredients": [
+      {"name": "隔夜米饭", "amount": "1碗"},
+      {"name": "鸡蛋", "amount": "2个"},
+      {"name": "葱花", "amount": "适量"},
+      {"name": "火腿丁", "amount": "50g"},
+      {"name": "盐", "amount": "少许"},
+      {"name": "生抽", "amount": "半勺"}
+    ],
+    "steps": [
+      "鸡蛋打散，米饭打散",
+      "热锅多倒些油，蛋液下锅快速划散",
+      "下火腿丁翻炒，倒入米饭大火翻炒至粒粒分明",
+      "加盐和生抽调味，撒葱花翻匀出锅"
+    ],
+    "nutrition": {"calories": 450, "protein": 18.0, "carbs": 55.0, "fat": 15.0}
+  },
+  {
+    "id": "recipe_05",
+    "name": "红烧豆腐",
+    "category": "healthy",
+    "description": "外焦里嫩，素下饭神器",
+    "image_url": "/images/recipes/recipe_05.jpg",
+    "rating": 4.5,
+    "calories": 220,
+    "prep_time": 15,
+    "difficulty": "easy",
+    "servings": 1,
+    "tags": ["素菜", "下饭"],
+    "ingredients": [
+      {"name": "老豆腐", "amount": "1块(300g)"},
+      {"name": "蒜末", "amount": "2瓣"},
+      {"name": "生抽", "amount": "2勺"},
+      {"name": "蚝油", "amount": "1勺"},
+      {"name": "白糖", "amount": "半勺"},
+      {"name": "葱花", "amount": "适量"}
+    ],
+    "steps": [
+      "豆腐切2cm厚块，厨房纸吸干水分",
+      "平底锅油热后下豆腐，两面煎至金黄",
+      "加蒜末、生抽、蚝油、糖和少许水",
+      "小火焖3分钟收汁，撒葱花出锅"
+    ],
+    "nutrition": {"calories": 220, "protein": 18.0, "carbs": 10.0, "fat": 12.0}
+  },
+  {
+    "id": "recipe_06",
+    "name": "番茄牛肉面",
+    "category": "healthy",
+    "description": "汤浓面爽，一顿满足",
+    "image_url": "/images/recipes/recipe_06.jpg",
+    "rating": 4.8,
+    "calories": 550,
+    "prep_time": 30,
+    "difficulty": "medium",
+    "servings": 1,
+    "tags": ["主食", "高蛋白"],
+    "ingredients": [
+      {"name": "牛腩", "amount": "150g"},
+      {"name": "番茄", "amount": "2个"},
+      {"name": "面条", "amount": "100g"},
+      {"name": "姜片", "amount": "3片"},
+      {"name": "生抽", "amount": "2勺"},
+      {"name": "盐", "amount": "少许"}
+    ],
+    "steps": [
+      "牛腩切块冷水下锅焯水，捞出洗净",
+      "番茄去皮切块，锅中炒出红油",
+      "加牛腩、姜片、生抽和热水，小火炖25分钟",
+      "另起锅煮面，捞出盛入碗中，浇上牛肉番茄汤"
+    ],
+    "nutrition": {"calories": 550, "protein": 35.0, "carbs": 60.0, "fat": 18.0}
+  },
+  {
+    "id": "recipe_07",
+    "name": "香煎三文鱼",
+    "category": "healthy",
+    "description": "优质蛋白，简单高级",
+    "image_url": "/images/recipes/recipe_07.jpg",
+    "rating": 4.9,
+    "calories": 380,
+    "prep_time": 12,
+    "difficulty": "easy",
+    "servings": 1,
+    "tags": ["优质脂肪", "高蛋白"],
+    "ingredients": [
+      {"name": "三文鱼", "amount": "150g"},
+      {"name": "柠檬", "amount": "2片"},
+      {"name": "盐", "amount": "少许"},
+      {"name": "黑胡椒", "amount": "少许"},
+      {"name": "橄榄油", "amount": "半勺"}
+    ],
+    "steps": [
+      "三文鱼用厨房纸擦干，两面撒盐和黑胡椒",
+      "平底锅加少许橄榄油，鱼皮朝下中火煎3分钟",
+      "翻面再煎2分钟至表面金黄",
+      "挤上柠檬汁，配蔬菜食用"
+    ],
+    "nutrition": {"calories": 380, "protein": 34.0, "carbs": 0.0, "fat": 25.0}
+  },
+  {
+    "id": "recipe_08",
+    "name": "蔬菜豆腐汤",
+    "category": "healthy",
+    "description": "暖胃低卡，一碗搞定晚餐",
+    "image_url": "/images/recipes/recipe_08.jpg",
+    "rating": 4.4,
+    "calories": 150,
+    "prep_time": 15,
+    "difficulty": "easy",
+    "servings": 1,
+    "tags": ["低卡", "汤品"],
+    "ingredients": [
+      {"name": "嫩豆腐", "amount": "半块"},
+      {"name": "小白菜", "amount": "100g"},
+      {"name": "金针菇", "amount": "50g"},
+      {"name": "虾皮", "amount": "1小把"},
+      {"name": "盐", "amount": "少许"},
+      {"name": "香油", "amount": "几滴"}
+    ],
+    "steps": [
+      "豆腐切小块，小白菜洗净切段，金针菇去根撕开",
+      "锅中烧开水，下虾皮煮2分钟出鲜味",
+      "下豆腐和金针菇煮3分钟",
+      "加小白菜烫熟，放盐调味，滴几滴香油出锅"
+    ],
+    "nutrition": {"calories": 150, "protein": 14.0, "carbs": 10.0, "fat": 6.0}
+  },
+  {
+    "id": "recipe_09",
+    "name": "黑椒牛柳",
+    "category": "muscle_gain",
+    "description": "高蛋白铁质补给，黑椒增香下饭",
+    "image_url": "/images/recipes/recipe_09.jpg",
+    "rating": 4.8,
+    "calories": 350,
+    "prep_time": 15,
+    "difficulty": "easy",
+    "servings": 1,
+    "tags": ["高蛋白", "增肌"],
+    "ingredients": [
+      {"name": "牛里脊", "amount": "150g"},
+      {"name": "洋葱", "amount": "半个"},
+      {"name": "青椒", "amount": "1个"},
+      {"name": "黑胡椒", "amount": "适量"},
+      {"name": "生抽", "amount": "1勺"},
+      {"name": "淀粉", "amount": "少许"}
+    ],
+    "steps": [
+      "牛里脊逆纹切条，加生抽、淀粉抓匀腌10分钟",
+      "热锅少油，大火滑炒牛肉至变色盛出",
+      "下洋葱、青椒翻炒断生",
+      "倒回牛肉，撒黑胡椒翻匀出锅"
+    ],
+    "nutrition": {"calories": 350, "protein": 28.0, "carbs": 15.0, "fat": 18.0}
+  },
+  {
+    "id": "recipe_10",
+    "name": "虾仁豆腐蒸蛋",
+    "category": "muscle_gain",
+    "description": "双蛋白蒸制，嫩滑易吸收",
+    "image_url": "/images/recipes/recipe_10.jpg",
+    "rating": 4.7,
+    "calories": 280,
+    "prep_time": 18,
+    "difficulty": "easy",
+    "servings": 1,
+    "tags": ["高蛋白", "蒸菜"],
+    "ingredients": [
+      {"name": "虾仁", "amount": "80g"},
+      {"name": "嫩豆腐", "amount": "半块"},
+      {"name": "鸡蛋", "amount": "2个"},
+      {"name": "葱花", "amount": "适量"},
+      {"name": "生抽", "amount": "1勺"}
+    ],
+    "steps": [
+      "鸡蛋打散加水，豆腐切小块铺入碗中",
+      "蛋液过筛倒入，摆上虾仁",
+      "水开后中火蒸10分钟",
+      "出锅淋生抽撒葱花"
+    ],
+    "nutrition": {"calories": 280, "protein": 30.0, "carbs": 8.0, "fat": 14.0}
+  },
+  {
+    "id": "recipe_11",
+    "name": "西兰花炒鸡胸",
+    "category": "fat_loss",
+    "description": "低脂高蛋白，减脂期主食搭档",
+    "image_url": "/images/recipes/recipe_11.jpg",
+    "rating": 4.6,
+    "calories": 300,
+    "prep_time": 15,
+    "difficulty": "easy",
+    "servings": 1,
+    "tags": ["低脂", "高蛋白", "减脂"],
+    "ingredients": [
+      {"name": "鸡胸肉", "amount": "150g"},
+      {"name": "西兰花", "amount": "200g"},
+      {"name": "蒜末", "amount": "2瓣"},
+      {"name": "盐", "amount": "少许"},
+      {"name": "黑胡椒", "amount": "少许"}
+    ],
+    "steps": [
+      "鸡胸肉切丁，加盐和黑胡椒腌5分钟",
+      "西兰花焯水1分钟捞出",
+      "热锅少油，鸡胸炒至变色，下西兰花和蒜末",
+      "加盐调味翻匀出锅"
+    ],
+    "nutrition": {"calories": 300, "protein": 38.0, "carbs": 15.0, "fat": 8.0}
+  },
+  {
+    "id": "recipe_12",
+    "name": "冬瓜虾仁汤",
+    "category": "fat_loss",
+    "description": "低卡清爽，补水去水肿",
+    "image_url": "/images/recipes/recipe_12.jpg",
+    "rating": 4.5,
+    "calories": 180,
+    "prep_time": 12,
+    "difficulty": "easy",
+    "servings": 1,
+    "tags": ["低卡", "汤品", "减脂"],
+    "ingredients": [
+      {"name": "冬瓜", "amount": "200g"},
+      {"name": "虾仁", "amount": "100g"},
+      {"name": "姜片", "amount": "2片"},
+      {"name": "盐", "amount": "少许"},
+      {"name": "葱花", "amount": "适量"}
+    ],
+    "steps": [
+      "冬瓜去皮切薄片，虾仁洗净",
+      "锅中烧水，下姜片和冬瓜煮5分钟",
+      "下虾仁煮至变色",
+      "加盐调味，撒葱花出锅"
+    ],
+    "nutrition": {"calories": 180, "protein": 20.0, "carbs": 10.0, "fat": 4.0}
+  }
+]

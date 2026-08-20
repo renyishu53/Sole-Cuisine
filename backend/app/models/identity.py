@@ -1,13 +1,10 @@
-"""SoloChef 数据模型（去家庭化版）。
+"""SoloChef 数据模型。
 
-定位收敛（2026-08-07）：原 CasaMind 家庭导向模型已去家庭化，所有业务表以
-``user_id`` 为核心；``families / family_memberships / family_member_profiles /
-family_invitations / event_participants`` 已删除；新增 ``UserProfile``（身体数据
-+ 饮食偏好）与 ``NutritionGoal``（TDEE + 宏量分配）支撑营养目标驱动生成。
+定位：所有业务表以
+``user_id`` 为核心， ``UserProfile``（身体数据+ 饮食偏好）
+与 ``NutritionGoal``（TDEE + 宏量分配）支撑营养目标驱动生成。
 
-Phase 3 清理（2026-08-09）：``calendar_events / calendar_event_exceptions /
-plan_tasks / plan_budgets / task_completions / inventory_items`` 6 张遗留表
-及对应模型已移除，数据模型精简为 14 张核心表。
+数据模型精简为 14 张核心表。
 """
 
 from datetime import datetime
@@ -52,6 +49,7 @@ class User(TimestampMixin, Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     phone: Mapped[str] = mapped_column(String(20))
     display_name: Mapped[str] = mapped_column(String(80))
+    avatar_url: Mapped[str] = mapped_column(String(500), default="", server_default="")
     password_hash: Mapped[str] = mapped_column(String(255))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true())
     token_version: Mapped[int] = mapped_column(default=1, server_default="1")
@@ -93,14 +91,23 @@ class UserProfile(TimestampMixin, Base):
     constraints: Mapped[list[str]] = mapped_column(JSON, default=list)
     budget_limit: Mapped[float] = mapped_column(Float, default=500, server_default="500")
     notes: Mapped[str] = mapped_column(String(500), default="", server_default="")
+    # 生活约束（阶段1）：结构化烹饪能力/厨具/备餐时间，供 meal_agent 精准读取，
+    # 驱动 max_duration_minutes 与食材可行性筛选。
+    cooking_skill: Mapped[str] = mapped_column(
+        String(20), default="intermediate", server_default="intermediate"
+    )
+    kitchenware: Mapped[list[str]] = mapped_column(JSON, default=list)
+    prep_time_max: Mapped[int] = mapped_column(Integer, default=60, server_default="60")
 
     user: Mapped[User] = relationship(back_populates="profile")
 
 
 class NutritionGoal(TimestampMixin, Base):
-    """营养目标快照：由身体数据按 Mifflin-St Jeor 公式计算并保存。
+    """营养目标快照：由身体数据计算并保存。
 
-    增肌/减脂/维护对应不同热量与宏量分配；性别差异体现在基础代谢。
+    蛋白质按 DRIs 2023 RNI + ISSN 运动营养立场声明动态计算；
+    脂肪按 DRIs AMDR 中值；碳水补足剩余热量。
+    范围值（min/max）为推荐区间，target 为区间中值。
     """
 
     __tablename__ = "nutrition_goals"
@@ -122,6 +129,14 @@ class NutritionGoal(TimestampMixin, Base):
     activity_level: Mapped[str] = mapped_column(
         String(20), default="moderate", server_default="moderate"
     )
+    calories_min: Mapped[float] = mapped_column(Float, default=1860, server_default="1860")
+    calories_max: Mapped[float] = mapped_column(Float, default=2140, server_default="2140")
+    protein_min: Mapped[float] = mapped_column(Float, default=65, server_default="65")
+    protein_max: Mapped[float] = mapped_column(Float, default=85, server_default="85")
+    carb_min: Mapped[float] = mapped_column(Float, default=200, server_default="200")
+    carb_max: Mapped[float] = mapped_column(Float, default=260, server_default="260")
+    fat_min: Mapped[float] = mapped_column(Float, default=45, server_default="45")
+    fat_max: Mapped[float] = mapped_column(Float, default=65, server_default="65")
 
     user: Mapped[User] = relationship(back_populates="nutrition_goal")
 
@@ -176,6 +191,14 @@ class WeeklyPlan(TimestampMixin, Base):
     summary: Mapped[str] = mapped_column(String(2000), default="", server_default="")
     conflicts: Mapped[list[str]] = mapped_column(JSON, default=list)
     suggestions: Mapped[list[str]] = mapped_column(JSON, default=list)
+    # Phase 3 任务A：校验失败三级策略的结构化结果，落库以便详情页展示
+    # 换菜选项（第 2 级降级提示）与自动修正/人工接管提示（第 1/3 级）。
+    conflict_details: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    auto_fixes: Mapped[list[str]] = mapped_column(JSON, default=list)
+    needs_manual_review: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false()
+    )
+    manual_review_hint: Mapped[str] = mapped_column(String(500), default="", server_default="")
 
     user: Mapped[User] = relationship()
     agent_run: Mapped[AgentRunRecord | None] = relationship(back_populates="plans")
@@ -204,12 +227,18 @@ class PlanMealItem(TimestampMixin, Base):
         ForeignKey("weekly_plans.id", ondelete="CASCADE"), index=True
     )
     day: Mapped[str] = mapped_column(String(10))
+    meal_type: Mapped[str] = mapped_column(String(10), default="晚餐", server_default="晚餐")
     name: Mapped[str] = mapped_column(String(120))
     duration: Mapped[int] = mapped_column(Integer, default=30, server_default="30")
     cost: Mapped[float] = mapped_column(default=0, server_default="0")
     tags: Mapped[list[str]] = mapped_column(JSON, default=list)
     reason: Mapped[str] = mapped_column(String(500), default="", server_default="")
     ingredients: Mapped[list[str]] = mapped_column(JSON, default=list)
+    # Phase 4：餐食"已吃"打卡 + 偏差结构化（没买到/不想吃/吃了别的）
+    eaten: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    eaten_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deviation_type: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    deviation_reason: Mapped[str] = mapped_column(String(500), default="", server_default="")
 
     plan: Mapped[WeeklyPlan] = relationship(back_populates="meals")
 
@@ -227,6 +256,11 @@ class PlanShoppingItem(TimestampMixin, Base):
     price: Mapped[float] = mapped_column(default=0, server_default="0")
     source: Mapped[str] = mapped_column(String(100), default="", server_default="")
     purchased: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    # Phase 3 任务B：食材替换确认闭环
+    # substituted_from 记录被替换前的原食材名；substituted_accepted 记录用户是否
+    # 确认该替换（None=待确认，True=已接受，False=已拒绝并回退）。
+    substituted_from: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    substituted_accepted: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
 
     plan: Mapped[WeeklyPlan] = relationship(back_populates="shopping_items")
 
@@ -284,7 +318,7 @@ class PlanFeedback(TimestampMixin, Base):
     任务完成 / 餐食替换 / 购物核销 / 支出录入的执行结果统一落到这里，既记录
     主观反馈（``sentiment`` / ``content`` / ``rating``），也记录客观偏差
     （``planned_value`` / ``actual_value`` / ``deviation``）。写入后由
-    :mod:`app.services.feedback_loop` 回流到 Neo4j 与 Chroma，形成
+    :mod:`app.services.feedback_loop` 回流到 Neo4j 与向量库，形成
     "计划 → 执行 → 反馈 → 检索/记忆" 的闭环。
     """
 

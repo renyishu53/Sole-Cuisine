@@ -1,8 +1,14 @@
+from collections import Counter
+from types import SimpleNamespace
+from pathlib import Path
+
 import pytest
 from fastapi.testclient import TestClient
 from pytest import MonkeyPatch
 
+import app.api.auth_router as auth_router
 import app.api.router as api_router
+from app.ai.llm import MEAL_TYPES, WEEK_DAYS
 from app.core.config import Settings
 
 
@@ -42,6 +48,46 @@ def test_registration_creates_user(
     payload = response.json()
     assert payload["user"]["display_name"] == "测试用户"
     assert payload["user"]["phone"] == "13800000001"
+    assert payload["user"]["avatar_url"] == ""
+
+
+def test_account_profile_and_avatar_can_be_updated(
+    client: TestClient,
+    monkeypatch: MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(auth_router, "_AVATAR_DIR", tmp_path)
+    registration = client.post(
+        "/api/v1/auth/register",
+        json={
+            "phone": "13800000018",
+            "verification_code": "123456",
+            "password": "solochef-test",
+            "display_name": "头像测试用户",
+        },
+    )
+    assert registration.status_code == 201
+    auth_headers = {"Authorization": f"Bearer {registration.json()['access_token']}"}
+    profile = client.put(
+        "/api/v1/auth/profile",
+        headers=auth_headers,
+        json={"display_name": "新用户名"},
+    )
+    assert profile.status_code == 200
+    assert profile.json()["display_name"] == "新用户名"
+
+    avatar = client.post(
+        "/api/v1/auth/profile/avatar",
+        headers=auth_headers,
+        files={"avatar": ("avatar.png", b"small-png-content", "image/png")},
+    )
+    assert avatar.status_code == 200
+    assert avatar.json()["avatar_url"].endswith(".png")
+
+    current = client.get("/api/v1/auth/me", headers=auth_headers)
+    assert current.status_code == 200
+    assert current.json()["user"]["display_name"] == "新用户名"
+    assert current.json()["user"]["avatar_url"].endswith(".png")
 
 
 def test_dashboard_uses_authenticated_user(
@@ -108,7 +154,10 @@ def test_generate_weekly_plan_and_trace_are_user_scoped(
     )
     assert response.status_code == 201
     payload = response.json()
-    assert len(payload["meals"]) == 7
+    assert len(payload["meals"]) == 21
+    assert {(meal["day"], meal["meal_type"]) for meal in payload["meals"]} == {
+        (day, meal_type) for day in WEEK_DAYS for meal_type in MEAL_TYPES
+    }
     assert payload["budget"]["estimated"] <= 500
     trace = client.get(f"/api/v1/agents/runs/{payload['run_id']}", headers=auth_headers)
     assert trace.status_code == 200
@@ -214,6 +263,64 @@ def test_plan_confirmation_writes_to_database(
     meals = client.get("/api/v1/meals", headers=auth_headers)
     assert meals.status_code == 200
     assert meals.json() == plan.json()["meals"]
+
+
+def test_plan_confirmation_rejects_shopping_estimate_over_budget(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    generated = client.post(
+        "/api/v1/plans/generate-weekly",
+        headers=auth_headers,
+        json={"prompt": "生成低预算采购校验计划", "budget": 50},
+    )
+    assert generated.status_code == 201
+
+    confirmed = client.post(
+        f"/api/v1/plans/{generated.json()['run_id']}/confirm",
+        headers=auth_headers,
+    )
+
+    assert confirmed.status_code == 409
+    assert "采购清单估价" in confirmed.json()["detail"]
+    assert "超过预算" in confirmed.json()["detail"]
+
+
+def test_confirmed_plan_is_immediately_available_from_active_overview(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    """A confirmed weekly plan must not disappear when the execution page reloads."""
+    generated = client.post(
+        "/api/v1/plans/generate-weekly",
+        headers=auth_headers,
+        json={"prompt": "确认后概览回归测试", "budget": 360},
+    )
+    assert generated.status_code == 201
+
+    confirmed = client.post(
+        f"/api/v1/plans/{generated.json()['run_id']}/confirm", headers=auth_headers
+    )
+    assert confirmed.status_code == 200
+    assert confirmed.json()["status"] == "confirmed"
+    assert len(confirmed.json()["meals"]) == 21
+    actual_slots = {(meal["day"], meal["meal_type"]) for meal in confirmed.json()["meals"]}
+    expected_slots = {(day, meal_type) for day in WEEK_DAYS for meal_type in MEAL_TYPES}
+    assert actual_slots == expected_slots, (
+        [(day.encode("unicode_escape"), meal_type.encode("unicode_escape")) for day, meal_type in actual_slots - expected_slots],
+        [(day.encode("unicode_escape"), meal_type.encode("unicode_escape")) for day, meal_type in expected_slots - actual_slots],
+        [
+            (day.encode("unicode_escape"), meal_type.encode("unicode_escape"), count)
+            for (day, meal_type), count in Counter(
+                (meal["day"], meal["meal_type"]) for meal in confirmed.json()["meals"]
+            ).items()
+            if count > 1
+        ],
+    )
+
+    overview = client.get("/api/v1/plans/active/overview", headers=auth_headers)
+    assert overview.status_code == 200
+    assert overview.json()["plan"] is not None
+    assert overview.json()["plan"]["id"] == confirmed.json()["id"]
+    assert len(overview.json()["plan"]["meals"]) == 21
 
 
 def test_confirm_plan_is_idempotent(client: TestClient, auth_headers: dict[str, str]) -> None:
@@ -425,6 +532,19 @@ def test_domain_crud_is_persisted_and_user_scoped(
     )
     assert checked.status_code == 200
     assert checked.json()["purchased"] is True
+    impact = client.get(f"/api/v1/shopping/{shopping_id}/impact", headers=headers)
+    assert impact.status_code == 200
+    assert impact.json()["has_impact"] is True
+    assert impact.json()["affected_meals"][0]["name"] == "番茄鸡蛋面"
+    structural_update = client.patch(
+        f"/api/v1/shopping/{shopping_id}", headers=headers, json={"quantity": "6 个"}
+    )
+    assert structural_update.status_code == 409
+    safe_price_update = client.patch(
+        f"/api/v1/shopping/{shopping_id}", headers=headers, json={"price": 10}
+    )
+    assert safe_price_update.status_code == 200
+    assert safe_price_update.json()["price"] == 10
 
     # Phase 3 清理：/tasks 与 /budget (PATCH) 端点随 plan_tasks / plan_budgets 表一并移除，
     # 预算改由 WeeklyPlan.budget 标量列承载，不再单独 CRUD。
@@ -507,8 +627,33 @@ def test_domain_operations_close_the_household_loop(
 
 
 def test_recipe_and_chat_are_user_scoped(
-    client: TestClient, auth_headers: dict[str, str]
+    client: TestClient, auth_headers: dict[str, str], monkeypatch: MonkeyPatch
 ) -> None:
+    # 注：菜谱列表（GET /recipes）已重构为全局菜谱库（Recipe Gallery），
+    # 不再按用户隔离；本用例仅验证聊天会话的用户隔离。见下方断言。
+
+    # 注入假的流式对话助手，避免依赖真实 DeepSeek 网络调用（测试确定性）。
+    class FakeChatAssistant:
+        async def answer(self, question, context="", rag_snippets=None, history=None):
+            del question, context, rag_snippets, history
+            yield "已按清淡口味"
+            yield "调整计划"
+
+    monkeypatch.setattr(
+        "app.services.conversation.get_chat_assistant", lambda: FakeChatAssistant()
+    )
+
+    # 注入假的 RAG 知识检索，避免离线环境下 Milvus/Neo4j 连接挂起（测试确定性）。
+    # 本用例只验证聊天会话的用户隔离，不关心 RAG 召回结果。
+    class StubKnowledgeService:
+        async def search(self, question, user_id, top_k=3, domain=None):
+            del question, user_id, top_k, domain
+            return SimpleNamespace(vector_hits=[], graph_hits=[])
+
+    monkeypatch.setattr(
+        "app.services.conversation.get_knowledge_service", lambda: StubKnowledgeService()
+    )
+
     recipe = client.post(
         "/api/v1/recipes",
         headers=auth_headers,
@@ -535,8 +680,7 @@ def test_recipe_and_chat_are_user_scoped(
     ) as response:
         body = "".join(response.iter_text())
     assert response.status_code == 200
-    assert "event: step" in body
-    assert "domain_coordinator" in body
+    assert "event: token" in body
     assert "event: complete" in body
     assert "id: " in body
     detail = client.get(f"/api/v1/chat/sessions/{session_id}", headers=auth_headers)
@@ -553,7 +697,8 @@ def test_recipe_and_chat_are_user_scoped(
     other_headers = _register_second_user(client, phone="13800000016", display_name="对话隔离用户")
     hidden_chat = client.get(f"/api/v1/chat/sessions/{session_id}", headers=other_headers)
     assert hidden_chat.status_code == 404
-    assert client.get("/api/v1/recipes", headers=other_headers).json() == []
+    # 菜谱列表为全局菜谱库，第二用户也应看到同一份精选菜谱（非空）。
+    assert client.get("/api/v1/recipes", headers=other_headers).json()["recipes"] != []
 
 
 def test_background_job_enqueue_and_user_scope(
@@ -712,6 +857,98 @@ def test_update_profile_requires_at_least_one_field(
     assert empty.status_code == 422
 
 
+def test_update_profile_lifestyle_fields_persist(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    """PUT /profile 生活约束字段（烹饪能力/厨具/备餐时间）往返持久化。"""
+    updated = client.put(
+        "/api/v1/profile",
+        headers=auth_headers,
+        json={
+            "cooking_skill": "beginner",
+            "kitchenware": ["炒锅", "电饭煲"],
+            "prep_time_max": 20,
+        },
+    )
+    assert updated.status_code == 200
+    body = updated.json()
+    assert body["cooking_skill"] == "beginner"
+    assert body["kitchenware"] == ["炒锅", "电饭煲"]
+    assert body["prep_time_max"] == 20
+
+    fetched = client.get("/api/v1/profile", headers=auth_headers).json()
+    assert fetched["cooking_skill"] == "beginner"
+    assert fetched["kitchenware"] == ["炒锅", "电饭煲"]
+    assert fetched["prep_time_max"] == 20
+
+
+def test_update_profile_rejects_invalid_lifestyle(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    """PUT /profile 对非法 cooking_skill / prep_time_max 返回 422。"""
+    bad_skill = client.put(
+        "/api/v1/profile", headers=auth_headers, json={"cooking_skill": "chef"}
+    )
+    assert bad_skill.status_code == 422
+    bad_time = client.put(
+        "/api/v1/profile", headers=auth_headers, json={"prep_time_max": 3}
+    )
+    assert bad_time.status_code == 422
+
+
+def test_update_profile_needs_replan_on_goal_switch(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    """切换 goal_type 时 PUT /profile 返回 needs_replan=True，未切换时为 False。"""
+    # 建立已知基线（忽略此处的 needs_replan 值）
+    client.put("/api/v1/profile", headers=auth_headers, json={"goal_type": "cut"})
+    switched = client.put(
+        "/api/v1/profile", headers=auth_headers, json={"goal_type": "bulk"}
+    )
+    assert switched.status_code == 200
+    assert switched.json()["needs_replan"] is True
+
+    unchanged = client.put(
+        "/api/v1/profile",
+        headers=auth_headers,
+        json={"goal_type": "bulk", "height_cm": 172.0},
+    )
+    assert unchanged.json()["needs_replan"] is False
+
+
+def test_update_profile_needs_replan_on_other_key_fields(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    """阶段6：活动量/忌口/预算任一变更均置 needs_replan=True，无关字段为 False。"""
+    # 建立基线（忽略首写的 needs_replan 值）
+    client.put(
+        "/api/v1/profile",
+        headers=auth_headers,
+        json={"goal_type": "maintain", "activity_level": "moderate",
+              "constraints": [], "budget_limit": 500},
+    )
+    activity = client.put(
+        "/api/v1/profile", headers=auth_headers, json={"activity_level": "active"}
+    )
+    assert activity.json()["needs_replan"] is True
+
+    constraint = client.put(
+        "/api/v1/profile", headers=auth_headers, json={"constraints": ["花生"]}
+    )
+    assert constraint.json()["needs_replan"] is True
+
+    budget = client.put(
+        "/api/v1/profile", headers=auth_headers, json={"budget_limit": 350}
+    )
+    assert budget.json()["needs_replan"] is True
+
+    # 生活约束字段（非规划关键字段）变更不触发重新规划提示
+    non_sensitive = client.put(
+        "/api/v1/profile", headers=auth_headers, json={"prep_time_max": 20}
+    )
+    assert non_sensitive.json()["needs_replan"] is False
+
+
 def test_compute_nutrition_goal_male_bulk(
     client: TestClient, auth_headers: dict[str, str]
 ) -> None:
@@ -733,14 +970,21 @@ def test_compute_nutrition_goal_male_bulk(
     goal = response.json()
     # BMR = 10*75 + 6.25*180 - 5*25 + 5 = 750 + 1125 - 125 + 5 = 1755
     assert goal["bmr"] == 1755.0
-    # TDEE = 1755 * 1.55 = 2720.25
-    assert goal["tdee"] == 2720.2
-    # target = round(2720.25 * 1.10, 1) = 2992.3（浮点舍入）
-    assert goal["target_calories"] == 2992.3
-    # 增肌比例 P30% C40% F30%
-    assert goal["protein_g"] == 224.4  # 2992.3 * 0.30 / 4
-    assert goal["carb_g"] == 299.2  # 2992.3 * 0.40 / 4
-    assert goal["fat_g"] == 99.7  # 2992.3 * 0.30 / 9
+    # TDEE = 1755 * 1.75（DRIs 中度 PAL）= 3071.25
+    assert goal["tdee"] == 3071.2
+    # target = round(3071.25 * 1.10, 1) = 3378.4（增肌盈余 10%）
+    assert goal["target_calories"] == 3378.4
+    # 蛋白质：75kg × 增肌+中度系数 (1.5~1.9) g/kg → 中点 127.5
+    assert goal["protein_g"] == 127.5
+    # 碳水/脂肪按剩余热量 AMDR 区间（45-65% / 20-30%）取中点
+    assert goal["carb_g"] == 295.8
+    assert goal["fat_g"] == 79.7
+    # 等价物解释随响应返回（阶段2：直观解释）
+    assert goal["hints"]["protein"].startswith("相当于")
+    assert "鸡胸肉" in goal["hints"]["protein"] and "鸡蛋" in goal["hints"]["protein"]
+    assert "碗米饭" in goal["hints"]["calories"]
+    assert "面包" in goal["hints"]["carbs"]
+    assert "坚果" in goal["hints"]["fat"]
 
 
 def test_compute_nutrition_goal_female_cut(
@@ -764,13 +1008,14 @@ def test_compute_nutrition_goal_female_cut(
     goal = response.json()
     # BMR = 10*58 + 6.25*165 - 5*30 - 161 = 580 + 1031.25 - 150 - 161 = 1300.25
     assert goal["bmr"] == 1300.2
-    # TDEE = 1300.25 * 1.375 = 1787.84...
-    assert goal["tdee"] == 1787.8
-    # target = 1787.84 * 0.85 = 1519.67 → 1519.7
-    assert goal["target_calories"] == 1519.7
-    # 减脂比例 P40% C30% F30%
-    assert goal["protein_g"] == 152.0  # 1519.7 * 0.40 / 4
-    assert goal["fat_g"] == 50.7  # 1519.7 * 0.30 / 9
+    # TDEE = 1300.25 * 1.50（DRIs 轻度 PAL）= 1950.38
+    assert goal["tdee"] == 1950.4
+    # target = round(1950.375 * 0.85, 1) = 1657.8（减脂赤字 15%）
+    assert goal["target_calories"] == 1657.8
+    # 蛋白质：58kg × 减脂+轻度系数 (1.2~1.6) g/kg → 中点 81.2
+    assert goal["protein_g"] == 81.2
+    # 脂肪按剩余热量 AMDR 区间（20-30%）取中点
+    assert goal["fat_g"] == 37.0
 
 
 def test_get_nutrition_goal_returns_404_when_not_computed(
@@ -830,4 +1075,3 @@ def test_profile_is_user_scoped(
     other = _register_second_user(client, phone="13900000099")
     other_profile = client.get("/api/v1/profile", headers=other)
     assert other_profile.json()["height_cm"] == 170.0  # 默认值，非 190
-

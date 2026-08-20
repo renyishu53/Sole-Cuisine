@@ -34,13 +34,13 @@ class ExtractedKnowledge:
 
 
 def extract_knowledge(content: str, settings: Settings | None = None) -> ExtractedKnowledge:
-    """抽取文档实体与关系，优先 LLM 级、失败回退正则级。"""
+    """抽取文档实体与关系，默认使用不依赖网络的正则抽取。"""
     settings = settings or get_settings()
-    if settings.real_llm_enabled:
+    if settings.entity_extraction_llm_enabled and settings.real_llm_enabled:
         try:
             return _extract_with_llm(content, settings)
         except Exception as exc:  # noqa: BLE001 - 抽取失败不应阻断入库
-            logger.warning("LLM 实体抽取失败，回退正则抽取: {}", type(exc).__name__)
+            logger.warning("LLM 实体抽取失败，已切换到本地正则抽取: {}", type(exc).__name__)
     return _extract_with_regex(content)
 
 
@@ -75,7 +75,7 @@ def _extract_with_llm(content: str, settings: Settings) -> ExtractedKnowledge:
     truncated = content[:6000]
     response = model.invoke([("system", _SYSTEM_PROMPT), ("user", truncated)])
     text = response.content if isinstance(response.content, str) else str(response.content)
-    payload = json.loads(text)
+    payload = _parse_json_object(text)
     entities: list[tuple[str, str]] = []
     for item in payload.get("entities", []) or []:
         kind = str(item.get("kind", "")).strip()
@@ -90,3 +90,21 @@ def _extract_with_llm(content: str, settings: Settings) -> ExtractedKnowledge:
         if subject and relation and obj:
             relations.append((subject, relation, obj))
     return ExtractedKnowledge(entities=entities[:50], relations=relations[:50])
+
+
+def _parse_json_object(text: str) -> dict[str, object]:
+    """Parse a JSON object even when a provider wraps it in a Markdown fence."""
+    normalized = text.strip()
+    if normalized.startswith("```"):
+        normalized = normalized.split("\n", 1)[1] if "\n" in normalized else ""
+        normalized = normalized.rsplit("```", 1)[0].strip()
+    try:
+        payload = json.loads(normalized)
+    except json.JSONDecodeError:
+        start, end = normalized.find("{"), normalized.rfind("}")
+        if start < 0 or end <= start:
+            raise
+        payload = json.loads(normalized[start : end + 1])
+    if not isinstance(payload, dict):
+        raise ValueError("LLM entity extraction response must be a JSON object")
+    return payload

@@ -202,9 +202,8 @@ async def _sync_member_graph(job_id: str) -> None:
         knowledge = KnowledgeService(get_settings())
         try:
             # Phase 3 清理：calendar_events / plan_tasks / plan_budgets 表已删除，
-            # 图谱同步上下文不再包含日程、任务与预算明细——events 恒为空，
+            # 图谱同步仅含用户画像（忌口/偏好）与领域数据（菜谱/计划），
             # 预算改由 WeeklyPlan.budget 标量列派生（已并入 plans 节点，不再单独建 Budget 节点）。
-            events: list = []
             domain_repository = DomainRepository(session)
             planning = PlanningRepository(session)
             recipes = await domain_repository.list_recipes(job.user_id)
@@ -230,11 +229,10 @@ async def _sync_member_graph(job_id: str) -> None:
                     for item in plans
                 ],
             }
-            await knowledge.graph_store.sync_user_context(job.user_id, None, events, domain)
+            await knowledge.graph_store.sync_user_context(job.user_id, None, domain)
             await jobs.mark_completed(
                 job,
                 {
-                    "events": len(events),
                     "recipes": len(recipes),
                     "plans": len(plans),
                 },

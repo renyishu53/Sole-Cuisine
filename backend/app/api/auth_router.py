@@ -1,12 +1,15 @@
 from datetime import UTC, datetime
+from pathlib import Path
 from secrets import token_urlsafe
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, UploadFile, status
 
 from app.api.dependencies import CurrentContext, SessionDep
 from app.core.config import get_settings
+from app.models import User
 from app.repositories import IdentityRepository
 from app.schemas import (
+    AccountProfileUpdate,
     AuthSession,
     ChangePasswordRequest,
     CurrentSession,
@@ -26,6 +29,22 @@ from app.services.sms import SMSCodeMismatchError, SMSError, SMSRateLimitError, 
 
 router = APIRouter(tags=["authentication"])
 settings = get_settings()
+_AVATAR_DIR = Path(__file__).resolve().parent.parent / "static" / "avatars"
+_AVATAR_CONTENT_TYPES = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+}
+_MAX_AVATAR_BYTES = 2 * 1024 * 1024
+
+
+def _user_summary(user: User) -> UserSummary:
+    return UserSummary(
+        id=user.id,
+        phone=user.phone,
+        display_name=user.display_name,
+        avatar_url=user.avatar_url,
+    )
 
 
 @router.post("/auth/register", response_model=AuthSession, status_code=status.HTTP_201_CREATED)
@@ -60,15 +79,58 @@ async def refresh(request: RefreshRequest, session: SessionDep) -> AuthSession:
 
 
 @router.get("/auth/me", response_model=CurrentSession)
-async def me(context: CurrentContext) -> CurrentSession:
+async def me(context: CurrentContext, session: SessionDep) -> CurrentSession:
+    user = await IdentityRepository(session).get_user(context.user_id)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="登录状态无效或已过期")
     return CurrentSession(
-        user=UserSummary(
-            id=context.user_id,
-            phone=context.phone,
-            display_name=context.display_name,
-        ),
+        user=_user_summary(user),
         jwt_development_secret=settings.jwt_uses_development_secret,
     )
+
+
+@router.put("/auth/profile", response_model=UserSummary)
+async def update_account_profile(
+    request: AccountProfileUpdate, context: CurrentContext, session: SessionDep
+) -> UserSummary:
+    user = await IdentityRepository(session).get_user(context.user_id)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
+    display_name = request.display_name.strip()
+    if not display_name:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="用户名不能为空")
+    user.display_name = display_name
+    await session.commit()
+    await session.refresh(user)
+    return _user_summary(user)
+
+
+@router.post("/auth/profile/avatar", response_model=UserSummary)
+async def upload_account_avatar(
+    avatar: UploadFile, context: CurrentContext, session: SessionDep
+) -> UserSummary:
+    extension = _AVATAR_CONTENT_TYPES.get(avatar.content_type or "")
+    if extension is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="头像仅支持 JPG、PNG 或 WebP 格式",
+        )
+    content = await avatar.read()
+    if not content or len(content) > _MAX_AVATAR_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="头像文件需小于 2 MB",
+        )
+    user = await IdentityRepository(session).get_user(context.user_id)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
+    _AVATAR_DIR.mkdir(parents=True, exist_ok=True)
+    filename = f"avatar_{user.id}.{extension}"
+    (_AVATAR_DIR / filename).write_bytes(content)
+    user.avatar_url = f"/static/avatars/{filename}"
+    await session.commit()
+    await session.refresh(user)
+    return _user_summary(user)
 
 
 @router.post("/auth/logout", status_code=status.HTTP_204_NO_CONTENT)

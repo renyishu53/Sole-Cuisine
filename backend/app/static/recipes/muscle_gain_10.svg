@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400" width="400" height="400">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#d97757"/>
+      <stop offset="100%" stop-color="#b35a3c"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="80%" cy="20%" r="50%">
+      <stop offset="0%" stop-color="rgba(255,255,255,.25)"/>
+      <stop offset="100%" stop-color="rgba(255,255,255,0)"/>
+    </radialGradient>
+  </defs>
+  <rect width="400" height="400" fill="url(#bg)"/>
+  <rect width="400" height="400" fill="url(#glow)"/>
+  <g transform="translate(280,140)" fill="rgba(255,255,255,.18)"><rect x="-6" y="-22" width="12" height="44" rx="3"/><rect x="-30" y="-30" width="18" height="14" rx="3"/><rect x="-30" y="16" width="18" height="14" rx="3"/><rect x="12" y="-30" width="18" height="14" rx="3"/><rect x="12" y="16" width="18" height="14" rx="3"/></g>
+  <g transform="translate(40,50)">
+    <rect width="68" height="28" rx="14" fill="#fff3eb"/>
+    <text x="34" y="19" text-anchor="middle" font-family="Microsoft YaHei, PingFang SC, sans-serif" font-size="14" font-weight="700" fill="#a3421b">增肌</text>
+  </g>
+  <g font-family="Microsoft YaHei, PingFang SC, sans-serif" text-anchor="middle">
+    <text x="200" y="210" font-size="34" font-weight="700" fill="#ffffff">鸡肉芝士三明治</text>
+    <text x="200" y="340" font-size="14" fill="#ffe5d4" opacity="0.85">SoloChef 营养菜谱</text>
+  </g>
+  <line x1="160" y1="360" x2="240" y2="360" stroke="rgba(255,255,255,.4)" stroke-width="2" stroke-linecap="round"/>
+</svg>

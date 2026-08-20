@@ -1,6 +1,6 @@
 import asyncio
 import sys
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator
 from pathlib import Path
 from types import ModuleType
 from typing import Any, cast
@@ -19,17 +19,15 @@ from app.ai.llm import (
 from app.ai.workflow import SoloChefWorkflow
 from app.core.config import Settings
 from app.schemas import (
-    CalendarEvent,
     GraphSearchHit,
-    MemberProfile,
     PlanningRequest,
     VectorSearchHit,
 )
 from app.services.conversation import SummaryStreamExtractor
 from app.services.documents import DocumentParseError, DocumentProcessor
-from app.services.embeddings import create_embedding_backend
+from app.services.embeddings import EmbeddingBackend, create_embedding_backend
 from app.services.graph_store import Neo4jGraphStore
-from app.services.vector_store import ChromaVectorStore
+from app.services.milvus_store import MilvusVectorStore
 
 
 class StubKnowledgeService:
@@ -37,10 +35,8 @@ class StubKnowledgeService:
         self,
         query: str,
         user_id: int,
-        members: Sequence[MemberProfile] = (),
-        events: Sequence[CalendarEvent] = (),
     ) -> tuple[list[GraphSearchHit], str]:
-        del query, user_id, members, events
+        del query, user_id
         return [
             GraphSearchHit(
                 subject="本人",
@@ -51,9 +47,15 @@ class StubKnowledgeService:
         ], "connected"
 
     async def retrieve_vector(
-        self, query: str, user_id: int, top_k: int
+        self,
+        query: str,
+        user_id: int,
+        top_k: int,
+        *,
+        goal_type: str | None = None,
+        meal_time: str | None = None,
     ) -> tuple[list[VectorSearchHit], str, str]:
-        del query, user_id, top_k
+        del query, user_id, top_k, goal_type, meal_time
         return [
             VectorSearchHit(
                 document_id="doc-1",
@@ -94,9 +96,32 @@ def test_demo_langgraph_workflow_has_parallel_specialists() -> None:
 
     names = {step.name for step in response.trace}
     assert {"meal_agent", "shopping_agent", "budget_agent"} <= names
-    assert len(response.meals) == 7
+    assert len(response.meals) == 21
     assert response.budget.estimated <= request.budget
     assert response.conflicts == []
+
+
+def test_workflow_uses_shopping_total_as_authoritative_budget_estimate() -> None:
+    class OverBudgetGenerator(DemoPlanGenerator):
+        async def generate(self, request: PlanningRequest, context: str) -> PlanDraft:
+            draft = await super().generate(request, context)
+            shopping = [
+                item.model_copy(update={"price": 100.0}) for item in draft.shopping
+            ]
+            return draft.model_copy(update={"shopping": shopping})
+
+    request = PlanningRequest(prompt="生成采购预算校验计划", budget=500)
+    workflow = SoloChefWorkflow(
+        knowledge=StubKnowledgeService(),
+        generator=OverBudgetGenerator(),
+    )
+
+    response = asyncio.run(workflow.run(request))
+
+    assert response.budget.estimated == 800
+    assert response.budget.usage_percent == 160
+    assert response.needs_manual_review is True
+    assert any("采购清单估价 800 元超过预算 500 元" in item for item in response.conflicts)
 
 
 def test_graph_search_uses_non_conflicting_search_parameter() -> None:
@@ -152,17 +177,23 @@ async def test_langgraph_resume_retries_only_pending_node() -> None:
             self,
             query: str,
             user_id: int,
-            members: Sequence[MemberProfile] = (),
-            events: Sequence[CalendarEvent] = (),
         ) -> tuple[list[GraphSearchHit], str]:
             self.calls += 1
-            return await super().retrieve_graph(query, user_id, members, events)
+            return await super().retrieve_graph(query, user_id)
 
         async def retrieve_vector(
-            self, query: str, user_id: int, top_k: int
+            self,
+            query: str,
+            user_id: int,
+            top_k: int,
+            *,
+            goal_type: str | None = None,
+            meal_time: str | None = None,
         ) -> tuple[list[VectorSearchHit], str, str]:
             self.calls += 1
-            return await super().retrieve_vector(query, user_id, top_k)
+            return await super().retrieve_vector(
+                query, user_id, top_k, goal_type=goal_type, meal_time=meal_time
+            )
 
     class FailOnceGenerator(DemoPlanGenerator):
         def __init__(self) -> None:
@@ -190,6 +221,8 @@ async def test_langgraph_resume_retries_only_pending_node() -> None:
     result = await workflow.run(None, run_id=run_id, resume=True)
 
     assert len(result.trace) == 11
+    assert result.trace[0].name == "constraint_parser"
+    assert all(step.name != "intent" for step in result.trace)
     assert generator.calls == 2
     assert knowledge.calls == retrieval_calls
 
@@ -240,7 +273,20 @@ async def test_real_plan_generator_streams_model_chunks() -> None:
     assert result.summary == draft.summary
 
 
-def test_embedding_backend_defaults_to_builtin_model() -> None:
+def test_embedding_backend_defaults_to_builtin_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 内置兜底模型（all-MiniLM-L6-v2）实例化不应触发网络下载：
+    # 离线环境无法访问 HuggingFace，故用假模块替换 sentence_transformers，
+    # 保持用例确定性（与下面 bge-m3 用例一致的隔离方式）。
+    class FakeSentenceTransformer:
+        def __init__(self, model_ref: str, **kwargs: object) -> None:
+            del model_ref, kwargs
+
+    fake_module = ModuleType("sentence_transformers")
+    fake_module.SentenceTransformer = FakeSentenceTransformer  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "sentence_transformers", fake_module)
+
     settings = Settings(_env_file=None, embedding_provider="default")
     backend = create_embedding_backend(settings)
     assert backend.is_bge_m3 is False
@@ -248,7 +294,19 @@ def test_embedding_backend_defaults_to_builtin_model() -> None:
     assert "MiniLM" in backend.model_name
 
 
-def test_embedding_backend_falls_back_when_bge_m3_path_missing(tmp_path: Path) -> None:
+def test_embedding_backend_falls_back_when_bge_m3_path_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # bge-m3 路径缺失时回退到内置模型；用假模块隔离 sentence_transformers，
+    # 避免离线环境下触发内置模型的网络下载。
+    class FakeSentenceTransformer:
+        def __init__(self, model_ref: str, **kwargs: object) -> None:
+            del model_ref, kwargs
+
+    fake_module = ModuleType("sentence_transformers")
+    fake_module.SentenceTransformer = FakeSentenceTransformer  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "sentence_transformers", fake_module)
+
     settings = Settings(
         _env_file=None,
         embedding_provider="bge-m3",
@@ -298,7 +356,7 @@ def test_embedding_backend_loads_bge_m3_from_local_path(
         {"model_ref": str(model_dir), "device": "cpu", "local_files_only": True}
     ]
     vectors = cast(Any, backend.function)(["晚餐吃什么", "采购清单"])
-    # embedding 函数返回原始模型输出（numpy 类数组），由 chroma 统一转 list
+    # embedding 函数返回原始模型输出（numpy 类数组），由向量库统一转 list
     assert [v.tolist() for v in vectors] == [[0.1, 0.2], [0.1, 0.2]]
 
 
@@ -313,7 +371,12 @@ def test_embedding_backend_never_downloads_implicitly(monkeypatch: pytest.Monkey
     fake_module.SentenceTransformer = FakeSentenceTransformer  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "sentence_transformers", fake_module)
 
-    settings = Settings(_env_file=None, embedding_provider="auto")
+    # 显式清空本地模型路径：pymilvus 在 import 时调用 load_dotenv()，
+    # 会把项目 .env 里的 EMBEDDING_MODEL_PATH 写入 os.environ，导致
+    # `_env_file=None` 仍从环境变量读到机器本地路径，破坏本用例的确定性。
+    settings = Settings(
+        _env_file=None, embedding_provider="auto", embedding_model_path=""
+    )
     backend = create_embedding_backend(settings)
 
     assert init_calls[0]["model_ref"] == "BAAI/bge-m3"
@@ -321,9 +384,20 @@ def test_embedding_backend_never_downloads_implicitly(monkeypatch: pytest.Monkey
     assert backend.is_bge_m3 is True
 
 
-def test_vector_store_uses_dedicated_collection_for_bge_m3() -> None:
-    settings = Settings(_env_file=None, chroma_collection="solochef_knowledge")
-    store = ChromaVectorStore(settings)
+def test_vector_store_uses_dedicated_collection_for_bge_m3(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 用假模块隔离 sentence_transformers，避免离线环境下触发内置模型的网络下载。
+    class FakeSentenceTransformer:
+        def __init__(self, model_ref: str, **kwargs: object) -> None:
+            del model_ref, kwargs
+
+    fake_module = ModuleType("sentence_transformers")
+    fake_module.SentenceTransformer = FakeSentenceTransformer  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "sentence_transformers", fake_module)
+
+    settings = Settings(_env_file=None, milvus_collection="solochef_knowledge")
+    store = MilvusVectorStore(settings)
     bge_backend = create_embedding_backend(
         Settings(_env_file=None, embedding_provider="default")
     )
@@ -334,20 +408,85 @@ def test_vector_store_uses_dedicated_collection_for_bge_m3() -> None:
         label="本地语义模型 BGE-M3",
         is_bge_m3=True,
     )
-    assert store.collection_name_for(upgraded) == "solochef_knowledge-bge-m3"
+    assert store.collection_name_for(upgraded) == "solochef_knowledge_bge_m3"
 
 
-def test_verifier_checks_member_allergy_constraints() -> None:
-    member = MemberProfile(
-        id=99,
-        name="过敏成员",
-        role="本人",
-        avatar="过",
-        color="#46705d",
-        preferences=[],
-        constraints=["虾过敏"],
-        availability="全天",
+def test_replace_document_creates_collection_before_delete() -> None:
+    # 回归：replace_document 在首次 delete 前必须先 _ensure_collection，
+    # 否则全新部署冷启动会因 collection not found 抛错（bootstrap 无法入库）。
+    calls: list[str] = []
+
+    class FakeSchema:
+        def add_field(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+    class FakeIndexParams:
+        def add_index(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+    class FakeMilvusClient:
+        def __init__(self) -> None:
+            self._created = False
+
+        def has_collection(self, collection_name: str) -> bool:
+            del collection_name
+            calls.append("has_collection")
+            return self._created
+
+        def describe_collection(self, collection_name: str) -> dict[str, object]:
+            del collection_name
+            calls.append("describe_collection")
+            return {"fields": [{"name": "goal_type"}, {"name": "meal_time"}]}
+
+        def create_schema(self, **kwargs: object) -> FakeSchema:
+            del kwargs
+            calls.append("create_schema")
+            return FakeSchema()
+
+        def prepare_index_params(self) -> FakeIndexParams:
+            calls.append("prepare_index_params")
+            return FakeIndexParams()
+
+        def create_collection(self, **kwargs: object) -> None:
+            del kwargs
+            calls.append("create_collection")
+            self._created = True
+
+        def delete(self, **kwargs: object) -> None:
+            del kwargs
+            calls.append("delete")
+
+        def upsert(self, **kwargs: object) -> None:
+            del kwargs
+            calls.append("upsert")
+
+    fake_client = FakeMilvusClient()
+    fake_backend = EmbeddingBackend(
+        function=lambda texts: [[0.1, 0.2, 0.3] for _ in texts],
+        model_name="fake",
+        label="fake",
+        is_bge_m3=False,
     )
+    store = MilvusVectorStore(Settings(_env_file=None))
+    store._client = fake_client  # type: ignore[assignment]
+    store._embedding = fake_backend  # type: ignore[assignment]
+
+    asyncio.run(
+        store.replace_document(
+            name="测试文档.md",
+            category="菜谱",
+            chunks=["第一段", "第二段"],
+            user_id=1,
+            document_id="doc-1",
+        )
+    )
+
+    assert "create_collection" in calls
+    assert "delete" in calls
+    assert calls.index("create_collection") < calls.index("delete")
+
+
+def test_verifier_checks_user_allergy_constraints() -> None:
     workflow = SoloChefWorkflow(
         knowledge=StubKnowledgeService(),
         generator=DemoPlanGenerator(),
@@ -355,7 +494,7 @@ def test_verifier_checks_member_allergy_constraints() -> None:
     response = asyncio.run(
         workflow.run(
             PlanningRequest(prompt="生成一周菜单", budget=500),
-            members=[member],
+            user_constraints=["虾过敏"],
         )
     )
     verifier = next(step for step in response.trace if step.name == "verifier")

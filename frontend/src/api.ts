@@ -1,5 +1,5 @@
 import axios, { AxiosError, type InternalAxiosRequestConfig } from 'axios'
-import type { AgentEvaluation, AgentRun, AIServiceStatus, ArchivedPlanResponse, AuthSession, BackgroundJob, CeleryStatsResponse, ChatSessionDetail, ChatSessionSummary, ChatStreamEvent, ChatTurnResponse, CurrentSession, Dashboard, DeadLetterItem, DeviceSession, FeedbackOverviewResponse, InventoryAdjustInput, InventoryEntry, InventoryResponse, KnowledgeDocument, KnowledgeSearchResponse, LLMSmokeResponse, MealItem, MealItemInput, MealReplacementResponse, NutritionReport, PlanDiff, PlanningResponse, PromptRegistryResponse, RagEvalResponse, Recipe, RecipeInput, ShoppingItem, ShoppingItemInput, ShoppingMergeResponse, SMSCodeResponse, SyncConsistencyResponse, TasteProfileResponse, WeeklyPlanDetail, WeeklyPlanSummary } from './types'
+import type { AgentEvaluation, AgentRun, AIServiceStatus, ArchivedPlanResponse, AuthSession, BackgroundJob, BudgetAnalytics, CeleryStatsResponse, ChatSessionDetail, ChatSessionSummary, ChatStreamEvent, ChatTurnResponse, CurrentSession, Dashboard, DeadLetterItem, DeviceSession, FeedbackOverviewResponse, InventoryAdjustInput, InventoryEntry, InventoryResponse, KnowledgeDocument, KnowledgeSearchResponse, LLMSmokeResponse, MealDeviationType, MealItem, MealItemInput, MealReplacementResponse, NutritionGoalResponse, NutritionReport, PlanDiff, PlanningResponse, PromptRegistryResponse, RagEvalResponse, Recipe, RecipeDetail, RecipeInput, RecipeListResponse, RecipeSummary, RecipeTipsResponse, ShoppingItem, ShoppingItemInput, ShoppingMergeResponse, ShoppingSubstitutionDecision, ShoppingSubstitutionResponse, SMSCodeResponse, SyncConsistencyResponse, TasteProfileResponse, TasteVectorResponse, TodayNutritionResponse, UserProfileResponse, UserSummary, VisionResult, VisionScene, WeeklyPlanDetail, WeeklyPlanSummary, WeeklyReportResponse } from './types'
 
 const baseURL = import.meta.env.VITE_API_BASE_URL || '/api/v1'
 const client = axios.create({ baseURL, timeout: 10000 })
@@ -65,7 +65,11 @@ async function streamChat(
     body: JSON.stringify(body),
     signal,
   })
-  if (!response.ok || !response.body) throw new Error(`对话请求失败 (${response.status})`)
+  if (!response.ok || !response.body) {
+    let detail = `对话请求失败 (${response.status})`
+    try { const err = await response.json(); if (err.detail) detail = Array.isArray(err.detail) ? err.detail.map((d: { msg: string }) => d.msg).join('；') : String(err.detail) } catch { /* ignore parse error */ }
+    throw new Error(detail)
+  }
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
   let buffer = ''
@@ -130,6 +134,11 @@ export const api = {
   sendSmsCode: (phone: string, scene: 'login' | 'reset_password' | 'change_phone' | 'bind_phone' | 'verify_phone' = 'login') => client.post<SMSCodeResponse>('/auth/sms/send', { phone, scene }).then(({ data }) => data),
   smsLogin: (body: { phone: string; code: string; display_name?: string }) => client.post<AuthSession>('/auth/sms/login', body).then(({ data }) => data),
   me: () => client.get<CurrentSession>('/auth/me').then(({ data }) => data),
+  updateAccountProfile: (body: { display_name: string }) => client.put<UserSummary>('/auth/profile', body).then(({ data }) => data),
+  uploadAccountAvatar: (file: File) => {
+    const body = new FormData(); body.append('avatar', file)
+    return client.post<UserSummary>('/auth/profile/avatar', body).then(({ data }) => data)
+  },
   logout: (refresh_token: string) => client.post('/auth/logout', { refresh_token }),
   logoutAll: () => client.post('/auth/logout-all'),
   changePassword: (current_password: string, new_password: string) => client.post('/auth/change-password', { current_password, new_password }),
@@ -137,18 +146,31 @@ export const api = {
   deviceSessions: () => client.get<DeviceSession[]>('/auth/sessions').then(({ data }) => data),
   revokeDeviceSession: (id: string) => client.delete(`/auth/sessions/${id}`),
   dashboard: () => client.get<Dashboard>('/dashboard').then(({ data }) => data),
+  profile: () => client.get<UserProfileResponse>('/profile').then(({ data }) => data),
+  updateProfile: (body: Partial<{ height_cm: number; weight_kg: number; age: number; gender: string; activity_level: string; goal_type: string; preferences: string[]; constraints: string[]; budget_limit: number; cooking_skill: string; kitchenware: string[]; prep_time_max: number }>) => client.put<UserProfileResponse>('/profile', body).then(({ data }) => data),
+  nutritionGoal: () => client.get<NutritionGoalResponse>('/profile/nutrition-goal').then(({ data }) => data),
+  computeNutritionGoal: () => client.post<NutritionGoalResponse>('/profile/nutrition-goal', undefined, { timeout: 30000 }).then(({ data }) => data),
   meals: () => client.get<MealItem[]>('/meals').then(({ data }) => data),
   createMeal: (body: MealItemInput) => client.post<MealItem>('/meals', body).then(({ data }) => data),
   updateMeal: (id: number, body: Partial<MealItemInput>) => client.patch<MealItem>(`/meals/${id}`, body).then(({ data }) => data),
   deleteMeal: (id: number) => client.delete(`/meals/${id}`),
   replaceMeal: (id: number, body: { feedback: string; rating?: number | null; tags?: string[] }) => client.post<MealReplacementResponse>(`/meals/${id}/replace`, body, { timeout: 120000 }).then(({ data }) => data),
+  checkinMeal: (id: number, body: { eaten: boolean; deviation_type?: MealDeviationType | null; deviation_reason?: string }) => client.post<MealItem>(`/meals/${id}/checkin`, body).then(({ data }) => data),
   shopping: () => client.get<ShoppingItem[]>('/shopping').then(({ data }) => data),
   createShoppingItem: (body: ShoppingItemInput) => client.post<ShoppingItem>('/shopping', body).then(({ data }) => data),
   updateShoppingItem: (id: number, body: Partial<ShoppingItemInput>) => client.patch<ShoppingItem>(`/shopping/${id}`, body).then(({ data }) => data),
   deleteShoppingItem: (id: number) => client.delete(`/shopping/${id}`),
+  shoppingImpact: (id: number) => client.get<import('./types').ShoppingImpactResponse>(`/shopping/${id}/impact`).then(({ data }) => data),
   mergeShopping: () => client.post<ShoppingMergeResponse>('/shopping/merge').then(({ data }) => data),
-  shoppingSubstitutions: (id: number) => client.get<{ item_id: number; name: string; suggestions: string[] }>(`/shopping/${id}/substitutions`).then(({ data }) => data),
+  shoppingSubstitutions: (id: number, limit = 5) => client.get<ShoppingSubstitutionResponse>(`/shopping/${id}/substitutions`, { params: { limit } }).then(({ data }) => data),
+  autoSubstituteShoppingItem: (id: number) => client.post<ShoppingItem>(`/shopping/${id}/auto-substitute`).then(({ data }) => data),
+  acceptShoppingSubstitution: (id: number, body: ShoppingSubstitutionDecision) => client.post<ShoppingItem>(`/shopping/${id}/substitution/accept`, body).then(({ data }) => data),
   recipes: () => client.get<Recipe[]>('/recipes').then(({ data }) => data),
+  listRecipes: (params?: { category?: string; page?: number; page_size?: number }) => client.get<RecipeListResponse>('/recipes', { params }).then(({ data }) => data),
+  getRecipe: (id: string) => client.get<RecipeDetail>(`/recipes/${id}`).then(({ data }) => data),
+  similarRecipes: (id: string, limit = 3) => client.get<RecipeSummary[]>(`/recipes/${id}/similar`, { params: { limit } }).then(({ data }) => data),
+  recipeTips: (id: string) => client.get<RecipeTipsResponse>(`/recipes/${id}/tips`).then(({ data }) => data),
+  tasteVector: () => client.get<TasteVectorResponse>('/feedback/taste-vector').then(({ data }) => data),
   createRecipe: (body: RecipeInput) => client.post<Recipe>('/recipes', body).then(({ data }) => data),
   updateRecipe: (id: number, body: Partial<RecipeInput>) => client.patch<Recipe>(`/recipes/${id}`, body).then(({ data }) => data),
   deleteRecipe: (id: number) => client.delete(`/recipes/${id}`),
@@ -159,6 +181,10 @@ export const api = {
   uploadKnowledge: (file: File, category: string) => {
     const body = new FormData(); body.append('file', file); body.append('category', category)
     return client.post<KnowledgeDocument>('/knowledge/documents/upload', body, { timeout: 120000 }).then(({ data }) => data)
+  },
+  recognizeVision: (file: File, scene: VisionScene = 'auto') => {
+    const body = new FormData(); body.append('image', file); body.append('scene', scene)
+    return client.post<VisionResult>('/chat/vision', body, { timeout: 120000 }).then(({ data }) => data)
   },
   searchKnowledge: (query: string) => client.post<KnowledgeSearchResponse>('/knowledge/search', { query, top_k: 4 }, { timeout: 120000 }).then(({ data }) => data),
   ragEval: (top_k = 4) => client.get<RagEvalResponse>('/admin/rag/eval', { params: { top_k } }).then(({ data }) => data),
@@ -174,12 +200,13 @@ export const api = {
   sendChatMessage: (id: string, content: string, budget: number) => client.post<ChatTurnResponse>(`/chat/sessions/${id}/messages`, { content, budget }, { timeout: 120000 }).then(({ data }) => data),
   streamChat,
   cancelChat: (id: string) => client.post<{ status: string }>(`/chat/sessions/${id}/cancel`).then(({ data }) => data),
-  generatePlan: (prompt: string, budget: number) => client.post<PlanningResponse>('/plans/generate-weekly', { prompt, budget }, { timeout: 120000 }).then(({ data }) => data),
-  confirmPlan: (id: string) => client.post<{ plan_id: number; run_id: string; status: string; message: string }>(`/plans/${id}/confirm`).then(({ data }) => data),
+  generatePlan: (prompt: string, budget: number) => client.post<PlanningResponse>('/plans/generate-weekly', { prompt, budget }, { timeout: 90000 }).then(({ data }) => data),
+  confirmPlan: (id: string) => client.post<WeeklyPlanDetail>(`/plans/${id}/confirm`).then(({ data }) => data),
   agentRun: (id: string) => client.get<AgentRun>(`/agents/runs/${id}`).then(({ data }) => data),
   retryAgentRun: (id: string) => client.post<PlanningResponse>(`/agents/runs/${id}/retry`, undefined, { timeout: 120000 }).then(({ data }) => data),
   listAgentRuns: () => client.get<AgentRun[]>('/agents/runs').then(({ data }) => data),
   listPlans: () => client.get<WeeklyPlanSummary[]>('/plans').then(({ data }) => data),
+  activePlanOverview: () => client.get<import('./types').ActivePlanOverview>('/plans/active/overview').then(({ data }) => data),
   getPlan: (id: number) => client.get<WeeklyPlanDetail>(`/plans/${id}`).then(({ data }) => data),
   listPlanVersions: (id: number) => client.get<WeeklyPlanSummary[]>(`/plans/${id}/versions`).then(({ data }) => data),
   activatePlan: (id: number) => client.post<WeeklyPlanDetail>(`/plans/${id}/activate`).then(({ data }) => data),
@@ -187,8 +214,13 @@ export const api = {
   derivePlan: (id: number) => client.post<WeeklyPlanDetail>(`/plans/${id}/derive`).then(({ data }) => data),
   comparePlans: (id: number, otherId: number) => client.get<PlanDiff>(`/plans/${id}/diff/${otherId}`).then(({ data }) => data),
   mealNutrition: () => client.get<NutritionReport>('/meals/nutrition').then(({ data }) => data),
+  todayNutrition: () => client.get<TodayNutritionResponse>('/meals/today/nutrition').then(({ data }) => data),
   tasteProfile: () => client.get<TasteProfileResponse>('/meals/taste-profile').then(({ data }) => data),
+  budgetAnalytics: () => client.get<BudgetAnalytics>('/budget/analytics').then(({ data }) => data),
+  weeklyReport: (weekStart?: string) => client.get<WeeklyReportResponse>('/reports/weekly', { params: weekStart ? { week_start: weekStart } : undefined }).then(({ data }) => data),
+  weeklyReportPeriods: () => client.get<import('./types').WeeklyReportPeriod[]>('/reports/weekly/periods').then(({ data }) => data),
   feedbackOverview: (params?: { feedback_type?: string; limit?: number }) => client.get<FeedbackOverviewResponse>('/feedback', { params }).then(({ data }) => data),
+  classifyIntent: (prompt: string, entryContext: import('./types').IntentEntryContext = 'assistant', hasActivePlan = false) => client.post<import('./types').IntentDecision>('/assistant/intent', { prompt, entry_context: entryContext, has_active_plan: hasActivePlan }).then(({ data }) => data),
   feedbackResync: () => client.post<FeedbackOverviewResponse>('/feedback/resync').then(({ data }) => data),
   listInventory: () => client.get<InventoryResponse>('/inventory').then(({ data }) => data),
   adjustInventory: (body: InventoryAdjustInput) => client.post<InventoryEntry>('/inventory/adjust', body).then(({ data }) => data),
@@ -201,4 +233,6 @@ export const api = {
   cancelJob: (id: string) => client.post<BackgroundJob>(`/jobs/${id}/cancel`).then(({ data }) => data),
   deadLetterJobs: () => client.get<DeadLetterItem[]>('/jobs/dead-letter').then(({ data }) => data),
   cleanupJobs: (daysOld = 30) => client.post<{ removed: number }>('/jobs/cleanup', null, { params: { days_old: daysOld } }).then(({ data }) => data),
+  revisePlan: (planId: number, message: string, sessionId?: string | null) => client.post<import('./types').RevisePreviewResponse>(`/plans/${planId}/revise`, { message, session_id: sessionId }, { timeout: 120000 }).then(({ data }) => data),
+  confirmRevise: (planId: number, reviseId: string) => client.post<import('./types').ReviseConfirmResponse>(`/plans/${planId}/revise/${reviseId}/confirm`, undefined, { timeout: 30000 }).then(({ data }) => data),
 }

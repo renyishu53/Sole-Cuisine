@@ -20,6 +20,26 @@ class AgentStatus(StrEnum):
     FAILED = "failed"
 
 
+class VisionScene(StrEnum):
+    """多模态图片识别场景。"""
+
+    AUTO = "auto"  # 由视觉模型自动判断图片类型
+    INGREDIENT = "ingredient"  # 食材识别
+    DISH = "dish"  # 菜品 + 热量估算
+    NUTRITION_LABEL = "label"  # 营养成分表 OCR
+    RECEIPT = "receipt"  # 购物小票 OCR
+
+
+class VisionResult(BaseModel):
+    """视觉识别统一响应结构。"""
+
+    scene: VisionScene
+    summary: str
+    items: list[dict[str, Any]] = []
+    calories: float | None = None
+    raw_text: str = ""
+
+
 class MemberProfile(BaseModel):
     id: int
     name: str
@@ -253,12 +273,21 @@ class TaskAgentResult(BaseModel):
     default_duration_minutes: int = Field(ge=5, le=240)
 
 
+class BudgetSelfCheck(BaseModel):
+    """预算分配自检字段：分类之和 + 预留 == 周预算。"""
+    category_sum: float = 0
+    total_check: float = 0
+    expected: float = 0
+    matched: bool = False
+
+
 class BudgetAgentResult(BaseModel):
     strategy: str
     limit: float = Field(gt=0)
     reserve: float = Field(ge=0)
     warning_threshold_percent: int = Field(ge=1, le=100)
     category_limits: dict[str, float]
+    self_check: BudgetSelfCheck | None = None
 
 
 class DomainAgentBundle(BaseModel):
@@ -340,18 +369,25 @@ class TaskItemUpdate(BaseModel):
 class MealItem(BaseModel):
     id: int = 0
     day: str
+    meal_type: str = "晚餐"
     name: str
     duration: int
     cost: float
     tags: list[str]
     reason: str
     ingredients: list[str]
+    # Phase 4：餐食"已吃"打卡 + 未吃偏差结构化
+    eaten: bool = False
+    eaten_at: datetime | None = None
+    deviation_type: str | None = None
+    deviation_reason: str = ""
 
 
 class MealItemCreate(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
     day: str = Field(min_length=1, max_length=10)
+    meal_type: str = Field(default="晚餐", max_length=10)
     name: str = Field(min_length=1, max_length=120)
     duration: int = Field(default=30, ge=1, le=1440)
     cost: float = Field(default=0, ge=0, le=100000)
@@ -364,6 +400,7 @@ class MealItemUpdate(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
     day: str | None = Field(default=None, min_length=1, max_length=10)
+    meal_type: str | None = Field(default=None, max_length=10)
     name: str | None = Field(default=None, min_length=1, max_length=120)
     duration: int | None = Field(default=None, ge=1, le=1440)
     cost: float | None = Field(default=None, ge=0, le=100000)
@@ -386,6 +423,10 @@ class ShoppingItem(BaseModel):
     price: float
     source: str
     purchased: bool = False
+    # 食材替换确认闭环：substituted_from 记录被替换前的原食材名，
+    # substituted_accepted 记录用户是否确认（None=待确认，True=已接受，False=已拒绝并回退）。
+    substituted_from: str | None = None
+    substituted_accepted: bool | None = None
 
 
 class ShoppingItemCreate(BaseModel):
@@ -430,10 +471,61 @@ class ShoppingItemUpdate(BaseModel):
         }
 
 
+class ShoppingImpactMeal(BaseModel):
+    """餐食与购物条目的依赖关系摘要。"""
+
+    id: int
+    day: str
+    meal_type: str
+    name: str
+
+
+class ShoppingImpactResponse(BaseModel):
+    """描述修改购物条目是否会破坏当前计划的餐食依赖。"""
+
+    item_id: int
+    item_name: str
+    has_impact: bool
+    affected_meals: list[ShoppingImpactMeal] = Field(default_factory=list)
+    message: str = ""
+
+
 class MealReplacementRequest(BaseModel):
     feedback: str = Field(min_length=2, max_length=1000)
     rating: int | None = Field(default=None, ge=1, le=5)
     tags: list[str] = Field(default_factory=list, max_length=20)
+
+
+MealDeviationType = Literal["not_available", "no_appetite", "ate_other"]
+
+
+class MealCheckinRequest(BaseModel):
+    """餐食"已吃"打卡请求：已吃时置 eaten=true；未吃时携带偏差类型与原因。"""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    eaten: bool
+    deviation_type: MealDeviationType | None = None
+    deviation_reason: str = Field(default="", max_length=500)
+
+
+class TodayNutrient(BaseModel):
+    """单个营养素的今日达成进度：目标 / 已摄入 / 剩余 / 达成率。"""
+
+    target: float = 0
+    consumed: float = 0
+    remaining: float = 0
+    percent: float = Field(default=0, description="已摄入占目标百分比，0-200 区间")
+
+
+class TodayNutritionResponse(BaseModel):
+    """今日营养目标达成进度（按当日已吃餐食聚合）。"""
+
+    day: str = Field(description="今日中文星期标签，如 '周四'")
+    meal_count: int = 0
+    eaten_count: int = 0
+    nutrients: dict[str, TodayNutrient] = Field(default_factory=dict)
+    overall_percent: float = 0
 
 
 class ShoppingMergeResponse(BaseModel):
@@ -581,6 +673,21 @@ class TasteProfileResponse(BaseModel):
     sample_size: int = 0
 
 
+class TasteDimension(BaseModel):
+    """口味画像五维向量的一维：辣 / 清淡 / 甜 / 咸 / 酸。"""
+
+    key: str
+    label: str
+    score: float  # -1..1，正值偏好、负值回避、0 中性/无数据
+
+
+class TasteVectorResponse(BaseModel):
+    """反馈复盘五维口味雷达的数据源（§7.4 已敲定的后端新增接口）。"""
+
+    dimensions: list[TasteDimension]
+    sample_size: int = 0
+
+
 class FeedbackOverviewResponse(BaseModel):
     """反馈闭环总览：偏差明细 + 情感分布 + 待补偿同步数。"""
 
@@ -590,12 +697,93 @@ class FeedbackOverviewResponse(BaseModel):
     taste_profile: TasteProfileResponse
 
 
+class WeeklyAchievement(BaseModel):
+    """阶段5：一周报告中的单类达成率卡片。"""
+
+    key: str = Field(description="nutrition | budget | coverage")
+    label: str = Field(description="中文标签，如 '营养达成'")
+    percent: float = Field(default=0, description="达成百分比，0-100 区间")
+    detail: str = Field(default="", description="一句话补充说明")
+    has_data: bool = Field(default=True, description="该指标是否已有可展示的数据")
+
+
+class CoverageStats(BaseModel):
+    """阶段5：计划执行覆盖（餐食打卡 + 采购核销）。"""
+
+    meal_planned: int = 0
+    meal_eaten: int = 0
+    shopping_planned: int = 0
+    shopping_purchased: int = 0
+    coverage_percent: float = Field(default=0, description="整体覆盖百分比")
+
+
+class WeeklySuggestion(BaseModel):
+    """阶段5：可操作建议，必须带具体行动而非泛泛之谈。"""
+
+    category: str = Field(description="nutrition | budget | taste | coverage")
+    title: str
+    detail: str = ""
+    action: str = Field(description="具体可执行的行动")
+
+
+class WeeklyReportResponse(BaseModel):
+    """所选自然周的执行报告，默认返回本周。"""
+
+    has_data: bool = Field(default=False, description="所选周是否存在已确认的备餐计划")
+    week_start: str = Field(description="报告周期起始日期 ISO 格式")
+    week_end: str = Field(description="报告周期结束日期 ISO 格式")
+    week_label: str = Field(description="ISO 周标签，如 '2026-W33'")
+    achievements: list[WeeklyAchievement] = Field(default_factory=list)
+    coverage: CoverageStats = Field(default_factory=CoverageStats)
+    suggestions: list[WeeklySuggestion] = Field(default_factory=list)
+    notices: list[str] = Field(default_factory=list)
+
+
+class WeeklyReportPeriod(BaseModel):
+    """One natural week that has at least one confirmed meal plan."""
+
+    week_start: str
+    week_end: str
+    week_label: str
+
+
+class NutritionComparison(BaseModel):
+    """餐食替换前后营养对比（单餐或全天）。"""
+
+    before: dict[str, float] = Field(default_factory=dict)
+    after: dict[str, float] = Field(default_factory=dict)
+    delta: dict[str, float] = Field(default_factory=dict)
+    calibrated_before: bool = False
+    calibrated_after: bool = False
+
+
+class DayNutritionComparison(BaseModel):
+    """餐食替换前后当天营养合计对比。"""
+
+    day: str
+    before: dict[str, float] = Field(default_factory=dict)
+    after: dict[str, float] = Field(default_factory=dict)
+    delta: dict[str, float] = Field(default_factory=dict)
+
+
+class ShoppingSyncResult(BaseModel):
+    """餐食替换触发的购物清单联动结果。"""
+
+    added: list[ShoppingItem] = Field(default_factory=list)
+    removed: list[ShoppingItem] = Field(default_factory=list)
+    merged_groups: int = 0
+    removed_duplicates: int = 0
+
+
 class MealReplacementResponse(BaseModel):
-    """餐食替换结果，同时回传"这次反馈被学到了什么"。"""
+    """餐食替换结果，同时回传"这次反馈被学到了什么"与营养/清单联动。"""
 
     meal: MealItem
     feedback: FeedbackSyncInfo | None = None
     taste_profile: TasteProfileResponse
+    meal_nutrition: NutritionComparison | None = None
+    day_nutrition: DayNutritionComparison | None = None
+    shopping_sync: ShoppingSyncResult | None = None
 
 
 class RecipeInput(BaseModel):
@@ -646,7 +834,7 @@ class ChatSessionUpdate(BaseModel):
 
 class ChatMessageCreate(BaseModel):
     content: str = Field(min_length=2, max_length=4000)
-    budget: float = Field(default=500, gt=0, le=100000)
+    budget: float = Field(default=500, ge=0, le=100000)
 
 
 class ChatMessageResponse(BaseModel):
@@ -750,6 +938,11 @@ class VectorSearchHit(BaseModel):
     content: str
     chunk_index: int
     score: float
+    # ── 文档 frontmatter 元数据（目标/餐次/过敏/营养侧重），供前端可解释展示 ──
+    goal_type: str = "maintain"
+    meal_time: str = "通用"
+    allergens: str = ""
+    nutrition_focus: str = "均衡"
 
 
 class GraphSearchHit(BaseModel):
@@ -760,9 +953,9 @@ class GraphSearchHit(BaseModel):
 
 
 class RetrievalDiagnostics(BaseModel):
-    chroma: str
+    vector_store: str
     neo4j: str
-    embedding: str = "Chroma DefaultEmbeddingFunction (ONNX MiniLM-L6-v2)"
+    embedding: str = "all-MiniLM-L6-v2 (384d)"
     rerank: str = "disabled"
 
 
@@ -778,7 +971,7 @@ class AIServiceStatus(BaseModel):
     rag_enabled: bool
     llm_mode: str
     langgraph: str
-    chroma: str
+    vector_store: str
     neo4j: str
     collection: str
     documents: int
@@ -793,19 +986,19 @@ class AIServiceStatus(BaseModel):
 
 
 class SyncConsistencyResponse(BaseModel):
-    """Chroma 与 Neo4j 检索索引的同步一致性快照。"""
+    """向量库与 Neo4j 检索索引的同步一致性快照。"""
 
-    chroma_status: str = Field(description="知识库(Chroma)连通状态")
+    vector_status: str = Field(description="向量知识库连通状态")
     neo4j_status: str = Field(description="关系图谱(Neo4j)连通状态")
-    chroma_documents: int = Field(description="Chroma 中文档数量")
-    chroma_chunks: int = Field(description="Chroma 中知识片段数量")
+    vector_documents: int = Field(description="向量库中文档数量")
+    vector_chunks: int = Field(description="向量库中知识片段数量")
     neo4j_documents: int = Field(description="Neo4j 中 Document 节点数量")
     neo4j_entities: int = Field(description="Neo4j 中 KnowledgeEntity 数量")
     missing_in_neo4j: list[str] = Field(
-        default_factory=list, description="仅存在于 Chroma、图谱未同步的文档名"
+        default_factory=list, description="仅存在于向量库、图谱未同步的文档名"
     )
     orphan_in_neo4j: list[str] = Field(
-        default_factory=list, description="仅存在于 Neo4j、Chroma 缺失的孤儿文档名"
+        default_factory=list, description="仅存在于 Neo4j、向量库缺失的孤儿文档名"
     )
     consistent: bool = Field(description="两份索引是否一致")
     notes: list[str] = Field(default_factory=list, description="一致性说明")
@@ -907,18 +1100,55 @@ class Dashboard(BaseModel):
     user_name: str
     greeting: str
     date_label: str
-    today_events: list[CalendarEvent]
+    today_events: list[CalendarEvent] = Field(default_factory=list)
     tasks: list[TaskItem]
     tonight_meal: MealItem
     budget: BudgetSummary
     notices: list[str]
     week_progress: int
+    plan_expired: bool = False
 
 
 class PlanningRequest(BaseModel):
     prompt: str = Field(min_length=5, max_length=1000)
     budget: float = Field(default=500, gt=0, le=100000)
     user_id: int = 1
+
+
+class ConflictOption(BaseModel):
+    """单条降级选项——换菜/换食材/放宽条件等可选动作，供前端渲染与局部重算。
+
+    ``action`` 语义：
+      - ``replace_meal``       替换冲突餐食（``proposal`` 为新餐食 dict）
+      - ``replace_ingredient`` 替换冲突食材（``proposal`` 为食材名）
+      - ``relax_budget``       放宽预算上限
+      - ``relax_constraint``   放宽忌口/分类限额等硬约束
+    """
+
+    label: str = Field(min_length=1, max_length=120)
+    action: Literal[
+        "replace_meal", "replace_ingredient", "relax_budget", "relax_constraint"
+    ] = "replace_meal"
+    proposal: dict[str, Any] | None = Field(
+        default=None, description="替换菜/食材提案，供前端渲染与后续局部重算"
+    )
+
+
+class PlanConflict(BaseModel):
+    """结构化冲突（校验失败三级策略）。
+
+    ``dimension`` 标识校验维度；``level`` 区分硬冲突（忌口/分类限额，进第 2 级
+    降级提示）与软冲突（重复/缺天/营养/预算，优先第 1 级自动修正）。
+    ``options`` 为第 2 级降级提示提供的可选项。
+    """
+
+    dimension: Literal[
+        "allergy", "budget", "coverage", "duplicate", "category_limit", "nutrition"
+    ]
+    level: Literal["hard", "soft"]
+    message: str
+    item: str = Field(default="", description="冲突主体（餐食名/维度名）")
+    options: list[ConflictOption] = Field(default_factory=list)
 
 
 class PlanningResponse(BaseModel):
@@ -929,17 +1159,28 @@ class PlanningResponse(BaseModel):
     tasks: list[TaskItem]
     budget: BudgetSummary
     conflicts: list[str]
-    suggestions: list[str]
     domain: DomainAgentBundle
     sources: list[str]
     trace: list[AgentStep]
+    conflict_details: list[PlanConflict] = Field(
+        default_factory=list, description="结构化冲突明细（硬/软分级 + 降级选项）"
+    )
+    auto_fixes: list[str] = Field(
+        default_factory=list, description="第 1 级自动修正说明，如 '已自动调整 2 处'"
+    )
+    needs_manual_review: bool = Field(
+        default=False, description="是否触发第 3 级人工接管（硬冲突率>30%）"
+    )
+    manual_review_hint: str = Field(
+        default="", description="人工接管提示，如 '请放宽条件：……'"
+    )
 
 
 class ChatTurnResponse(BaseModel):
     session: ChatSessionSummary
     user_message: ChatMessageResponse
     assistant_message: ChatMessageResponse
-    plan: PlanningResponse
+    plan: PlanningResponse | None = None
 
 
 class WeeklyPlanSummary(BaseModel):
@@ -957,6 +1198,25 @@ class WeeklyPlanSummary(BaseModel):
     meal_count: int = 0
     task_count: int = 0
     shopping_count: int = 0
+    is_expired: bool = Field(default=False, description="计划是否已超过 7 天有效期")
+
+
+class WeekNutrient(BaseModel):
+    """单个营养素的周达成进度。"""
+
+    target: float = 0
+    consumed: float = 0
+    remaining: float = 0
+    percent: float = 0
+
+
+class WeekNutritionResponse(BaseModel):
+    """本周营养目标达成进度（按已吃餐食聚合）。"""
+
+    nutrients: dict[str, WeekNutrient] = Field(default_factory=dict)
+    overall_percent: float = 0
+    eaten_count: int = 0
+    total_count: int = 0
 
 
 class WeeklyPlanDetail(BaseModel):
@@ -969,9 +1229,21 @@ class WeeklyPlanDetail(BaseModel):
     parent_plan_id: int | None = None
     prompt: str
     budget: float
+    estimated_cost: float = 0
     summary: str
     conflicts: list[str]
-    suggestions: list[str]
+    conflict_details: list[PlanConflict] = Field(
+        default_factory=list, description="结构化冲突明细（硬/软分级 + 降级选项）"
+    )
+    auto_fixes: list[str] = Field(
+        default_factory=list, description="第 1 级自动修正说明，如 '已自动调整 2 处'"
+    )
+    needs_manual_review: bool = Field(
+        default=False, description="是否触发第 3 级人工接管（硬冲突率>30%）"
+    )
+    manual_review_hint: str = Field(
+        default="", description="人工接管提示，如 '请放宽条件：……'"
+    )
     run_id: str | None = None
     created_at: datetime
     updated_at: datetime
@@ -979,13 +1251,34 @@ class WeeklyPlanDetail(BaseModel):
     shopping: list[ShoppingItem]
     tasks: list[TaskItem]
     budget_record: BudgetSummary | None = None
+    week_nutrition: WeekNutritionResponse | None = None
+    is_expired: bool = Field(default=False, description="计划是否已超过 7 天有效期")
+
+
+class PlanConfirmationResponse(WeeklyPlanDetail):
+    """Confirmed plan payload, retaining the legacy ``plan_id`` field."""
+
+    plan_id: int
+    message: str = ""
 
 
 # ---------- 用户画像与营养目标 ----------
 
 
+class ActivePlanOverview(BaseModel):
+    """Aggregate response consumed by the weekly execution screen."""
+
+    plan: WeeklyPlanDetail | None = None
+    versions: list[WeeklyPlanSummary] = Field(default_factory=list)
+
+
 class UserProfileResponse(BaseModel):
-    """用户画像响应：身体数据 + 饮食偏好/忌口 + 预算偏好。"""
+    """用户画像响应：身体数据 + 饮食偏好/忌口 + 预算偏好 + 生活约束。
+
+    ``needs_replan`` 仅在 ``PUT /profile`` 触发规划关键字段变更（goal_type /
+    activity_level / constraints / budget_limit 任一变化）时置为 True，提示前端
+    "关键字段已变更，是否重新生成下周计划"；``GET /profile`` 恒为 False。
+    """
 
     user_id: int
     height_cm: float
@@ -998,6 +1291,11 @@ class UserProfileResponse(BaseModel):
     constraints: list[str]
     budget_limit: float
     notes: str
+    cooking_skill: str
+    kitchenware: list[str]
+    prep_time_max: int
+    needs_replan: bool = False
+    profile_complete: bool = False
 
 
 class UserProfileUpdate(BaseModel):
@@ -1017,6 +1315,11 @@ class UserProfileUpdate(BaseModel):
     constraints: list[str] | None = Field(default=None, max_length=20)
     budget_limit: float | None = Field(default=None, ge=0, le=10000)
     notes: str | None = Field(default=None, max_length=500)
+    cooking_skill: str | None = Field(
+        default=None, pattern=r"^(beginner|intermediate|proficient)$"
+    )
+    kitchenware: list[str] | None = Field(default=None, max_length=20)
+    prep_time_max: int | None = Field(default=None, ge=5, le=240)
 
     @model_validator(mode="after")
     def ensure_update_has_values(self) -> "UserProfileUpdate":
@@ -1026,7 +1329,7 @@ class UserProfileUpdate(BaseModel):
 
 
 class NutritionGoalResponse(BaseModel):
-    """营养目标快照响应：BMR/TDEE/目标热量/宏量分配。"""
+    """营养目标快照响应：BMR/TDEE/目标热量/宏量分配（含范围值与等价物解释）。"""
 
     user_id: int
     goal_type: str
@@ -1037,6 +1340,18 @@ class NutritionGoalResponse(BaseModel):
     carb_g: float
     fat_g: float
     activity_level: str
+    calories_min: float
+    calories_max: float
+    protein_min: float
+    protein_max: float
+    carb_min: float
+    carb_max: float
+    fat_min: float
+    fat_max: float
+    hints: dict[str, str] = Field(
+        default_factory=dict,
+        description="各营养素的等价物解释文案（如 protein → '相当于 2~3 块鸡胸肉'）",
+    )
 
 
 # ---------- 营养目标求解 ----------
@@ -1159,3 +1474,115 @@ class ArchivedPlanResponse(BaseModel):
     status: str
     is_active: bool
     archived_at: datetime
+
+
+# ---------- G08 购物替代图谱化 ----------
+
+
+class SubstitutionSuggestion(BaseModel):
+    """单条食材替代建议。
+
+    ``source`` 标识数据来源：``graph`` 为 Neo4j 显式 SUBSTITUTABLE_FOR 关系，
+    ``nutrition`` 为食材营养库余弦相似度兜底。前端可据此区分"权威替代"
+    与"营养近似"。
+    """
+
+    name: str = Field(min_length=1, max_length=120)
+    reason: str = ""
+    similarity: float = Field(ge=0.0, le=1.0)
+    source: str = Field(default="graph", pattern="^(graph|nutrition)$")
+    nutrition: dict[str, float] | None = Field(
+        default=None,
+        description="替代食材每 100g 营养快照，用于前端对比展示",
+    )
+
+
+class ShoppingSubstitutionResponse(BaseModel):
+    """购物替代建议响应。"""
+
+    item_id: int
+    name: str
+    suggestions: list[SubstitutionSuggestion]
+    source_summary: dict[str, int] = Field(
+        default_factory=dict,
+        description="按来源统计的命中数，如 {'graph': 2, 'nutrition': 3}",
+    )
+
+
+class ShoppingSubstitutionDecision(BaseModel):
+    """购物项替换确认请求（接受 / 拒绝 / 换一个）。
+
+    - ``accept``：确认当前替换，``substituted_accepted=True``。
+    - ``reject``：拒绝替换，回退到 ``substituted_from`` 并清空替换标记。
+    - ``swap``：换一个替代品；``name`` 传前端选定的新食材名，缺省时自动召回
+      与当前名称不同的下一条替代建议。
+    """
+
+    action: Literal["accept", "reject", "swap"] = "accept"
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+
+
+class SubstitutionSeedResponse(BaseModel):
+    """替代关系图谱种子同步响应。"""
+
+    seeded_edges: int = Field(ge=0, description="成功写入的替代边数（双向计数）")
+    total_pairs: int = Field(ge=0, description="种子数据中的替代对总数")
+    note: str = ""
+
+
+# ---------- 菜谱首页目录 ----------
+
+
+class RecipeCategory(StrEnum):
+    FAT_LOSS = "fat_loss"
+    MUSCLE_GAIN = "muscle_gain"
+    HEALTHY = "healthy"
+
+
+class RecipeIngredient(BaseModel):
+    name: str
+    amount: str
+
+
+class RecipeNutrition(BaseModel):
+    calories: float
+    protein: float
+    carbs: float
+    fat: float
+
+
+class RecipeSummary(BaseModel):
+    id: str
+    name: str
+    category: RecipeCategory
+    description: str
+    image_url: str = ""
+    emoji: str = "🍽️"
+    gradient: str = "linear-gradient(135deg, #667eea 0%, #764ba2 100%)"
+    calories: int
+    prep_time: int
+    difficulty: str
+    servings: int
+    rating: float = 0.0
+    tags: list[str] = []
+
+
+class RecipeDetail(RecipeSummary):
+    ingredients: list[RecipeIngredient] = []
+    steps: list[str] = []
+    nutrition: RecipeNutrition
+
+
+class RecipeListResponse(BaseModel):
+    recipes: list[RecipeSummary]
+    total: int
+    page: int
+    page_size: int
+    has_more: bool
+
+
+class RecipeTipsResponse(BaseModel):
+    """菜谱详情里的营养师小贴士（§8：LLM 生成 + 缓存，当前为确定性生成）。"""
+
+    recipe_id: str
+    tip: str

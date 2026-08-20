@@ -38,6 +38,11 @@ class UserSummary(BaseModel):
     id: int
     phone: str
     display_name: str
+    avatar_url: str = ""
+
+
+class AccountProfileUpdate(BaseModel):
+    display_name: str = Field(min_length=1, max_length=80)
 
 
 class AuthSession(BaseModel):

@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from time import perf_counter
 from uuid import UUID, uuid4
@@ -16,8 +16,6 @@ from app.schemas import (
     AgentRun,
     AgentStatus,
     AgentStep,
-    CalendarEvent,
-    MemberProfile,
     PlanningRequest,
     PlanningResponse,
 )
@@ -98,11 +96,44 @@ class PlanningService:
             return [], []
         return list(profile.constraints), list(profile.preferences)
 
+    @staticmethod
+    async def _load_goal_type(session: AsyncSession | None, user_id: int) -> str | None:
+        """读取用户营养目标取向（bulk/cut/maintain），注入向量检索做目标型文档过滤。
+
+        无 Session 或未建档时返回 ``None``，检索退化为不过滤（等价通用召回）。
+        """
+        if session is None:
+            return None
+        try:
+            profile = await session.scalar(
+                select(UserProfile).where(UserProfile.user_id == user_id)
+            )
+        except Exception:  # noqa: BLE001 - 画像缺失不应阻断规划
+            return None
+        return profile.goal_type if profile is not None else None
+
+    async def _load_lifestyle_constraints(
+        self, session: AsyncSession | None, user_id: int
+    ) -> tuple[int | None, list[str]]:
+        """加载生活约束（备餐时间上限与可用厨具），供 meal_agent 精准读取。
+
+        画像缺失或读取失败时回退到空约束，不阻断规划。
+        """
+        if session is None:
+            return None, []
+        try:
+            profile = await session.scalar(
+                select(UserProfile).where(UserProfile.user_id == user_id)
+            )
+        except Exception:  # noqa: BLE001 - 画像缺失不应阻断规划
+            return None, []
+        if profile is None:
+            return None, []
+        return profile.prep_time_max, list(profile.kitchenware)
+
     async def generate(
         self,
         request: PlanningRequest,
-        members: Sequence[MemberProfile] = (),
-        events: Sequence[CalendarEvent] = (),
         session: AsyncSession | None = None,
         on_step: Callable[[AgentStep], Awaitable[None]] | None = None,
         on_token: TokenSink | None = None,
@@ -113,6 +144,10 @@ class PlanningService:
         user_constraints, user_preferences = await self._load_user_profile_constraints(
             session, request.user_id
         )
+        prep_time_max, kitchenware = await self._load_lifestyle_constraints(
+            session, request.user_id
+        )
+        goal_type = await self._load_goal_type(session, request.user_id)
         run_id = uuid4()
         started = perf_counter()
         repo = PlanningRepository(session) if session is not None else None
@@ -143,14 +178,15 @@ class PlanningService:
 
             response = await self._workflow.run(
                 request,
-                members,
-                events,
                 run_id=run_id,
                 on_step=persist_step,
                 taste_profile=taste_profile,
                 nutrition_targets=nutrition_targets,
                 user_constraints=user_constraints,
                 user_preferences=user_preferences,
+                prep_time_max=prep_time_max,
+                kitchenware=kitchenware,
+                goal_type=goal_type,
             )
         except asyncio.CancelledError:
             if repo is not None:

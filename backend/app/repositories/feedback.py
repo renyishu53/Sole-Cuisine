@@ -1,12 +1,13 @@
 """执行反馈仓储：``plan_feedback`` 偏差表的读写与口味画像聚合。
 
-本模块只负责 MySQL 侧的持久化与统计；回流到 Neo4j / Chroma 的动作由
+本模块只负责 MySQL 侧的持久化与统计；回流到 Neo4j / 向量库 的动作由
 :mod:`app.services.feedback_loop` 编排，保持仓储层无外部依赖、可单测。
 """
 
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -106,10 +107,33 @@ class FeedbackRepository:
         )
         return list((await self._session.scalars(statement)).all())
 
-    async def taste_profile(self, user_id: int, *, limit: int = 40) -> TasteProfile:
-        """聚合餐食反馈 + 菜谱点赞，生成可直接喂给智能体的口味画像。"""
-        records = await self.list_recent(
-            user_id, feedback_types=MEAL_FEEDBACK_TYPES, limit=limit
+    async def taste_profile(
+        self,
+        user_id: int,
+        *,
+        limit: int = 40,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> TasteProfile:
+        """聚合餐食反馈 + 菜谱点赞，生成可直接喂给智能体的口味画像。
+
+        ``since``/``until`` 限定反馈时间窗（阶段5 用于"本周 vs 上周"口味演化对比），
+        缺省时取最近 ``limit`` 条。
+        """
+        statement = select(PlanFeedback).where(
+            PlanFeedback.user_id == user_id,
+            PlanFeedback.feedback_type.in_(list(MEAL_FEEDBACK_TYPES)),
+        )
+        if since is not None:
+            statement = statement.where(PlanFeedback.created_at >= since)
+        if until is not None:
+            statement = statement.where(PlanFeedback.created_at < until)
+        records = list(
+            (
+                await self._session.scalars(
+                    statement.order_by(PlanFeedback.created_at.desc()).limit(limit)
+                )
+            ).all()
         )
         liked: Counter[str] = Counter()
         disliked: Counter[str] = Counter()

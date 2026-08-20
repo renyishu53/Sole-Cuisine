@@ -10,6 +10,8 @@ from app.ai.llm import DemoPlanGenerator
 from app.ai.workflow import SoloChefWorkflow
 from app.db import Base, get_db
 from app.main import app
+from app.services.conversation import conversation_service
+from app.services.plan_revise import plan_revise_service
 from app.services.planning import planning_service
 from app.services.sms import SMSCodeMismatchError, SMSService
 
@@ -44,6 +46,10 @@ async def database_schema() -> AsyncIterator[None]:
         knowledge=StubKnowledgeRetriever(),  # type: ignore[arg-type]
         generator=DemoPlanGenerator(),
     )
+    # Plan revise 走 demo 兜底解析，不调真实 LLM
+    plan_revise_service._llm_model = None
+    # Conversation service 走 demo 兜底，不调真实 LLM
+    conversation_service._get_llm = lambda: None  # type: ignore[method-assign]
 
     async def verify_test_code(self: SMSService, phone: str, code: str) -> bool:
         if code != "123456":

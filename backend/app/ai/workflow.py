@@ -1,3 +1,4 @@
+import asyncio
 import json
 import operator
 from collections.abc import Awaitable, Callable, Sequence
@@ -12,13 +13,19 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
 
 from app.ai.domain_agents import StructuredDomainAgentEngine
-from app.ai.llm import DemoPlanGenerator, LLMGenerationError, PlanDraft, PlanGenerator
+from app.ai.intent_router import extract_planning_constraints
+from app.ai.llm import (
+    DemoPlanGenerator,
+    LLMGenerationError,
+    PlanDraft,
+    PlanGenerator,
+    validate_weekly_meals,
+    with_meal_types,
+)
 from app.core.config import Settings, get_settings
 from app.schemas import (
     AgentRun,
-    CalendarEvent,
     GraphSearchHit,
-    MemberProfile,
     PlanningRequest,
     PlanningResponse,
     VectorSearchHit,
@@ -29,26 +36,36 @@ from app.schemas.domain import (
     BudgetAgentResult,
     DomainAgentBundle,
     MealAgentResult,
+    PlanConflict,
     ShoppingAgentResult,
 )
 from app.services.knowledge import get_knowledge_service
-from app.services.nutrition import estimate_meal_nutrition
+from app.services.plan_validation import (
+    apply_auto_fix,
+    compute_forbidden_terms,
+    detect_conflicts,
+    evaluate_manual_review,
+)
 
 
 class WorkflowState(TypedDict, total=False):
     request: PlanningRequest
-    members: list[MemberProfile]
-    events: list[CalendarEvent]
     #: 单人用户画像的忌口/过敏约束（来自 UserProfile.constraints），SoloChef
     #: 忌口校验的优先数据源；members 仅为家庭时期遗留兼容回退
     user_constraints: list[str]
     #: 单人用户画像的饮食偏好（来自 UserProfile.preferences）
     user_preferences: list[str]
+    #: 生活约束：最长备餐时间（分钟，来自 UserProfile.prep_time_max）
+    prep_time_max: int | None
+    #: 生活约束：可用厨具清单（来自 UserProfile.kitchenware）
+    kitchenware: list[str]
     #: 历史执行反馈聚合出的口味画像，餐食智能体据此做偏好学习
     taste_profile: dict[str, object]
     #: 营养目标（TDEE + 宏量分配），由 planning_service 从 DB 加载后注入
     nutrition_targets: dict[str, float]
-    intent: dict[str, object]
+    #: 用户营养目标取向（bulk/cut/maintain），注入向量检索做目标型文档过滤
+    goal_type: str | None
+    planning_constraints: dict[str, object]
     graph_hits: list[GraphSearchHit]
     vector_hits: list[VectorSearchHit]
     graph_status: str
@@ -57,6 +74,10 @@ class WorkflowState(TypedDict, total=False):
     draft: PlanDraft
     llm_mode: str
     validation_warnings: list[str]
+    conflict_details: list[PlanConflict]
+    auto_fixes: list[str]
+    needs_manual_review: bool
+    manual_review_hint: str
     domain_results: Annotated[list[dict[str, object]], operator.add]
     domain_bundle: DomainAgentBundle
     domain_context: str
@@ -70,12 +91,16 @@ class KnowledgeRetriever(Protocol):
         self,
         query: str,
         user_id: int,
-        members: Sequence[MemberProfile] = (),
-        events: Sequence[CalendarEvent] = (),
     ) -> tuple[list[GraphSearchHit], str]: ...
 
     async def retrieve_vector(
-        self, query: str, user_id: int, top_k: int
+        self,
+        query: str,
+        user_id: int,
+        top_k: int,
+        *,
+        goal_type: str | None = None,
+        meal_time: str | None = None,
     ) -> tuple[list[VectorSearchHit], str, str]: ...
 
 
@@ -98,14 +123,17 @@ class SoloChefWorkflow:
         self._generator = generator
         self._domain_engine = StructuredDomainAgentEngine(
             self._settings,
-            use_llm=self._generator.mode != "demo",
+            use_llm=(
+                self._settings.domain_agents_llm_enabled
+                and self._generator.mode != "demo"
+            ),
         )
         self._checkpointer: BaseCheckpointSaver[str] | None = None
         self._graph = self._build_graph()
 
     def _build_graph(self):  # type: ignore[no-untyped-def]
         builder = StateGraph(WorkflowState)
-        builder.add_node("intent", self._intent_node)
+        builder.add_node("constraint_parser", self._constraint_parser_node)
         builder.add_node("graph_retriever", self._graph_retriever_node)
         builder.add_node("vector_retriever", self._vector_retriever_node)
         builder.add_node("coordinator", self._coordinator_node)
@@ -116,9 +144,9 @@ class SoloChefWorkflow:
         builder.add_node("planner", self._planner_node)
         builder.add_node("verifier", self._verifier_node)
         builder.add_node("final_planner", self._final_node)
-        builder.add_edge(START, "intent")
-        builder.add_edge("intent", "graph_retriever")
-        builder.add_edge("intent", "vector_retriever")
+        builder.add_edge(START, "constraint_parser")
+        builder.add_edge("constraint_parser", "graph_retriever")
+        builder.add_edge("constraint_parser", "vector_retriever")
         builder.add_edge(["graph_retriever", "vector_retriever"], "coordinator")
         builder.add_edge("coordinator", "meal_agent")
         builder.add_edge("coordinator", "shopping_agent")
@@ -142,8 +170,6 @@ class SoloChefWorkflow:
     async def run(
         self,
         request: PlanningRequest | None,
-        members: Sequence[MemberProfile] = (),
-        events: Sequence[CalendarEvent] = (),
         run_id: UUID | None = None,
         on_step: Callable[[AgentStep], Awaitable[None]] | None = None,
         resume: bool = False,
@@ -151,6 +177,9 @@ class SoloChefWorkflow:
         nutrition_targets: dict[str, float] | None = None,
         user_constraints: Sequence[str] = (),
         user_preferences: Sequence[str] = (),
+        prep_time_max: int | None = None,
+        kitchenware: Sequence[str] = (),
+        goal_type: str | None = None,
     ) -> PlanningResponse:
         state: WorkflowState = {}
         config: RunnableConfig | None = None
@@ -171,12 +200,13 @@ class SoloChefWorkflow:
                 raise ValueError("request is required for a new workflow")
             graph_input = {
                 "request": request,
-                "members": list(members),
-                "events": list(events),
                 "taste_profile": dict(taste_profile or {}),
                 "nutrition_targets": dict(nutrition_targets or {}),
                 "user_constraints": list(user_constraints),
                 "user_preferences": list(user_preferences),
+                "prep_time_max": prep_time_max,
+                "kitchenware": list(kitchenware),
+                "goal_type": goal_type,
                 "trace": [],
             }
         async for current in self._graph.astream(
@@ -200,25 +230,34 @@ class SoloChefWorkflow:
             tasks=draft.tasks,
             budget=draft.budget,
             conflicts=draft.conflicts,
-            suggestions=draft.suggestions,
             domain=state["domain_bundle"],
             sources=state["sources"],
             trace=state["trace"],
+            conflict_details=state.get("conflict_details", []),
+            auto_fixes=state.get("auto_fixes", []),
+            needs_manual_review=state.get("needs_manual_review", False),
+            manual_review_hint=state.get("manual_review_hint", ""),
         )
 
-    async def _intent_node(self, state: WorkflowState) -> dict[str, object]:
+    async def _constraint_parser_node(self, state: WorkflowState) -> dict[str, object]:
         start = perf_counter()
         request = state["request"]
-        intent = {
-            "type": "weekly_plan",
+        constraints = {
+            **extract_planning_constraints(request.prompt),
             "user_id": request.user_id,
             "budget": request.budget,
-            "requires": ["meals", "shopping", "budget"],
+            "workflow": "weekly_plan",
         }
         return {
-            "intent": intent,
+            "planning_constraints": constraints,
             "trace": [
-                self._step(start, "intent", "Intent Agent", "识别规划意图与硬约束", intent)
+                self._step(
+                    start,
+                    "constraint_parser",
+                    "Constraint Parser",
+                    "解析周计划预算、日期、餐次与营养硬约束",
+                    constraints,
+                )
             ],
         }
 
@@ -228,8 +267,6 @@ class SoloChefWorkflow:
         hits, status = await self._knowledge.retrieve_graph(
             request.prompt,
             request.user_id,
-            state.get("members", []),
-            state.get("events", []),
         )
         output: dict[str, object] = {
             "status": status,
@@ -254,7 +291,10 @@ class SoloChefWorkflow:
         start = perf_counter()
         request = state["request"]
         hits, status, _rerank_status = await self._knowledge.retrieve_vector(
-            request.prompt, request.user_id, self._settings.rag_top_k
+            request.prompt,
+            request.user_id,
+            self._settings.rag_top_k,
+            goal_type=state.get("goal_type"),
         )
         output: dict[str, object] = {
             "status": status,
@@ -269,7 +309,7 @@ class SoloChefWorkflow:
                     start,
                     "vector_retriever",
                     "Vector Retriever",
-                    f"从 Chroma 召回 {len(hits)} 个语义相关知识片段",
+                    f"从向量库召回 {len(hits)} 个语义相关知识片段",
                     output,
                     AgentStatus.COMPLETED if status == "connected" else AgentStatus.WARNING,
                 )
@@ -318,16 +358,26 @@ class SoloChefWorkflow:
         )
         specialist_context += "\n\n结构化领域约束：\n" + state.get("domain_context", "")
         try:
-            draft = await self._generator.generate(request, state["context"] + specialist_context)
-        except LLMGenerationError as exc:
+            draft = await asyncio.wait_for(
+                self._generator.generate(request, state["context"] + specialist_context),
+                timeout=self._settings.plan_generation_timeout_seconds,
+            )
+            draft.meals = with_meal_types(draft.meals)
+            validate_weekly_meals(draft.meals)
+        except (LLMGenerationError, TimeoutError) as exc:
             if not self._settings.ai_fallback_enabled:
                 raise
             draft = await DemoPlanGenerator().generate(
                 request, state["context"] + specialist_context
             )
+            validate_weekly_meals(draft.meals)
             mode = f"{mode}->demo-fallback"
             status = AgentStatus.WARNING
-            fallback_reason = str(exc)
+            fallback_reason = (
+                "主规划模型响应超时，已使用本地规划器完成生成"
+                if isinstance(exc, TimeoutError)
+                else str(exc)
+            )
         output: dict[str, object] = {
             "llm_mode": mode,
             "meals": len(draft.meals),
@@ -355,11 +405,11 @@ class SoloChefWorkflow:
     async def _meal_agent_node(self, state: WorkflowState) -> dict[str, object]:
         result, mode, error = await self._domain_engine.meal(
             state["request"],
-            state.get("members", []),
-            state.get("events", []),
             state.get("taste_profile"),
             constraints=state.get("user_constraints", []),
             preferences=state.get("user_preferences", []),
+            prep_time_max=state.get("prep_time_max"),
+            kitchenware=state.get("kitchenware", []),
         )
         return self._structured_specialist_result(
             "meal_agent",
@@ -372,7 +422,7 @@ class SoloChefWorkflow:
 
     async def _shopping_agent_node(self, state: WorkflowState) -> dict[str, object]:
         result, mode, error = await self._domain_engine.shopping(
-            state["request"], state.get("members", []), state.get("events", [])
+            state["request"]
         )
         return self._structured_specialist_result(
             "shopping_agent",
@@ -385,7 +435,7 @@ class SoloChefWorkflow:
 
     async def _budget_agent_node(self, state: WorkflowState) -> dict[str, object]:
         result, mode, error = await self._domain_engine.budget(
-            state["request"], state.get("members", []), state.get("events", [])
+            state["request"]
         )
         return self._structured_specialist_result(
             "budget_agent",
@@ -468,109 +518,119 @@ class SoloChefWorkflow:
         start = perf_counter()
         request = state["request"]
         draft = state["draft"]
-        warnings: list[str] = []
         domain = state["domain_bundle"]
-        if draft.budget.estimated > request.budget:
-            warnings.append("模型估算超过预算上限，已将预算摘要限制到上限")
-            draft.budget.estimated = request.budget
-        draft.budget.limit = request.budget
-        draft.budget.saved = max(0, request.budget - draft.budget.estimated)
-        draft.budget.usage_percent = round(draft.budget.estimated / request.budget * 100)
 
+        # 采购清单是计划落库后的实际估价来源，不能使用模型自报金额覆盖它。
+        shopping_categories: dict[str, float] = {}
+        for item in draft.shopping:
+            shopping_categories[item.category] = round(
+                shopping_categories.get(item.category, 0.0) + float(item.price), 2
+            )
+        shopping_estimated = round(sum(shopping_categories.values()), 2)
+        draft.budget.estimated = shopping_estimated
+        draft.budget.limit = request.budget
+        draft.budget.saved = request.budget - shopping_estimated
+        draft.budget.usage_percent = round(draft.budget.estimated / request.budget * 100)
+        draft.budget.categories = shopping_categories
+
+        # 忌口约束聚合（图谱关系 + SoloChef 单人画像，去重）
         constraints = [
             hit.target for hit in state.get("graph_hits", []) if hit.relation == "HAS_CONSTRAINT"
         ]
-        # SoloChef 单人画像忌口约束（来自 UserProfile.constraints，优先取用）；
-        # members 仅为家庭时期遗留兼容回退，SoloChef 真实运行时为空
         constraints.extend(state.get("user_constraints", []))
-        constraints.extend(
-            constraint for member in state.get("members", []) for constraint in member.constraints
-        )
         constraints = list(dict.fromkeys(constraints))
-        meal_text = " ".join(
-            f"{meal.name} {' '.join(meal.tags)} {' '.join(meal.ingredients)}"
-            for meal in draft.meals
-        )
-        forbidden_terms: set[str] = set()
-        constraint_aliases = {
-            "不吃辣": ["辣椒", "辣酱", "麻辣"],
-            "乳糖不耐": ["牛奶", "奶油", "乳制品"],
-            "海鲜过敏": ["虾", "蟹", "贝", "海鲜"],
-        }
-        for constraint in constraints:
-            forbidden_terms.update(constraint_aliases.get(constraint, []))
-            if constraint.endswith("过敏"):
-                forbidden_terms.add(constraint.removesuffix("过敏"))
-            if constraint.startswith("不吃"):
-                forbidden_terms.add(constraint.removeprefix("不吃"))
-            if constraint.startswith("忌"):
-                forbidden_terms.add(constraint.removeprefix("忌"))
-        violated_terms = sorted(term for term in forbidden_terms if term and term in meal_text)
-        if violated_terms:
-            warnings.append(f"菜单命中忌口或过敏食材：{'、'.join(violated_terms)}")
-
-        expected_days = {"周一", "周二", "周三", "周四", "周五", "周六", "周日"}
-        meal_days = [meal.day for meal in draft.meals]
-        if len(draft.meals) != 7 or set(meal_days) != expected_days:
-            missing = sorted(expected_days - set(meal_days))
-            detail = f"，缺少 {'、'.join(missing)}" if missing else ""
-            warnings.append(f"餐食未完整覆盖周一至周日{detail}")
-        duplicate_meals = sorted(
-            {
-                meal.name
-                for meal in draft.meals
-                if sum(item.name == meal.name for item in draft.meals) > 1
-            }
-        )
-        if duplicate_meals:
-            warnings.append(f"一周菜单存在重复菜品：{'、'.join(duplicate_meals)}")
-
-        category_total = sum(draft.budget.categories.values())
-        if category_total > request.budget:
-            warnings.append("预算分类合计超过总预算上限")
-        domain_category_total = sum(domain.budget.category_limits.values())
-        if domain_category_total + domain.budget.reserve > domain.budget.limit + 0.01:
-            warnings.append("Budget Agent 的分类限额与预留金额超过总预算")
-        # 第 6 项：营养目标达成率校验
+        forbidden_terms = compute_forbidden_terms(constraints)
         nutrition_targets = state.get("nutrition_targets") or {}
-        if nutrition_targets:
-            actual_nutrition: dict[str, float] = {}
-            for meal in draft.meals:
-                nutrition, _ = estimate_meal_nutrition(meal, [])
-                for key, value in nutrition.items():
-                    actual_nutrition[key] = actual_nutrition.get(key, 0.0) + value
-            off_target: list[str] = []
-            for key, target_value in nutrition_targets.items():
-                if target_value <= 0:
-                    continue
-                actual_value = round(actual_nutrition.get(key, 0.0), 1)
-                percent = actual_value / target_value * 100
-                if percent < 90.0 or percent > 110.0:
-                    direction = "不足" if percent < 90.0 else "超出"
-                    detail = f"目标 {target_value}，实际 {actual_value}，{percent:.0f}%"
-                    off_target.append(f"{key} {direction}（{detail}）")
-            if off_target:
-                warnings.append(f"营养目标偏差：{'；'.join(off_target)}")
 
-        warnings = list(dict.fromkeys(warnings))
+        # 校验失败三级策略：第 1 级自动修正（重复→缺天→营养→预算，最多 2 轮）
+        conflicts = detect_conflicts(
+            draft.meals,
+            budget_limit=request.budget,
+            constraints=constraints,
+            category_limits=domain.budget.category_limits,
+            category_limit_total=domain.budget.limit,
+            category_reserve=domain.budget.reserve,
+            nutrition_targets=nutrition_targets,
+        )
+        auto_fixes: list[str] = []
+        for _ in range(2):
+            soft = [conflict for conflict in conflicts if conflict.level == "soft"]
+            if not soft:
+                break
+            draft.meals, fixes = apply_auto_fix(
+                draft.meals,
+                soft,
+                forbidden_terms=forbidden_terms,
+                nutrition_targets=nutrition_targets,
+                budget_limit=request.budget,
+            )
+            if not fixes:
+                break
+            auto_fixes.extend(fixes)
+            # 每轮自动修正后重跑校验，捕获"修了重复又超预算"的震荡
+            conflicts = detect_conflicts(
+                draft.meals,
+                budget_limit=request.budget,
+                constraints=constraints,
+                category_limits=domain.budget.category_limits,
+                category_limit_total=domain.budget.limit,
+                category_reserve=domain.budget.reserve,
+                nutrition_targets=nutrition_targets,
+            )
+
+        if shopping_estimated > request.budget:
+            conflicts.append(
+                PlanConflict(
+                    dimension="budget",
+                    level="hard",
+                    message=(
+                        f"采购清单估价 {shopping_estimated:.0f} 元超过预算 "
+                        f"{request.budget:.0f} 元"
+                    ),
+                    item="采购预算",
+                )
+            )
+
+        # 第 3 级人工接管判定：硬冲突率 > 30% → 提示放宽条件
+        needs_manual_review, manual_review_hint = evaluate_manual_review(
+            conflicts, len(draft.meals)
+        )
+        if shopping_estimated > request.budget:
+            needs_manual_review = True
+            manual_review_hint = "采购估价超过预算，请调整餐食、采购数量或预算后再确认"
+
+        # 扁平化冲突信息（向后兼容 PlanningResponse.conflicts / WeeklyPlan.conflicts）
+        flat_conflicts = [conflict.message for conflict in conflicts]
+        draft.conflicts = list(dict.fromkeys([*draft.conflicts, *flat_conflicts]))
+        if auto_fixes:
+            auto_fixes = [f"已自动调整 {len(auto_fixes)} 处", *auto_fixes]
+
         output: dict[str, object] = {
             "constraints_checked": constraints,
             "forbidden_terms_checked": sorted(forbidden_terms),
-            "warnings": warnings,
+            "warnings": flat_conflicts,
+            "conflict_count": len(conflicts),
+            "auto_fixes": auto_fixes,
+            "needs_manual_review": needs_manual_review,
+            "manual_review_hint": manual_review_hint,
             "budget_usage_percent": draft.budget.usage_percent,
             "domain": domain.model_dump(mode="json"),
         }
         return {
             "draft": draft,
-            "validation_warnings": warnings,
+            "validation_warnings": flat_conflicts,
+            "conflict_details": conflicts,
+            "auto_fixes": auto_fixes,
+            "needs_manual_review": needs_manual_review,
+            "manual_review_hint": manual_review_hint,
             "trace": [
                 self._step(
                     start,
                     "verifier",
                     "Verifier Agent",
-                    "执行预算、餐食完整性与用户忌口确定性校验",
+                    "执行三级校验失败策略（自动修正→降级提示→人工接管）",
                     output,
-                    AgentStatus.WARNING if warnings else AgentStatus.COMPLETED,
+                    AgentStatus.WARNING if conflicts else AgentStatus.COMPLETED,
                 )
             ],
         }
@@ -583,7 +643,7 @@ class SoloChefWorkflow:
         seen_documents: set[str] = set()
         for hit in state.get("vector_hits", []):
             if hit.document_name not in seen_documents:
-                sources.append(f"Chroma · {hit.document_name}")
+                sources.append(f"向量检索 · {hit.document_name}")
                 seen_documents.add(hit.document_name)
         if not sources:
             sources.append("SoloChef · 无外部检索上下文的降级规划")
