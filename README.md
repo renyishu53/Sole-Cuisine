@@ -1,17 +1,17 @@
-# CasaMind
+# SoloChef
 
 阶段 1-3（真实 LLM 校准、PostgreSQL/Alembic、JWT 与家庭隔离）的首次部署和 Yaak 验证见：`docs/阶段1-3实施部署与第三方配置.md`。
 
 阶段 4（家庭成员画像 CRUD、家庭隔离与 Graph RAG 同步）的迁移和 Yaak 验证见：`docs/阶段4-家庭成员画像部署与接口测试.md`。
 
-CasaMind 是一个基于 Graph RAG 与多智能体协同的 AI 家庭事务规划平台。项目将家庭成员画像、固定日程、餐食、采购、家务和预算放进同一条规划链路，输出可执行的一周家庭计划，并完整展示 Agent 决策轨迹。
+SoloChef 是一个基于 Graph RAG 与多智能体协同的 AI 餐食与采购规划平台。项目将家庭成员画像、固定日程、餐食、采购、家务和预算放进同一条规划链路，输出可执行的一周家庭计划，并完整展示 Agent 决策轨迹。
 
 ## 当前能力
 
 - Vue3 家庭控制台：仪表盘、AI 规划、成员、日历、家务、餐食、购物、预算、知识库、Agent Trace、登录
 - FastAPI 类型化接口：仪表盘及各业务模块查询、周计划生成、Agent Run 查询
 - 可运行的 Graph RAG 多 Agent 工作流：Intent、双路 Retriever、Coordinator、餐食/采购/家务/预算专家、Planning、Verifier、Final Planner
-- 基础设施编排：PostgreSQL、Redis、Neo4j、Chroma
+- 基础设施编排：PostgreSQL（业务库与 LangGraph 短期记忆）、Redis、Neo4j、Milvus
 - 双模式运行：默认 Demo 模式不依赖 LLM 密钥；环境变量可切换正式数据与 AI 适配器
 
 ## 目录
@@ -20,11 +20,11 @@ CasaMind 是一个基于 Graph RAG 与多智能体协同的 AI 家庭事务规�
 .
 ├── frontend/             # Vue3 + TypeScript + Vite
 ├── backend/              # FastAPI + Pydantic 分层 API
-├── docker-compose.yml    # PostgreSQL / Redis / Neo4j / Chroma
+├── docker-compose.yml    # PostgreSQL / Redis / Neo4j / Milvus
 ├── .env                  # 本地运行配置（不提交）
 ├── .env.example
 ├── HomePilot_PRD.md
-└── CasaMind 项目 UI设计.md
+└── SoloChef UI 设计.md
 ```
 
 ## 本地启动
@@ -108,7 +108,20 @@ AI_FALLBACK_ENABLED=true
 docker compose up -d
 ```
 
-`LLM_PROVIDER=demo` 时不需要 LLM 密钥，但真实 Graph RAG 检索需要 Chroma 和 Neo4j。使用 Docker Compose 时，后端镜像会安装 `[ai]` 依赖，容器内自动使用 `CHROMA_HOST=chroma`、`NEO4J_URI=bolt://neo4j:7687`。
+开发环境后端直接运行在宿主机时，`.env` 使用 `localhost:5433` 连接 Compose
+映射出来的 PostgreSQL（容器内部仍是标准 `5432`）：
+
+```text
+DATABASE_URL=postgresql+asyncpg://solochef:***@localhost:5433/solochef
+CHECKPOINT_BACKEND=postgres
+CHECKPOINT_POSTGRES_URL=postgresql://solochef:***@localhost:5433/solochef
+```
+
+业务表和 LangGraph checkpoint 表会在应用启动时幂等创建。Redis 仅用于队列、
+缓存和实时状态，不再承担工作流短期记忆。使用 Docker Compose 启动后端容器时，
+Compose 会自动覆盖为 `postgres:5432`，避免容器内错误访问 `localhost`。
+
+`LLM_PROVIDER=demo` 时不需要 LLM 密钥；真实 Graph RAG 检索依赖 Milvus 和 Neo4j。
 
 ## 验证
 

@@ -3,7 +3,7 @@
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, Field
 
 
 class AssistantIntent(StrEnum):
@@ -56,14 +56,6 @@ class IntentHandoff(BaseModel):
     prompt: str | None = None
     needs_confirmation: bool = False
     message: str
-
-
-class IntentRequest(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True)
-
-    prompt: str = Field(min_length=2, max_length=4000)
-    has_active_plan: bool = False
-    entry_context: IntentEntryContext = IntentEntryContext.ASSISTANT
 
 
 class IntentDecision(BaseModel):

@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>SoloChef 计划调整工作流 — 业务流程图</title>
+<style>
+  :root {
+    --bg: #0f1217;
+    --panel: #161b22;
+    --line: #5b6678;
+    --text: #e6edf3;
+    --sub: #9aa4b2;
+    --c1: #0C447C; --c1b: #85B7EB;
+    --c2: #3C3489; --c2b: #AFA9EC;
+    --c3: #444441; --c3b: #B4B2A9;
+    --c4: #633806; --c4b: #EF9F27;
+    --c5: #085041; --c5b: #5DCAA5;
+    --c6: #712B13; --c6b: #F0997B;
+    --c7: #72243E; --c7b: #ED93B1;
+    --c8: #27500A; --c8b: #97C459;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    padding: 28px 16px 60px;
+  }
+  h1 { text-align: center; font-size: 22px; font-weight: 600; margin: 0 0 6px; }
+  .sub { text-align: center; color: var(--sub); font-size: 13px; margin-bottom: 26px; }
+  .flow { max-width: 720px; margin: 0 auto; position: relative; }
+  .node {
+    border-radius: 12px; padding: 14px 18px; margin: 0 auto 0;
+    width: 90%; text-align: center; border: 0.5px solid;
+    box-shadow: 0 2px 10px rgba(0,0,0,.35);
+  }
+  .node .t { font-size: 15px; font-weight: 600; }
+  .node .d { font-size: 12.5px; color: #cdd5e0; margin-top: 4px; }
+  .arrow { text-align: center; color: var(--line); font-size: 18px; line-height: 28px; height: 28px; }
+  .n1 { background: var(--c1); border-color: var(--c1b); }
+  .n2 { background: var(--c2); border-color: var(--c2b); }
+  .n3 { background: var(--c3); border-color: var(--c3b); }
+  .n4 { background: var(--c4); border-color: var(--c4b); }
+  .n5 { background: var(--c4); border-color: var(--c4b); }
+  .n6 { background: var(--c5); border-color: var(--c5b); }
+  .n7 { background: var(--c3); border-color: var(--c3b); }
+  .n8 { background: var(--c3); border-color: var(--c3b); }
+  .n9 { background: var(--c6); border-color: var(--c6b); }
+  .n10{ background: var(--c6); border-color: var(--c6b); }
+  .n11{ background: var(--c7); border-color: var(--c7b); }
+  .n12{ background: var(--c1); border-color: var(--c1b); }
+  .n13{ background: var(--c8); border-color: var(--c8b); }
+  .n14{ background: var(--c8); border-color: var(--c8b); }
+  .legend { max-width: 720px; margin: 34px auto 0; font-size: 12.5px; color: var(--sub); line-height: 1.9; }
+  .legend b { color: var(--text); }
+  .tag { display:inline-block; padding:1px 7px; border-radius:6px; font-size:11px; margin-right:4px; color:#fff; }
+  .t-blue{background:var(--c1);} .t-purple{background:var(--c2);} .t-gray{background:#555;} .t-orange{background:var(--c4);}
+  .t-green{background:var(--c5);} .t-red{background:var(--c6);} .t-pink{background:var(--c7);} .t-lgreen{background:var(--c8);}
+</style>
+</head>
+<body>
+  <h1>SoloChef · 计划调整工作流</h1>
+  <div class="sub">从自然语言修改要求 → LLM 解析 → 确定性重算 → 预览 → 确认派生新版本（完整生命周期）</div>
+
+  <div class="flow">
+    <div class="node n1"><div class="t">① 用户输入自然语言修改要求</div><div class="d">POST /plans/{plan_id}/revise</div></div>
+    <div class="arrow">▼</div>
+    <div class="node n2"><div class="t">② _parse_operation：LLM 解析为 ReviseOperation（8类）</div><div class="d">无 LLM 时正则兜底 _parse_demo_operation</div></div>
+    <div class="arrow">▼</div>
+    <div class="node n3"><div class="t">③ 取 before 快照 _snapshot(plan, recipes)</div><div class="d">记录修改前 meals / shopping / budget 状态</div></div>
+    <div class="arrow">▼</div>
+    <div class="node n4"><div class="t">④ PlanRevisionWorkflow：revision_intent 路由</div><div class="d">operation → route + 所需智能体能力</div></div>
+    <div class="arrow">▼</div>
+    <div class="node n5"><div class="t">⑤ 条件边选中分支</div><div class="d">MEAL / SHOPPING / BUDGET / CONSTRAINT / COMPOUND</div></div>
+    <div class="arrow">▼</div>
+    <div class="node n6"><div class="t">⑥ _apply_operation 确定性内存重算</div><div class="d">replace / add / remove / exclude / budget / skip / macro / shopping</div></div>
+    <div class="arrow">▼</div>
+    <div class="node n7"><div class="t">⑦ affected_agents + dependency_sync</div><div class="d">审计能力列表 + 置位（近乎空操作）</div></div>
+    <div class="arrow">▼</div>
+    <div class="node n8"><div class="t">⑧ 取 after 快照 _snapshot_from(...)</div><div class="d">重算后的新状态</div></div>
+    <div class="arrow">▼</div>
+    <div class="node n9"><div class="t">⑨ 计算 delta + 冲突预警</div><div class="d">nutrition / budget delta · 超预算 / 餐数≠21</div></div>
+    <div class="arrow">▼</div>
+    <div class="node n10"><div class="t">⑩ can_confirm = before ≠ after</div><div class="d">是否有实际变更</div></div>
+    <div class="arrow">▼</div>
+    <div class="node n11"><div class="t">⑪ 持久化 ChatMessage.payload</div><div class="d">存 before/after/operation/routing/modified_* → 返回 revise_id</div></div>
+    <div class="arrow">▼</div>
+    <div class="node n12"><div class="t">⑫ 前端展示 before/after diff 预览</div><div class="d">用户确认 / 取消</div></div>
+    <div class="arrow">▼</div>
+    <div class="node n13"><div class="t">⑬ confirm：读 payload → derive_plan_with_modifications</div><div class="d">派生新版本 parent_plan_id，无重复 LLM</div></div>
+    <div class="arrow">▼</div>
+    <div class="node n14"><div class="t">⑭ 新计划版本落库，旧版保留</div><div class="d">completed</div></div>
+  </div>
+
+  <div class="legend">
+    <b>图示说明：</b><br />
+    • <span class="tag t-blue">蓝</span> 用户/前端入口（发起与确认）<br />
+    • <span class="tag t-purple">紫</span> LLM 意图解析（唯一用模型处）<br />
+    • <span class="tag t-gray">灰</span> 快照 / 审计元数据（近乎空操作）<br />
+    • <span class="tag t-orange">橙</span> LangGraph 路由壳（<b>可删</b>，见备注）<br />
+    • <span class="tag t-green">绿</span> 确定性内存重算（核心计算）<br />
+    • <span class="tag t-red">红</span> 差异计算与冲突预警<br />
+    • <span class="tag t-pink">粉</span> 预览持久化（存 ChatMessage.payload）<br />
+    • <span class="tag t-lgreen">深绿</span> 确认派生新版本（版本链可追溯）<br />
+    <br />
+    <b>架构备注：</b>步骤 ④⑤⑦ 的 LangGraph 图（PlanRevisionWorkflow）本质是一个 if/elif 路由壳 + 两个空节点，没有真正用到图引擎的并行/checkpoint 价值。真正的重算在 ⑥（PlanReviseService._apply_operation，纯函数确定性重算）。建议将其简化为普通路由函数，删除多余的 LangGraph 图（见对话讨论）。
+  </div>
+</body>
+</html>

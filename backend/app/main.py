@@ -20,7 +20,7 @@ _STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
 async def _create_tables() -> None:
-    """在应用启动时按需创建数据表（幂等，兼容 MySQL / SQLite）。
+    """在应用启动时按需创建数据表（幂等，兼容 PostgreSQL / SQLite）。
 
     生产环境可改为 ``alembic upgrade head``；此处兜底保证新部署开箱即用。
     """

@@ -79,12 +79,14 @@ class DomainRepository:
         plan = await PlanningRepository(self._session).get_active_plan(user_id)
         if plan is None:
             return 0, 0, [], []
-        groups: dict[tuple[str, str], list[PlanShoppingItem]] = defaultdict(list)
+        groups: dict[tuple[str, str, str], list[PlanShoppingItem]] = defaultdict(list)
         for item in plan.shopping_items:
             normalized = "".join(item.name.lower().split())
             aliases = {"西红柿": "番茄", "土豆": "马铃薯", "鸡蛋": "蛋", "生抽酱油": "生抽"}
             normalized = aliases.get(normalized, normalized)
-            groups[(normalized, item.category)].append(item)
+            # Extra purchases are independent procurement records.  They must
+            # never be merged into a meal-derived ingredient merely by name.
+            groups[(item.origin, normalized, item.category)].append(item)
         merged_groups = 0
         removed = 0
         conversion_notes: list[dict[str, Any]] = []

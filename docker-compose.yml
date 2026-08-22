@@ -6,7 +6,9 @@ services:
       - .env
     environment:
       APP_ENV: production
-      DATABASE_URL: mysql+aiomysql://${MYSQL_USER:-solochef}:${MYSQL_PASSWORD:-solochef_password}@mysql:3306/${MYSQL_DB:-solochef}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-solochef}:${POSTGRES_PASSWORD:-solochef_password}@postgres:5432/${POSTGRES_DB:-solochef}
+      CHECKPOINT_BACKEND: postgres
+      CHECKPOINT_POSTGRES_URL: postgresql://${POSTGRES_USER:-solochef}:${POSTGRES_PASSWORD:-solochef_password}@postgres:5432/${POSTGRES_DB:-solochef}
       REDIS_URL: redis://redis:6379/0
       NEO4J_URI: bolt://neo4j:7687
       NEO4J_USER: neo4j
@@ -23,7 +25,7 @@ services:
         condition: service_started
       neo4j:
         condition: service_started
-      mysql:
+      postgres:
         condition: service_healthy
 
   worker:
@@ -34,7 +36,9 @@ services:
       - .env
     environment:
       APP_ENV: production
-      DATABASE_URL: mysql+aiomysql://${MYSQL_USER:-solochef}:${MYSQL_PASSWORD:-solochef_password}@mysql:3306/${MYSQL_DB:-solochef}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-solochef}:${POSTGRES_PASSWORD:-solochef_password}@postgres:5432/${POSTGRES_DB:-solochef}
+      CHECKPOINT_BACKEND: postgres
+      CHECKPOINT_POSTGRES_URL: postgresql://${POSTGRES_USER:-solochef}:${POSTGRES_PASSWORD:-solochef_password}@postgres:5432/${POSTGRES_DB:-solochef}
       REDIS_URL: redis://redis:6379/0
       NEO4J_URI: bolt://neo4j:7687
       NEO4J_USER: neo4j
@@ -48,7 +52,7 @@ services:
         condition: service_started
       milvus-standalone:
         condition: service_started
-      mysql:
+      postgres:
         condition: service_healthy
 
   frontend:
@@ -59,19 +63,18 @@ services:
       backend:
         condition: service_started
 
-  mysql:
-    image: mysql:8.0
+  postgres:
+    image: postgres:16-alpine
+    container_name: solochef-postgres
     restart: unless-stopped
-    command: --default-authentication-plugin=mysql_native_password --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
     environment:
-      MYSQL_DATABASE: ${MYSQL_DB:-solochef}
-      MYSQL_USER: ${MYSQL_USER:-solochef}
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-solochef_password}
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-solochef_root}
-    ports: ["3306:3306"]
-    volumes: [mysql_data:/var/lib/mysql]
+      POSTGRES_DB: ${POSTGRES_DB:-solochef}
+      POSTGRES_USER: ${POSTGRES_USER:-solochef}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-solochef_password}
+    ports: ["5433:5432"]
+    volumes: [solochef_postgres_data:/var/lib/postgresql/data]
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD:-solochef_root}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-solochef} -d ${POSTGRES_DB:-solochef}"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -126,7 +129,7 @@ services:
         condition: service_started
 
 volumes:
-  mysql_data:
+  solochef_postgres_data:
   redis_data:
   neo4j_data:
   etcd_data:

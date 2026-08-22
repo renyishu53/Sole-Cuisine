@@ -1,10 +1,11 @@
 import { defineStore } from 'pinia'
 import { api, apiErrorMessage } from '../api'
-import type { AuthSession, ChatMessage, ChatSessionSummary, ChatStreamEvent, UserSummary } from '../types'
+import type { AuthSession, ChatMessage, ChatSessionSummary, ChatStreamEvent, ChatToolEvent, UserSummary } from '../types'
 
 const SESSION_KEY = 'solochef-session'
 const RUN_KEY = 'solochef-run-id'
 let typingFrame: number | null = null
+const TYPING_INTERVAL_MS = 28
 
 function initialSession(): AuthSession | null {
   try { return JSON.parse(localStorage.getItem(SESSION_KEY) || 'null') as AuthSession | null }
@@ -18,6 +19,7 @@ export const useAppStore = defineStore('app', {
     lastRunId: sessionStorage.getItem(RUN_KEY) || '',
     recipeQuickViewId: null as string | null,
     chatOpen: false,
+    assistantSuppressed: false,
     chatMessages: [] as ChatMessage[],
     chatSessions: [] as ChatSessionSummary[],
     chatSessionId: null as string | null,
@@ -29,6 +31,7 @@ export const useAppStore = defineStore('app', {
     chatStreamText: '',
     chatStreamQueue: '',
     chatCompletedMessage: null as ChatMessage | null,
+    chatToolEvents: [] as ({ event: 'tool_call' | 'tool_result' } & ChatToolEvent)[],
     activePlanVersion: null as number | null,
   }),
   getters: {
@@ -44,8 +47,9 @@ export const useAppStore = defineStore('app', {
     openChat() { this.chatOpen = true },
     closeChat() { this.chatOpen = false },
     toggleChat() { this.chatOpen = !this.chatOpen },
+    setAssistantSuppressed(value: boolean) { this.assistantSuppressed = value },
     resetChat() {
-      if (typingFrame !== null) window.cancelAnimationFrame(typingFrame)
+      if (typingFrame !== null) window.clearTimeout(typingFrame)
       typingFrame = null
       this.chatMessages = []
       this.chatSessionId = null
@@ -56,6 +60,7 @@ export const useAppStore = defineStore('app', {
       this.chatStreamText = ''
       this.chatStreamQueue = ''
       this.chatCompletedMessage = null
+      this.chatToolEvents = []
     },
     async ensureChatSession() {
       if (this.chatSessionId) return this.chatSessionId
@@ -86,6 +91,7 @@ export const useAppStore = defineStore('app', {
         this.chatThinkingHint = ''
         this.chatStreamText = ''
         this.chatStreamQueue = ''
+        this.chatToolEvents = []
       } catch (reason) {
         this.chatError = apiErrorMessage(reason, '对话加载失败')
       }
@@ -105,7 +111,21 @@ export const useAppStore = defineStore('app', {
         this.chatMessages.push(event.data)
         this.chatThinkingHint = ''
       }
-      if (event.event === 'thinking') this.chatThinkingHint = '正在调配这份回答…'
+      if (event.event === 'thinking') this.chatThinkingHint = '我先把你的问题拆开，找最有用的答案…'
+      if (event.event === 'tool_call' || event.event === 'tool_result') {
+        const labels: Record<string, string> = {
+          get_user_profile: '你的饮食偏好',
+          get_nutrition_goal: '你的营养目标',
+          get_active_plan: '当前周计划',
+          search_knowledge: 'SoloChef 知识库',
+          web_research: '最新公开资料',
+        }
+        const subject = labels[event.data.name] || '相关资料'
+        this.chatThinkingHint = event.event === 'tool_call'
+          ? `我去查一下${subject}…`
+          : `资料找到了，我正在把它们拼成答案…`
+        this.chatToolEvents.push({ event: event.event, ...event.data })
+      }
       if (event.event === 'token') {
         this.chatThinkingHint = ''
         this.chatStreamQueue += event.data.content
@@ -121,6 +141,7 @@ export const useAppStore = defineStore('app', {
         this.chatStreamQueue = ''
         this.chatStreamText = ''
         this.chatCompletedMessage = null
+        this.chatToolEvents = []
         this.chatRunning = false
         this.chatMessages.push({ id: Date.now(), role: 'system', content: event.data.message, run_id: null, created_at: new Date().toISOString() })
       }
@@ -128,18 +149,19 @@ export const useAppStore = defineStore('app', {
     consumeChatStream() {
       if (typingFrame !== null) return
       const render = () => {
-        const characters = Array.from(this.chatStreamQueue)
-        if (!characters.length) {
+        if (!this.chatStreamQueue) {
           typingFrame = null
           this.finishChatStreamIfReady()
           return
         }
-        const count = characters.length > 160 ? 8 : characters.length > 64 ? 4 : characters.length > 20 ? 2 : 1
-        this.chatStreamText += characters.slice(0, count).join('')
-        this.chatStreamQueue = characters.slice(count).join('')
-        typingFrame = window.requestAnimationFrame(render)
+        // Token 往往一次包含多个汉字；分帧消费，避免整块瞬间出现，
+        // 同时保持真实 SSE 到达节奏和较自然的打字速度。
+        const next = this.chatStreamQueue.slice(0, 1)
+        this.chatStreamText += next
+        this.chatStreamQueue = this.chatStreamQueue.slice(next.length)
+        typingFrame = window.setTimeout(render, TYPING_INTERVAL_MS)
       }
-      typingFrame = window.requestAnimationFrame(render)
+      typingFrame = window.setTimeout(render, TYPING_INTERVAL_MS)
     },
     finishChatStreamIfReady() {
       if (this.chatStreamQueue || !this.chatCompletedMessage) return

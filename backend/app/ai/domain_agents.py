@@ -5,6 +5,7 @@ from typing import TypeVar
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 
+from app.ai.agent_tools import execute_tool, get_workflow_tools
 from app.ai.prompts import PromptVersion, get_active
 from app.core.config import Settings
 from app.schemas import PlanningRequest
@@ -91,6 +92,7 @@ class StructuredDomainAgentEngine:
     """
 
     def __init__(self, settings: Settings, *, use_llm: bool) -> None:
+        self._settings = settings
         self._model: ChatOpenAI | None = None
         if use_llm and settings.real_llm_enabled:
             self._model = ChatOpenAI(
@@ -111,6 +113,7 @@ class StructuredDomainAgentEngine:
         preferences: Sequence[str] = (),
         prep_time_max: int | None = None,
         kitchenware: Sequence[str] = (),
+        directive: Mapping[str, object] | None = None,
     ) -> tuple[MealAgentResult, str, str]:
         """规划餐食筛选策略。
 
@@ -163,17 +166,26 @@ class StructuredDomainAgentEngine:
                 "prep_time_max_minutes": prep_time_max,
                 "kitchenware": available_tools,
             }
+        if directive:
+            extra_payload["supervisor_directive"] = dict(directive)
         return await self._generate(
             MealAgentResult,
             get_active("meal"),
             request,
             fallback,
             extra_payload=extra_payload or None,
+            tool_names=(
+                "search_knowledge",
+                "get_user_profile",
+                "get_nutrition_goal",
+                "get_nutrition_report",
+            ),
         )
 
     async def shopping(
         self,
         request: PlanningRequest,
+        directive: Mapping[str, object] | None = None,
     ) -> tuple[ShoppingAgentResult, str, str]:
         fallback = ShoppingAgentResult(
             strategy="按标准化食材名和分类合并，同类数量保留可追溯来源",
@@ -186,11 +198,14 @@ class StructuredDomainAgentEngine:
             get_active("shopping"),
             request,
             fallback,
+            extra_payload={"supervisor_directive": dict(directive)} if directive else None,
+            tool_names=("search_knowledge", "get_active_plan", "web_research"),
         )
 
     async def budget(
         self,
         request: PlanningRequest,
+        directive: Mapping[str, object] | None = None,
     ) -> tuple[BudgetAgentResult, str, str]:
         limit = request.budget
         # 确定性回退：预留 10%，分类限额之和严格等于 limit - reserve
@@ -213,6 +228,8 @@ class StructuredDomainAgentEngine:
             get_active("budget"),
             request,
             fallback,
+            extra_payload={"supervisor_directive": dict(directive)} if directive else None,
+            tool_names=("search_knowledge", "get_active_plan", "get_nutrition_goal"),
         )
         # 第二层防御：确定性兜底，确保分类之和 + 预留 == 周预算
         result = reconcile_budget(result, limit)
@@ -225,6 +242,7 @@ class StructuredDomainAgentEngine:
         request: PlanningRequest,
         fallback: ResultT,
         extra_payload: Mapping[str, object] | None = None,
+        tool_names: tuple[str, ...] = (),
     ) -> tuple[ResultT, str, str]:
         """运行领域智能体，返回 (结果, 模式, 错误说明)。
 
@@ -245,13 +263,47 @@ class StructuredDomainAgentEngine:
             f"Input: {json.dumps(payload, ensure_ascii=False)}"
         )
         try:
-            response = await self._model.bind(response_format={"type": "json_object"}).ainvoke(
-                [("system", prompt.system_message), ("user", user_prompt)]
+            messages: list[object] = [("system", prompt.system_message), ("user", user_prompt)]
+            tools = get_workflow_tools(tool_names)
+            bound_model = (
+                self._model.bind_tools([tool.openai_schema() for tool in tools.values()])
+                if tools
+                else self._model.bind(response_format={"type": "json_object"})
             )
-            content = (
-                response.content if isinstance(response.content, str) else str(response.content)
-            )
-            return schema.model_validate_json(content), f"llm:v{prompt.version}", ""
+            tool_calls_used = 0
+            tool_names_used: list[str] = []
+            for _ in range(self._settings.domain_agent_max_iterations):
+                response = await bound_model.ainvoke(messages)
+                tool_calls = getattr(response, "tool_calls", []) or []
+                if not tool_calls:
+                    content = response.content if isinstance(response.content, str) else str(response.content)
+                    mode = (
+                        f"llm-react:v{prompt.version}:{tool_calls_used}tools:{','.join(dict.fromkeys(tool_names_used))}"
+                        if tools else f"llm:v{prompt.version}"
+                    )
+                    return schema.model_validate_json(content), mode, ""
+                messages.append(response)
+                for call in tool_calls:
+                    if tool_calls_used >= self._settings.domain_agent_max_tool_calls:
+                        break
+                    name = str(call.get("name", ""))
+                    arguments = call.get("args", {})
+                    safe_arguments = arguments if isinstance(arguments, dict) else {}
+                    tool = tools.get(name)
+                    if tool is None:
+                        result = json.dumps({"status": "invalid", "message": "未注册工具"}, ensure_ascii=False)
+                    else:
+                        result = await execute_tool(
+                            tool, safe_arguments, self._settings.domain_agent_tool_timeout_seconds
+                        )
+                    tool_calls_used += 1
+                    tool_names_used.append(name or "unknown")
+                    from langchain_core.messages import ToolMessage
+
+                    messages.append(
+                        ToolMessage(content=result, tool_call_id=str(call.get("id", "")))
+                    )
+            return fallback, f"deterministic-fallback:v{prompt.version}", "领域工具调用达到上限"
         except Exception as exc:
             return (
                 fallback,

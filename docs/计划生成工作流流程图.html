@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>SoloChef 计划生成工作流 — 业务流程图</title>
+<style>
+  :root {
+    --bg:#0f1217; --panel:#161b22; --line:#5b6678; --text:#e6edf3; --sub:#9aa4b2;
+    --c0:#4a4a4a; --c0b:#b4b2a9;
+    --c1:#0C447C; --c1b:#85B7EB;
+    --c2:#3C3489; --c2b:#AFA9EC;
+    --c3:#085041; --c nav:;
+    --c4:#633806; --c4b:#EF9F27;
+    --c5:#72243E; --c5b:#ED93B1;
+    --c6:#27500A; --c6b:#97C459;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+    font-family:-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    padding:28px 16px 60px; }
+  h1 { text-align:center; font-size:22px; font-weight:600; margin:0 0 6px; }
+  .sub { text-align:center; color:var(--sub); font-size:13px; margin-bottom:8px; }
+  .note { max-width:760px; margin:0 auto 22px; font-size:12.5px; color:var(--sub);
+    background:#161b22; border:1px solid #232b36; border-radius:10px; padding:12px 16px; line-height:1.7; }
+  .flow { max-width:760px; margin:0 auto; }
+  .node { border-radius:12px; padding:13px 18px; margin:0 auto; width:92%; text-align:center; border:0.5px solid; box-shadow:0 2px 10px rgba(0,0,0,.35); }
+  .node .t { font-size:14.5px; font-weight:600; }
+  .node .d { font-size:12px; color:#cdd5e0; margin-top:4px; }
+  .arrow { text-align:center; color:var(--line); font-size:17px; line-height:26px; height:26px; }
+  .parallel { max-width:760px; margin:0 auto; display:flex; gap:12px; align-items:stretch; }
+  .parallel .node { width:32%; margin:0; }
+  .arrow-h { text-align:center; color:var(--line); flex:0 0 auto; align-self:center; font-size:16px; }
+  .n0 { background:var(--c0); border-color:var(--c0b); }
+  .n1 { background:var(--c1); border-color:var(--c1b); }
+  .n2 { background:var(--c2); border-color:var(--c2b); }
+  .n3 { background:#085041; border-color:#5DCAA5; }
+  .n4 { background:var(--c4); border-color:var(--c4b); }
+  .n5 { background:var(--c5); border-color:var(--c5b); }
+  .n6 { background:var(--c6); border-color:var(--c6b); }
+  .legend { max-width:760px; margin:30px auto 0; font-size:12.5px; color:var(--sub); line-height:1.9; }
+  .legend b { color:var(--text); }
+  .tag { display:inline-block; padding:1px 7px; border-radius:6px; font-size:11px; margin-right:4px; color:#fff; }
+  .t-gray{background:#555;} .t-blue{background:var(--c1);} .t-purple{background:var(--c2);}
+  .t-green{background:#085041;} .t-orange{background:var(--c4);} .t-pink{background:var(--c5);} .t-lgreen{background:var(--c6);}
+</style>
+</head>
+<body>
+  <h1>SoloChef · 计划生成工作流（SoloChefWorkflow）</h1>
+  <div class="sub">LangGraph 11 节点 StateGraph：检索 → (Supervisor) → 三领域专家并行 → Planner → Verifier → 条件回流</div>
+
+  <div class="note">
+    <b>先回答你的问题：检索节点是「直接检索」。</b> 图中 ② 检索节点只拿 <code>request.prompt</code> + <code>goal_type</code> 去搜，<b>约束不参与检索 query</b>。<br/>
+    约束解析在图的<b>外面</b>：① PlanningService.generate() 先从 DB 加载忌口/偏好/营养目标/口味画像/生活方式，注入 <code>WorkflowState</code>，再由 ③ ⑥ 的 meal_agent 与 verifier 消费。<br/>
+    <b>降级开关</b>：<code>workflow_supervisor_enabled=false</code> 时跳过 Supervisor，检索后三专家直接并行（无 LLM 派发、无回流）；<code>domain_agents_llm_enabled=false</code> 时专家走确定性规则引擎（不调 LLM、不调工具）。
+  </div>
+
+  <div class="flow">
+    <div class="node n0"><div class="t">① PlanningService.generate()（图外预处理）</div><div class="d">从 DB 加载约束/偏好/营养目标/口味画像/生活方式 → 注入 WorkflowState；配置 checkpointer；建 agent_run 记录</div></div>
+    <div class="arrow">▼</div>
+
+    <div class="node n1"><div class="t">② retrieval 节点（直接检索，并行）</div><div class="d">asyncio.gather：Neo4j 图谱（rewrite_query→Cypher）+ Milvus 向量（goal_type 过滤 + 可选 rerank）<br/>→ 融合为 context 字符串；任一异常仅返回空+状态标记，不崩</div></div>
+    <div class="arrow">▼</div>
+
+    <div class="node n2"><div class="t">③ supervisor 节点（仅 workflow_supervisor_enabled）</div><div class="d">真·LLM（ChatOpenAI, T=0）输出 JSON 派发决策；无 LLM 时降级为确定性 _fallback_dispatch（首轮全派，回流按冲突维度补派）</div></div>
+    <div class="arrow">▼</div>
+  </div>
+
+  <div class="parallel">
+    <div class="node n3"><div class="t">④ meal_agent</div><div class="d">硬约束/排除食材/备餐时长<br/>工具：search_knowledge, get_user_profile, get_nutrition_goal, get_nutrition_report</div></div>
+    <div class="node n3"><div class="t">④ shopping_agent</div><div class="d">合并键/分类/批次<br/>工具：search_knowledge, get_active_plan, web_research</div></div>
+    <div class="node n3"><div class="t">④ budget_agent</div><div class="d">分类限额/预留/预警<br/>工具：search_knowledge, get_active_plan, get_nutrition_goal<br/>+ reconcile_budget 确定性兜底</div></div>
+  </div>
+  <div class="arrow" style="max-width:760px;margin:0 auto;">▲（并行汇聚）▼</div>
+
+  <div class="flow">
+    <div class="node n4"><div class="t">⑤ planner 节点</div><div class="d">融合 context + 专家建议(specialist_context) + 上轮校验反馈 + web 上下文 → LLM 生成 PlanDraft（21 餐/采购/任务/预算）<br/>超时/异常 → DemoPlanGenerator 确定性兜底；with_meal_types + validate_weekly_meals 校验餐数</div></div>
+    <div class="arrow">▼</div>
+
+    <div class="node n5"><div class="t">⑥ verifier 节点（三级校验自愈）</div><div class="d">采购估价回填 → 忌口(forbidden_terms)+营养目标校验 → 自动修正≤2轮 → 超预算硬冲突 → 硬冲突率&gt;30%人工接管判定 → 产出 supervisor_feedback</div></div>
+    <div class="arrow">▼</div>
+
+    <div class="node n6"><div class="t">⑦ 条件边 verifier_route</div><div class="d">retry_requested 且轮次/总派发未超限 → 回 ③ supervisor；否则 → END</div></div>
+    <div class="arrow">▼</div>
+
+    <div class="node n0"><div class="t">⑧ 落库（图外）</div><div class="d">update_agent_run：trace/steps/sources/payload/checkpoint 写入 MySQL；返回 PlanningResponse</div></div>
+  </div>
+
+  <div class="legend">
+    <b>颜色：</b>
+    <span class="tag t-gray">灰</span> 图外服务层 / 落库
+    <span class="tag t-blue">蓝</span> 检索（直接检索）
+    <span class="tag t-purple">紫</span> Supervisor（LLM 派发）
+    <span class="tag t-green">绿</span> 三领域专家（并行 + 工具调用）
+    <span class="tag t-orange">橙</span> Planner（LLM 生成）
+    <span class="tag t-pink">粉</span> Verifier（确定性校验）
+    <span class="tag t-lgreen">深绿</span> 条件回流控制<br/><br/>
+    <b>短期记忆（图内）</b>：WorkflowState（单 run 内存态） + 可选 LangGraph Checkpoint（默认 InMemorySaver，支持 redis/postgres 开关，未启用）<br/>
+    <b>长期记忆（跨 run）</b>：MySQL 的 UserProfile.constraints/preferences、NutritionGoal、FeedbackRepository.taste_profile（口味画像）、plan_feedback 回流 Neo4j+向量<br/>
+    <b>上下文记忆管理</b>：生成 run 内 state 流转；对话服务走 ChatMessage 多轮历史（取最近 8 条）+ RAG + Redis SSE 事件重放（断线续传）
+  </div>
+</body>
+</html>

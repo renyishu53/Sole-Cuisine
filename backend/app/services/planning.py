@@ -7,6 +7,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.ai.agent_tools import build_readonly_tools, reset_workflow_tools, set_workflow_tools
 from app.ai.llm import TokenSink, token_sink
 from app.ai.workflow import SoloChefWorkflow
 from app.models import NutritionGoal, UserProfile
@@ -40,9 +41,7 @@ class PlanningService:
         return checkpointer is not None
 
     @staticmethod
-    async def _load_taste_profile(
-        session: AsyncSession | None, user_id: int
-    ) -> dict[str, object]:
+    async def _load_taste_profile(session: AsyncSession | None, user_id: int) -> dict[str, object]:
         """读取历史执行反馈聚合出的口味画像，注入本轮规划。
 
         这是"反馈 → 记忆 → 下一轮规划"闭环的入口：没有 Session 或表尚未迁移时
@@ -157,8 +156,14 @@ class PlanningService:
                 user_id=request.user_id,
                 prompt=request.prompt,
                 status="running",
+                checkpoint={},
             )
         token = token_sink.set(on_token)
+        tools_token = (
+            set_workflow_tools(build_readonly_tools(session, request.user_id))
+            if session is not None
+            else None
+        )
         try:
 
             async def persist_step(step: AgentStep) -> None:
@@ -169,7 +174,6 @@ class PlanningService:
                         checkpoint={
                             "last_completed_node": step.name,
                             "step": step.model_dump(mode="json"),
-                            "resumable": True,
                             "updated_at": datetime.now(UTC).isoformat(),
                         },
                     )
@@ -220,6 +224,8 @@ class PlanningService:
                 )
             raise
         finally:
+            if tools_token is not None:
+                reset_workflow_tools(tools_token)
             token_sink.reset(token)
 
         if repo is not None:
@@ -234,110 +240,12 @@ class PlanningService:
                 llm_mode=getattr(self._workflow._generator, "mode", "demo"),
                 payload=response.model_dump(mode="json"),
                 checkpoint={
-                    "last_completed_node": "final_planner",
-                    "resumable": False,
+                    "last_completed_node": response.trace[-1].name if response.trace else "",
                     "updated_at": datetime.now(UTC).isoformat(),
                 },
                 finished_at=datetime.now(UTC),
             )
 
-        return response
-
-    async def resume(
-        self,
-        run_id: UUID,
-        *,
-        user_id: int,
-        session: AsyncSession,
-        on_step: Callable[[AgentStep], Awaitable[None]] | None = None,
-    ) -> PlanningResponse | None:
-        repo = PlanningRepository(session)
-        record = await repo.get_agent_run(str(run_id), user_id)
-        if record is None:
-            return None
-        if record.status != "failed":
-            raise ValueError("只有失败的 Agent Run 可以继续执行")
-        if not await self._configure_checkpointer(session):
-            return None
-
-        started = perf_counter()
-        previous_checkpoint = dict(record.checkpoint or {})
-        await repo.update_agent_run(
-            str(run_id),
-            user_id,
-            status="running",
-            finished_at=None,
-            error_message="",
-            error_type="",
-            failed_step="",
-            checkpoint={
-                **previous_checkpoint,
-                "resume_requested_at": datetime.now(UTC).isoformat(),
-                "resumable": True,
-            },
-        )
-
-        async def persist_step(step: AgentStep) -> None:
-            await repo.update_agent_run(
-                str(run_id),
-                user_id,
-                checkpoint={
-                    **previous_checkpoint,
-                    "last_completed_node": step.name,
-                    "step": step.model_dump(mode="json"),
-                    "resumed": True,
-                    "resumable": True,
-                    "updated_at": datetime.now(UTC).isoformat(),
-                },
-            )
-            if on_step is not None:
-                await on_step(step)
-
-        try:
-            response = await self._workflow.run(
-                None,
-                run_id=run_id,
-                on_step=persist_step,
-                resume=True,
-            )
-        except Exception as exc:
-            await session.rollback()
-            await repo.update_agent_run(
-                str(run_id),
-                user_id,
-                status="failed",
-                duration_ms=max(1, round((perf_counter() - started) * 1000)),
-                error_message=str(exc)[:2000] or "工作流恢复失败",
-                error_type=type(exc).__name__,
-                failed_step="workflow",
-                finished_at=datetime.now(UTC),
-                checkpoint={
-                    **previous_checkpoint,
-                    "resume_failed_at": datetime.now(UTC).isoformat(),
-                    "resumable": True,
-                },
-            )
-            raise
-
-        await repo.update_agent_run(
-            str(run_id),
-            user_id,
-            status="completed",
-            duration_ms=sum(step.duration_ms for step in response.trace),
-            steps=[step.model_dump(mode="json") for step in response.trace],
-            sources=response.sources,
-            summary=response.summary,
-            llm_mode=getattr(self._workflow._generator, "mode", "demo"),
-            payload=response.model_dump(mode="json"),
-            finished_at=datetime.now(UTC),
-            checkpoint={
-                **previous_checkpoint,
-                "last_completed_node": "final_planner",
-                "resumed": True,
-                "resumable": False,
-                "updated_at": datetime.now(UTC).isoformat(),
-            },
-        )
         return response
 
     async def get_run(self, run_id: UUID, user_id: int, session: AsyncSession) -> AgentRun | None:
@@ -345,6 +253,7 @@ class PlanningService:
         record = await repo.get_agent_run(str(run_id), user_id)
         if record is None:
             return None
+        checkpoint = record.checkpoint or {}
         return AgentRun(
             id=UUID(record.id),
             request=record.prompt,
@@ -356,7 +265,7 @@ class PlanningService:
             error_message=record.error_message,
             error_type=record.error_type,
             failed_step=record.failed_step,
-            checkpoint=record.checkpoint or {},
+            checkpoint=checkpoint,
         )
 
 

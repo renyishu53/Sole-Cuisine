@@ -21,6 +21,7 @@ const sessions = computed(() => store.chatSessions)
 const historyLoading = computed(() => store.chatHistoryLoading)
 const historyOpen = ref(false)
 const streamedText = computed(() => store.chatStreamText)
+const toolEvents = computed(() => store.chatToolEvents)
 const thinkingHint = computed(() => store.chatThinkingHint)
 const bodyEl = ref<HTMLElement>()
 
@@ -42,6 +43,7 @@ const SCENE_OPTIONS: { value: VisionScene; label: string }[] = [
 const visionOpen = ref(false)
 const visionLoading = ref(false)
 const visionResult = ref<VisionResult | null>(null)
+const visionError = ref('')
 const selectedScene = ref<VisionScene>('auto')
 const fileInput = ref<HTMLInputElement>()
 
@@ -105,16 +107,16 @@ async function send(text?: string) {
 function ask(text: string) { void send(text) }
 function goPlanner() { store.closeChat(); router.push('/planner'); }
 
-function toggleVision() { visionOpen.value = !visionOpen.value; visionResult.value = null }
+function toggleVision() { visionOpen.value = !visionOpen.value; visionResult.value = null; visionError.value = '' }
 function triggerFile() { fileInput.value?.click() }
 async function onFile(e: Event) {
   const input = e.target as HTMLInputElement
   const file = input.files?.[0]
   if (!file) return
   input.value = ''
-  visionLoading.value = true; store.chatError = ''
+  visionLoading.value = true; visionError.value = ''; store.chatError = ''
   try { visionResult.value = await api.recognizeVision(file, selectedScene.value) }
-  catch (reason) { store.chatError = apiErrorMessage(reason, '图片识别失败') }
+  catch (reason) { visionError.value = apiErrorMessage(reason, '图片识别失败，请检查视觉模型配置或稍后重试') }
   finally { visionLoading.value = false }
 }
 
@@ -152,7 +154,7 @@ watch(
 </script>
 
 <template>
-  <div class="ask-fab-root">
+  <div v-if="!store.assistantSuppressed || open" class="ask-fab-root">
     <!-- FAB 按钮：触控目标 50×50 ≥ 44px -->
     <button
       v-if="!open"
@@ -226,6 +228,16 @@ watch(
             <span class="ask-msg-avatar"><Sparkles :size="15" /></span>
             <div class="ask-msg-body"><small>SoloChef</small><p class="ask-thinking">{{ thinkingHint }}<i>.</i><i>.</i><i>.</i></p></div>
           </article>
+          <details v-if="toolEvents.length" class="ask-tool-trace">
+            <summary>已查询 {{ toolEvents.filter((item) => item.event === 'tool_call').length }} 项资料</summary>
+            <ul>
+              <li v-for="(item, index) in toolEvents" :key="`${item.event}-${item.name}-${index}`">
+                <span>{{ item.event === 'tool_call' ? '查询' : '结果' }}</span>
+                <strong>{{ item.name }}</strong>
+                <small v-if="item.content">{{ item.content }}</small>
+              </li>
+            </ul>
+          </details>
           <article v-if="streamedText" class="ask-msg assistant">
             <span class="ask-msg-avatar"><Sparkles :size="15" /></span>
             <div class="ask-msg-body"><small>SoloChef</small><p>{{ streamedText }}</p></div>
@@ -245,6 +257,7 @@ watch(
           </div>
           <input ref="fileInput" type="file" accept="image/*" hidden @change="onFile" />
           <p class="ask-vision-options">也可先选择识别类型，让结果更聚焦。</p>
+          <p v-if="visionError" class="ask-vision-error" role="alert">{{ visionError }}</p>
         </div>
 
         <div v-if="visionResult" class="ask-vision-result">
@@ -261,7 +274,14 @@ watch(
         <form class="ask-composer" @submit.prevent="send()">
           <textarea v-model="prompt" rows="4" maxlength="4000" placeholder="输入营养、食谱、热量或食材问题…" :disabled="running" @keydown.enter.exact.prevent="send()" />
           <div class="ask-composer-actions">
-            <button type="button" class="icon-button" :aria-label="'图片识别'" title="图片识别" :disabled="running" @click="toggleVision"><Camera :size="18" /></button>
+            <button
+              type="button"
+              class="icon-button"
+              :aria-label="'图片识别'"
+              title="图片识别"
+              :disabled="visionLoading"
+              @click="toggleVision"
+            ><Camera :size="18" /></button>
             <button class="ask-send" :disabled="running || !prompt.trim()" type="submit" :aria-label="'发送'"><Loader2 v-if="running" :size="16" class="spin" /><Send v-else :size="16" /></button>
           </div>
         </form>
@@ -373,6 +393,14 @@ watch(
 .ask-thinking i:nth-child(3) { animation-delay: .4s; }
 @keyframes ask-bounce { 0%, 60%, 100% { transform: translateY(0); opacity: .4; } 30% { transform: translateY(-3px); opacity: 1; } }
 
+.ask-tool-trace { margin: -4px 0 0 36px; max-width: 82%; border-left: 2px solid #cfe0d6; padding: 4px 0 4px 10px; color: var(--muted); }
+.ask-tool-trace summary { cursor: pointer; font-size: var(--font-xs); color: var(--primary); }
+.ask-tool-trace ul { list-style: none; margin: 7px 0 0; padding: 0; display: grid; gap: 4px; }
+.ask-tool-trace li { display: grid; grid-template-columns: 32px auto; gap: 5px; font-size: var(--font-xs); overflow-wrap: anywhere; }
+.ask-tool-trace li span { color: var(--muted); }
+.ask-tool-trace li strong { color: var(--text); font-weight: 600; }
+.ask-tool-trace li small { grid-column: 2; line-height: 1.45; }
+
 .ask-redirect-btn {
   margin-top: 8px; display: inline-flex; align-items: center; gap: 5px;
   padding: 9px 14px; border: 1px solid var(--primary); border-radius: 14px;
@@ -399,6 +427,7 @@ watch(
 .ask-vision-scenes button:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
 .ask-vision-note { margin: 0; font-size: var(--font-xs); color: var(--muted); line-height: 1.5; }
 .ask-vision-options { margin: 0; font-size: var(--font-xs); color: var(--muted); }
+.ask-vision-error { margin: 0; color: #a23f35; font-size: var(--font-xs); line-height: 1.5; }
 .ask-vision-btn { width: 100%; min-height: 46px; justify-content: center; }
 
 .ask-vision-result { margin: 0 14px 14px; padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--radius-md); background: #fbfcfa; }

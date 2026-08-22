@@ -13,6 +13,8 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.services.shopping_categories import normalize_shopping_category
+
 from app.models.identity import (
     AgentRunRecord,
     PlanMealItem,
@@ -65,6 +67,7 @@ class PlanningRepository:
         user_id: int,
         prompt: str,
         status: str = "running",
+        checkpoint: dict[str, Any] | None = None,
     ) -> AgentRunRecord:
         record = AgentRunRecord(
             id=run_id,
@@ -72,6 +75,7 @@ class PlanningRepository:
             status=status,
             prompt=prompt,
             payload={},
+            checkpoint=checkpoint or {},
         )
         self._session.add(record)
         await self._session.commit()
@@ -173,7 +177,12 @@ class PlanningRepository:
             for item in meals
         ]
         plan.shopping_items = [
-            PlanShoppingItem(**{key: value for key, value in item.items() if key != "id"})
+            PlanShoppingItem(
+                **{
+                    **{key: value for key, value in item.items() if key != "id"},
+                    "category": normalize_shopping_category(item.get("category"), item.get("name", "")),
+                }
+            )
             for item in shopping
         ]
         self._session.add(plan)
@@ -194,10 +203,14 @@ class PlanningRepository:
                 PlanMealItem(plan_id=plan.id, **{k: v for k, v in meal_data.items() if k != "id"})
             )
         for shop_data in shopping:
+            values = {
+                **{k: v for k, v in shop_data.items() if k != "id"},
+                "category": normalize_shopping_category(
+                    shop_data.get("category"), shop_data.get("name", "")
+                ),
+            }
             self._session.add(
-                PlanShoppingItem(
-                    plan_id=plan.id, **{k: v for k, v in shop_data.items() if k != "id"}
-                )
+                PlanShoppingItem(plan_id=plan.id, **values)
             )
         await self._session.commit()
         await self._session.refresh(plan)
@@ -244,7 +257,7 @@ class PlanningRepository:
         plan.shopping_items = [
             PlanShoppingItem(
                 name=item.name,
-                category=item.category,
+                category=normalize_shopping_category(item.category, item.name),
                 quantity=item.quantity,
                 price=item.price,
                 source=item.source,
@@ -316,7 +329,12 @@ class PlanningRepository:
             for item in meals
         ]
         plan.shopping_items = [
-            PlanShoppingItem(**{key: value for key, value in item.items() if key != "id"})
+            PlanShoppingItem(
+                **{
+                    **{key: value for key, value in item.items() if key != "id"},
+                    "category": normalize_shopping_category(item.get("category"), item.get("name", "")),
+                }
+            )
             for item in shopping
         ]
         self._session.add(plan)
@@ -541,6 +559,7 @@ class PlanningRepository:
 
     async def create_shopping_item(self, user_id: int, **values: Any) -> PlanShoppingItem:
         plan = await self.get_or_create_active_plan(user_id)
+        values["category"] = normalize_shopping_category(values.get("category"), values.get("name", ""))
         item = PlanShoppingItem(plan_id=plan.id, **values)
         self._session.add(item)
         await self._session.commit()

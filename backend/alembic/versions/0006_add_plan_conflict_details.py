@@ -20,7 +20,7 @@ import sqlalchemy as sa
 
 
 revision: str = "0006_add_plan_conflict_details"
-down_revision: str = "0005_add_shopping_substitution_fields"
+down_revision: str = "0005_shopping_sub_fields"
 branch_labels: None | str = None
 depends_on: None | str = None
 

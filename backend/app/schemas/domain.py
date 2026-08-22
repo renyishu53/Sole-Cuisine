@@ -5,6 +5,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.services.shopping_categories import normalize_shopping_category
+
 
 class TaskStatus(StrEnum):
     TODO = "todo"
@@ -38,6 +40,17 @@ class VisionResult(BaseModel):
     items: list[dict[str, Any]] = []
     calories: float | None = None
     raw_text: str = ""
+
+
+class ResearchResult(BaseModel):
+    """A bounded, auditable item returned by an external research provider."""
+
+    provider: str = Field(min_length=1, max_length=40)
+    title: str = Field(max_length=200)
+    url: str = Field(max_length=500)
+    snippet: str = Field(max_length=1_000)
+    fetched_at: datetime
+    status: Literal["ok", "warning"] = "ok"
 
 
 class MemberProfile(BaseModel):
@@ -275,6 +288,7 @@ class TaskAgentResult(BaseModel):
 
 class BudgetSelfCheck(BaseModel):
     """预算分配自检字段：分类之和 + 预留 == 周预算。"""
+
     category_sum: float = 0
     total_check: float = 0
     expected: float = 0
@@ -422,22 +436,33 @@ class ShoppingItem(BaseModel):
     quantity: str
     price: float
     source: str
+    origin: Literal["meal_ingredient", "extra_purchase"] = "meal_ingredient"
     purchased: bool = False
     # 食材替换确认闭环：substituted_from 记录被替换前的原食材名，
     # substituted_accepted 记录用户是否确认（None=待确认，True=已接受，False=已拒绝并回退）。
     substituted_from: str | None = None
     substituted_accepted: bool | None = None
 
+    @model_validator(mode="after")
+    def normalize_category(self) -> "ShoppingItem":
+        self.category = normalize_shopping_category(self.category, self.name)
+        return self
+
 
 class ShoppingItemCreate(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
     name: str = Field(min_length=1, max_length=120)
-    category: str = Field(default="未分类", min_length=1, max_length=40)
+    category: str = Field(default="其他", min_length=1, max_length=40)
     quantity: str = Field(default="1", min_length=1, max_length=40)
     price: float = Field(default=0, ge=0, le=100000)
     source: str = Field(default="手工添加", max_length=100)
     purchased: bool = False
+
+    @model_validator(mode="after")
+    def normalize_category(self) -> "ShoppingItemCreate":
+        self.category = normalize_shopping_category(self.category, self.name)
+        return self
 
 
 class ShoppingItemUpdate(BaseModel):
@@ -448,6 +473,7 @@ class ShoppingItemUpdate(BaseModel):
     quantity: str | None = Field(default=None, min_length=1, max_length=40)
     price: float | None = Field(default=None, ge=0, le=100000)
     source: str | None = Field(default=None, max_length=100)
+    origin: Literal["meal_ingredient", "extra_purchase"] | None = None
     purchased: bool | None = None
     # 核销反馈：仅在 purchased 由 false → true 时参与闭环回流，不落到 PlanShoppingItem
     actual_price: float | None = Field(default=None, ge=0, le=100000)
@@ -460,6 +486,12 @@ class ShoppingItemUpdate(BaseModel):
     def ensure_values(self) -> "ShoppingItemUpdate":
         if not self.model_fields_set:
             raise ValueError("至少提供一个需要修改的字段")
+        return self
+
+    @model_validator(mode="after")
+    def normalize_category(self) -> "ShoppingItemUpdate":
+        if self.category is not None:
+            self.category = normalize_shopping_category(self.category, self.name or "")
         return self
 
     def item_changes(self) -> dict[str, Any]:
@@ -881,6 +913,7 @@ class BackgroundJobResponse(BaseModel):
 
 class QueueStats(BaseModel):
     """Celery 队列监控指标。"""
+
     name: str = Field(description="队列名称")
     depth: int = Field(ge=0, description="待处理消息数")
     routing_key: str = Field(default="", description="路由键")
@@ -888,11 +921,10 @@ class QueueStats(BaseModel):
 
 class CeleryStatsResponse(BaseModel):
     """Celery 运行时监控快照。"""
+
     broker_connected: bool = Field(description="broker 是否可达")
     queues: list[QueueStats] = Field(default_factory=list)
-    status_counts: dict[str, int] = Field(
-        default_factory=dict, description="后台任务按状态计数"
-    )
+    status_counts: dict[str, int] = Field(default_factory=dict, description="后台任务按状态计数")
     recent_jobs: list[BackgroundJobResponse] = Field(default_factory=list)
     dead_letter_count: int = Field(ge=0, description="死信任务数")
     result_expires: int = Field(description="结果过期秒数")
@@ -901,6 +933,7 @@ class CeleryStatsResponse(BaseModel):
 
 class DeadLetterItem(BaseModel):
     """死信任务详情。"""
+
     id: UUID
     kind: str
     error_message: str
@@ -1126,9 +1159,9 @@ class ConflictOption(BaseModel):
     """
 
     label: str = Field(min_length=1, max_length=120)
-    action: Literal[
-        "replace_meal", "replace_ingredient", "relax_budget", "relax_constraint"
-    ] = "replace_meal"
+    action: Literal["replace_meal", "replace_ingredient", "relax_budget", "relax_constraint"] = (
+        "replace_meal"
+    )
     proposal: dict[str, Any] | None = Field(
         default=None, description="替换菜/食材提案，供前端渲染与后续局部重算"
     )
@@ -1142,9 +1175,7 @@ class PlanConflict(BaseModel):
     ``options`` 为第 2 级降级提示提供的可选项。
     """
 
-    dimension: Literal[
-        "allergy", "budget", "coverage", "duplicate", "category_limit", "nutrition"
-    ]
+    dimension: Literal["allergy", "budget", "coverage", "duplicate", "category_limit", "nutrition"]
     level: Literal["hard", "soft"]
     message: str
     item: str = Field(default="", description="冲突主体（餐食名/维度名）")
@@ -1171,9 +1202,7 @@ class PlanningResponse(BaseModel):
     needs_manual_review: bool = Field(
         default=False, description="是否触发第 3 级人工接管（硬冲突率>30%）"
     )
-    manual_review_hint: str = Field(
-        default="", description="人工接管提示，如 '请放宽条件：……'"
-    )
+    manual_review_hint: str = Field(default="", description="人工接管提示，如 '请放宽条件：……'")
 
 
 class ChatTurnResponse(BaseModel):
@@ -1241,9 +1270,7 @@ class WeeklyPlanDetail(BaseModel):
     needs_manual_review: bool = Field(
         default=False, description="是否触发第 3 级人工接管（硬冲突率>30%）"
     )
-    manual_review_hint: str = Field(
-        default="", description="人工接管提示，如 '请放宽条件：……'"
-    )
+    manual_review_hint: str = Field(default="", description="人工接管提示，如 '请放宽条件：……'")
     run_id: str | None = None
     created_at: datetime
     updated_at: datetime
@@ -1307,17 +1334,13 @@ class UserProfileUpdate(BaseModel):
     weight_kg: float | None = Field(default=None, ge=20, le=500)
     age: int | None = Field(default=None, ge=1, le=120)
     gender: str | None = Field(default=None, pattern=r"^(male|female)$")
-    activity_level: str | None = Field(
-        default=None, pattern=r"^(sedentary|light|moderate|active)$"
-    )
+    activity_level: str | None = Field(default=None, pattern=r"^(sedentary|light|moderate|active)$")
     goal_type: str | None = Field(default=None, pattern=r"^(bulk|cut|maintain)$")
     preferences: list[str] | None = Field(default=None, max_length=20)
     constraints: list[str] | None = Field(default=None, max_length=20)
     budget_limit: float | None = Field(default=None, ge=0, le=10000)
     notes: str | None = Field(default=None, max_length=500)
-    cooking_skill: str | None = Field(
-        default=None, pattern=r"^(beginner|intermediate|proficient)$"
-    )
+    cooking_skill: str | None = Field(default=None, pattern=r"^(beginner|intermediate|proficient)$")
     kitchenware: list[str] | None = Field(default=None, max_length=20)
     prep_time_max: int | None = Field(default=None, ge=5, le=240)
 

@@ -86,7 +86,7 @@ _SHOPPING_SYSTEM = (
 _SHOPPING_USER = (
     "已确定的一周菜单：\n{meals_json}\n\n"
     "请根据菜单中的 ingredients 推导采购清单，合并同类项。"
-    "每项含 name/category/quantity/price/source/purchased(false)。\n"
+    "每项含 name/category/quantity/price/source/purchased(false)。category 只能是：肉蛋奶、蔬菜、主食、水果、其他。\n"
     "只输出 {{\"shopping\": [...]}} 格式的 JSON。"
 )
 

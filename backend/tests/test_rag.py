@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -7,6 +8,7 @@ from typing import Any, cast
 from uuid import uuid4
 
 import pytest
+import httpx
 from langgraph.checkpoint.memory import InMemorySaver
 
 from app.ai.llm import (
@@ -16,6 +18,7 @@ from app.ai.llm import (
     PlanDraft,
     token_sink,
 )
+from app.ai.agent_tools import AgentTool, execute_tool, web_research
 from app.ai.workflow import SoloChefWorkflow
 from app.core.config import Settings
 from app.schemas import (
@@ -220,11 +223,186 @@ async def test_langgraph_resume_retries_only_pending_node() -> None:
 
     result = await workflow.run(None, run_id=run_id, resume=True)
 
-    assert len(result.trace) == 11
-    assert result.trace[0].name == "constraint_parser"
+    assert len(result.trace) == 6
+    assert result.trace[0].name == "retrieval"
     assert all(step.name != "intent" for step in result.trace)
     assert generator.calls == 2
     assert knowledge.calls == retrieval_calls
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_failures_are_returned_as_agent_data() -> None:
+    async def slow(_: dict[str, object]) -> str:
+        await asyncio.sleep(0.05)
+        return "late"
+
+    async def broken(_: dict[str, object]) -> str:
+        raise RuntimeError("backend unavailable")
+
+    schema = {"type": "object", "properties": {}}
+    timed_out = await execute_tool(
+        AgentTool("slow", "slow tool", schema, slow), {}, timeout=0.001
+    )
+    failed = await execute_tool(
+        AgentTool("broken", "broken tool", schema, broken), {}, timeout=1
+    )
+
+    assert '"status": "timeout"' in timed_out
+    assert '"status": "error"' in failed
+
+
+@pytest.mark.asyncio
+async def test_supervisor_fallback_does_not_trigger_web_research() -> None:
+    workflow = SoloChefWorkflow(
+        settings=Settings(
+            _env_file=None,
+            workflow_supervisor_enabled=True,
+            tool_websearch_enabled=True,
+            tool_websearch_api_key="configured-but-not-called",
+        ),
+        knowledge=StubKnowledgeService(),
+        generator=DemoPlanGenerator(),
+    )
+
+    result = await workflow.run(PlanningRequest(prompt="安排一周晚餐", budget=500))
+
+    assert "web_research" not in [step.name for step in result.trace]
+
+
+@pytest.mark.asyncio
+async def test_supervisor_retries_with_conflict_specific_specialist() -> None:
+    """An unresolved allergy conflict must produce a bounded second collaboration round."""
+    workflow = SoloChefWorkflow(
+        settings=Settings(
+            _env_file=None,
+            workflow_supervisor_enabled=True,
+            supervisor_max_rounds=2,
+            supervisor_max_total_dispatches=4,
+        ),
+        knowledge=StubKnowledgeService(),
+        generator=DemoPlanGenerator(),
+    )
+
+    result = await workflow.run(
+        PlanningRequest(prompt="生成一周菜单，不能使用虾", budget=500),
+        user_constraints=["虾过敏"],
+    )
+
+    supervisors = [step for step in result.trace if step.name == "supervisor"]
+    planners = [step for step in result.trace if step.name == "planner"]
+    verifiers = [step for step in result.trace if step.name == "verifier"]
+
+    assert len(supervisors) == len(planners) == len(verifiers) == 2
+    assert supervisors[0].output["dispatch"] == [
+        "meal_agent",
+        "shopping_agent",
+        "budget_agent",
+    ]
+    assert supervisors[1].output["dispatch"] == ["meal_agent"]
+    assert supervisors[1].output["round"] == 2
+    assert verifiers[0].output["retry_requested"] is True
+    assert verifiers[1].output["retry_requested"] is False
+    assert [step.name for step in result.trace].count("meal_agent") == 2
+    assert [step.name for step in result.trace].count("shopping_agent") == 1
+    assert [step.name for step in result.trace].count("budget_agent") == 1
+
+
+def test_planning_web_research_requires_realtime_request_and_local_miss() -> None:
+    workflow = SoloChefWorkflow(
+        settings=Settings(
+            _env_file=None,
+            workflow_supervisor_enabled=True,
+            tool_websearch_enabled=True,
+            tool_websearch_api_key="configured-for-test",
+        ),
+        knowledge=StubKnowledgeService(),
+        generator=DemoPlanGenerator(),
+    )
+    realtime_request = PlanningRequest(prompt="查询本周时令蔬菜价格", budget=500)
+
+    assert workflow._web_research_available(  # noqa: SLF001 - verifies the policy boundary.
+        {"request": realtime_request, "vector_hits": []}
+    )
+    assert not workflow._web_research_available(  # noqa: SLF001
+        {"request": realtime_request, "vector_hits": [object()]}
+    )
+    assert not workflow._web_research_available(  # noqa: SLF001
+        {"request": PlanningRequest(prompt="安排一周晚餐", budget=500), "vector_hits": []}
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("handler", "expected_status"),
+    [
+        (
+            lambda request: httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "title": "本周蔬菜行情",
+                            "url": "https://example.test/price",
+                            "content": "青菜价格稳定。",
+                        }
+                    ]
+                },
+                request=request,
+            ),
+            "ok",
+        ),
+        (
+            lambda request: (_ for _ in ()).throw(httpx.ReadTimeout("slow", request=request)),
+            "warning",
+        ),
+        (lambda request: httpx.Response(429, request=request), "warning"),
+        (lambda request: httpx.Response(500, request=request), "warning"),
+        (lambda request: httpx.Response(200, content=b"not json", request=request), "warning"),
+    ],
+)
+async def test_web_research_returns_bounded_agent_data_for_provider_outcomes(
+    handler: object, expected_status: str
+) -> None:
+    transport = httpx.MockTransport(handler)  # type: ignore[arg-type]
+    raw = await web_research(
+        "查询本周蔬菜价格",
+        api_key="test-key",
+        provider="tavily",
+        timeout=0.1,
+        transport=transport,
+    )
+    payload = json.loads(raw)
+
+    assert payload["status"] == expected_status
+    assert "test-key" not in raw
+    if expected_status == "ok":
+        assert payload["results"][0]["title"] == "本周蔬菜行情"
+        assert payload["results"][0]["fetched_at"]
+    else:
+        assert payload["results"] == []
+
+
+@pytest.mark.asyncio
+async def test_supervisor_stops_at_round_limit() -> None:
+    workflow = SoloChefWorkflow(
+        settings=Settings(
+            _env_file=None,
+            workflow_supervisor_enabled=True,
+            supervisor_max_rounds=1,
+            supervisor_max_total_dispatches=6,
+        ),
+        knowledge=StubKnowledgeService(),
+        generator=DemoPlanGenerator(),
+    )
+
+    result = await workflow.run(
+        PlanningRequest(prompt="生成一周菜单，不能使用虾", budget=500),
+        user_constraints=["虾过敏"],
+    )
+
+    assert [step.name for step in result.trace].count("supervisor") == 1
+    verifier = next(step for step in result.trace if step.name == "verifier")
+    assert verifier.output["retry_requested"] is False
 
 
 def test_summary_stream_extractor_handles_split_json_tokens() -> None:

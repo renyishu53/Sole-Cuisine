@@ -53,7 +53,7 @@ SCENE_PROMPTS: dict[VisionScene, str] = {
     VisionScene.INGREDIENT: (
         "你是食材识别专家。识别图片中的所有食材，只输出 JSON 对象："
         '{"summary":"一句话概述图片内容","items":['
-        '{"name":"食材名","quantity":"估测量如200g或2个","category":"蔬菜|肉类|主食|调味料|其他"}'
+        '{"name":"食材名","quantity":"估测量如200g或2个","category":"肉蛋奶|蔬菜|主食|水果|其他"}'
         "]}"
     ),
     VisionScene.DISH: (

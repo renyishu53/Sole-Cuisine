@@ -5,6 +5,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.llm import LLMGenerationError, get_chat_assistant
+from app.ai.agent_tools import build_readonly_tools
+from app.core.config import get_settings
 from app.models import NutritionGoal, UserProfile
 from app.repositories import ConversationRepository, PlanningRepository
 from app.schemas.domain import (
@@ -192,10 +194,6 @@ class ConversationService:
             chat, role="user", content=content
         )
 
-        # 组装只读上下文 + RAG 检索
-        context = await self._build_readonly_context(session, user_id)
-        rag_snippets = await self._retrieve_rag(content, user_id)
-
         # 调用对话 LLM（非规划链路）
         assistant_model = get_chat_assistant()
         if assistant_model is None:
@@ -206,9 +204,14 @@ class ConversationService:
         else:
             chunks: list[str] = []
             try:
-                async for chunk in assistant_model.answer(
-                    content, context, rag_snippets, history
-                ):
+                agent_enabled = get_settings().chat_agent_enabled
+                context = "" if agent_enabled else await self._build_readonly_context(session, user_id)
+                rag_snippets = [] if agent_enabled else await self._retrieve_rag(content, user_id)
+                tools = build_readonly_tools(session, user_id) if agent_enabled else None
+                answer_args: tuple[object, ...] = (content, context, rag_snippets, history)
+                if tools:
+                    answer_args += (tools,)
+                async for chunk in assistant_model.answer(*answer_args):
                     chunks.append(chunk)
                 answer = "".join(chunks) or "[未生成回答]"
             except LLMGenerationError as exc:
@@ -260,10 +263,6 @@ class ConversationService:
             session_id, "thinking", {"hint": "正在准备回答…"}
         )
 
-        # 组装只读上下文 + RAG 检索
-        context = await self._build_readonly_context(session, user_id)
-        rag_snippets = await self._retrieve_rag(content, user_id)
-
         assistant_model = get_chat_assistant()
         chunks: list[str] = []
         try:
@@ -272,15 +271,30 @@ class ConversationService:
                     "AI 助手未启用（未配置 LLM_API_KEY）"
                 )
 
-            async for chunk in assistant_model.answer(
-                content, context, rag_snippets, history
-            ):
+            agent_enabled = get_settings().chat_agent_enabled
+            context = "" if agent_enabled else await self._build_readonly_context(session, user_id)
+            rag_snippets = [] if agent_enabled else await self._retrieve_rag(content, user_id)
+            tools = build_readonly_tools(session, user_id) if agent_enabled else None
+
+            async def emit_tool_event(event: str, data: dict[str, object]) -> None:
+                nonlocal pending_events
+                pending_events.append(await self._emit(session_id, event, data))
+
+            pending_events: list[str] = []
+            answer_args: tuple[object, ...] = (content, context, rag_snippets, history)
+            if tools:
+                answer_args += (tools, emit_tool_event)
+            async for chunk in assistant_model.answer(*answer_args):
+                while pending_events:
+                    yield pending_events.pop(0)
                 if await runtime_state.is_cancelled(session_id):
                     raise PlanningCancelledError("用户已取消本次对话")
                 chunks.append(chunk)
                 yield await self._emit(
                     session_id, "token", {"content": chunk}
                 )
+            while pending_events:
+                yield pending_events.pop(0)
 
             answer = "".join(chunks) or "[未生成回答]"
             assistant = await repository.add_message(

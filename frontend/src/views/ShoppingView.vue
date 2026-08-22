@@ -6,11 +6,21 @@ import { api, apiErrorMessage } from '../api'
 import AsyncState from '../components/AsyncState.vue'
 import { useResource } from '../composables/useResource'
 import { useToast } from '../composables/useToast'
+import { useAppStore } from '../stores/app'
 import type { ShoppingImpactResponse, ShoppingItem, ShoppingItemInput, ShoppingSubstitutionAction, ShoppingSubstitutionResponse } from '../types'
 
-const { data, loading, error, load } = useResource(api.shopping)
+const SHOPPING_CATEGORIES = ['肉蛋奶', '蔬菜', '主食', '水果', '其他'] as const
+const CATEGORY_ALIASES: Record<string, string> = { '肉类': '肉蛋奶', '蛋类': '肉蛋奶', '乳制品': '肉蛋奶', '奶制品': '肉蛋奶', '调味料': '其他', '调味品': '其他', '日用品': '其他', '未分类': '其他' }
+function displayCategory(category: string | null | undefined): string {
+  const value = category || ''
+  return CATEGORY_ALIASES[value] || (SHOPPING_CATEGORIES.includes(value as typeof SHOPPING_CATEGORIES[number]) ? value : '其他')
+}
+
+const { data, loading, error, load } = useResource(loadShopping)
 const { show: showToast } = useToast()
 const router = useRouter()
+const appStore = useAppStore()
+const hasActivePlan = ref(false)
 const search = ref('')
 const dialogOpen = ref(false)
 const editing = ref<ShoppingItem | null>(null)
@@ -30,7 +40,8 @@ const substItem = ref<ShoppingItem | null>(null)
 const substResult = ref<ShoppingSubstitutionResponse | null>(null)
 const substLoading = ref(false)
 const substError = ref('')
-const form = reactive({ name: '', category: '未分类', quantity: '1', price: 0, source: '手工添加', purchased: false })
+const form = reactive({ name: '', category: '其他', quantity: '1', price: 0, source: '手工添加', purchased: false })
+const creationIntent = ref<'extra_purchase' | 'meal_ingredient'>('extra_purchase')
 const impactOpen = ref(false)
 const impactItem = ref<ShoppingItem | null>(null)
 const impactAction = ref('修改')
@@ -48,25 +59,28 @@ const progress = computed(() => data.value?.length ? purchasedCount.value / data
 /* ───────── 品类筛选 chips ───────── */
 const filterKey = ref('全部')
 const filterKeys = computed<string[]>(() => {
-  const keys = new Set<string>()
-  for (const item of data.value || []) keys.add(item.category || '未分类')
-  return ['全部', ...[...keys].sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'))]
+  return ['全部', ...SHOPPING_CATEGORIES]
 })
 watch(filterKey, () => { search.value = '' })
 
 const filtered = computed(() => (data.value || [])
   .filter(item => item.name.includes(search.value.trim()))
-  .filter(item => filterKey.value === '全部' || (item.category || '未分类') === filterKey.value))
+  .filter(item => filterKey.value === '全部' || displayCategory(item.category) === filterKey.value))
 
 function openCreate() {
+  if (!hasActivePlan.value) {
+    void router.push('/planner?mode=generate')
+    return
+  }
   editing.value = null
-  Object.assign(form, { name: '', category: '未分类', quantity: '1', price: 0, source: '手工添加', purchased: false })
+  creationIntent.value = 'extra_purchase'
+  Object.assign(form, { name: '', category: '其他', quantity: '1', price: 0, source: '手工添加', purchased: false })
   actionError.value = ''; dialogOpen.value = true
 }
 function openEdit(item: ShoppingItem) {
-  editing.value = item; Object.assign(form, item); actionError.value = ''; dialogOpen.value = true
+  editing.value = item; Object.assign(form, { ...item, category: displayCategory(item.category) }); actionError.value = ''; dialogOpen.value = true
 }
-function payload(): ShoppingItemInput { return { name: form.name.trim(), category: form.category.trim(), quantity: form.quantity.trim(), price: form.price, source: form.source.trim(), purchased: form.purchased } }
+function payload(): ShoppingItemInput { return { name: form.name.trim(), category: displayCategory(form.category), quantity: form.quantity.trim(), price: form.price, source: form.source.trim(), purchased: form.purchased } }
 async function inspectImpact(item: ShoppingItem, action: string, desired: ShoppingItemInput | null = null): Promise<boolean> {
   try {
     const result = await api.shoppingImpact(item.id)
@@ -110,6 +124,16 @@ async function save() {
       const structuralChange = changes.name !== editing.value.name || changes.quantity !== editing.value.quantity
       if (structuralChange && await inspectImpact(editing.value, '修改', changes)) return
       await api.updateShoppingItem(editing.value.id, changes)
+    } else if (creationIntent.value === 'meal_ingredient') {
+      dialogOpen.value = false
+      await router.push({
+        path: '/planner',
+        query: {
+          mode: 'revise',
+          prompt: `将“${form.name.trim()}”（${form.quantity.trim()}，预计 ¥${form.price}）加入本周食谱；请先生成包含受影响餐食、采购清单和预算的预览，确认后再创建新版本。`,
+        },
+      })
+      return
     } else await api.createShoppingItem(payload())
     showToast(editing.value ? '购物条目已更新' : '购物条目已添加', 'success')
     await load(); dialogOpen.value = false
@@ -227,8 +251,11 @@ function nutritionLabel(key: string): string {
 
 // ── 行操作：checkbox + ⋯ 溢出菜单 ──
 const menuItemId = ref<number | null>(null)
-function toggleItemMenu(id: number) { menuItemId.value = menuItemId.value === id ? null : id }
-function closeItemMenu() { menuItemId.value = null }
+function toggleItemMenu(id: number) {
+  menuItemId.value = menuItemId.value === id ? null : id
+  appStore.setAssistantSuppressed(menuItemId.value !== null)
+}
+function closeItemMenu() { menuItemId.value = null; appStore.setAssistantSuppressed(false) }
 function menuTogglePurchased(item: ShoppingItem) { closeItemMenu(); togglePurchased(item) }
 function menuOpenEdit(item: ShoppingItem) { closeItemMenu(); openEdit(item) }
 function menuOpenSubstitutions(item: ShoppingItem) { closeItemMenu(); openSubstitutions(item) }
@@ -237,9 +264,20 @@ function menuResolve(item: ShoppingItem, action: ShoppingSubstitutionAction) { c
 
 /* ── 页级  溢出菜单：智能合并 / 复制清单 / 导出 ── */
 const pageMenuOpen = ref(false)
-function pageMerge() { pageMenuOpen.value = false; mergeItems() }
-function pageCopy() { pageMenuOpen.value = false; copyList() }
-function pageExport() { pageMenuOpen.value = false; exportList() }
+function togglePageMenu() {
+  pageMenuOpen.value = !pageMenuOpen.value
+  appStore.setAssistantSuppressed(pageMenuOpen.value)
+}
+function pageMerge() { pageMenuOpen.value = false; appStore.setAssistantSuppressed(false); if (hasActivePlan.value) mergeItems() }
+function pageCopy() { pageMenuOpen.value = false; appStore.setAssistantSuppressed(false); copyList() }
+function pageExport() { pageMenuOpen.value = false; appStore.setAssistantSuppressed(false); exportList() }
+
+// 购物清单是当前周计划的派生数据，没有计划时统一回到生成入口。
+async function loadShopping() {
+  const overview = await api.activePlanOverview()
+  hasActivePlan.value = !!overview.plan
+  return hasActivePlan.value ? api.shopping() : []
+}
 
 /* 复制清单：平铺文本 */
 async function copyList() {
@@ -283,14 +321,14 @@ function exportList() {
         <div class="shop2-hero-head">
           <h2>购物清单</h2>
           <div class="shop2-hero-actions">
-            <button class="button primary" @click="openCreate"><Plus :size="16" />添加商品</button>
+            <button class="button primary" :disabled="!hasActivePlan" @click="openCreate"><Plus :size="16" />添加商品</button>
             <div class="shopping-more shop2-page-more">
-              <button class="icon-button" aria-label="更多操作" aria-haspopup="menu" :aria-expanded="pageMenuOpen" @click="pageMenuOpen = !pageMenuOpen"><MoreHorizontal :size="18" /></button>
+              <button class="icon-button" aria-label="更多操作" aria-haspopup="menu" :aria-expanded="pageMenuOpen" @click="togglePageMenu"><MoreHorizontal :size="18" /></button>
               <Transition name="dropdown">
                 <div v-if="pageMenuOpen" class="more-menu" role="menu">
-                  <button role="menuitem" :disabled="merging" @click="pageMerge"><Merge :size="15" />{{ merging ? '合并中…' : '智能合并重复项' }}</button>
-                  <button role="menuitem" @click="pageCopy"><Copy :size="15" />复制清单</button>
-                  <button role="menuitem" @click="pageExport"><Download :size="15" />导出 CSV</button>
+                  <button role="menuitem" :disabled="merging || !hasActivePlan" @click="pageMerge"><Merge :size="15" />{{ merging ? '合并中…' : '智能合并重复项' }}</button>
+                  <button role="menuitem" :disabled="!hasActivePlan" @click="pageCopy"><Copy :size="15" />复制清单</button>
+                  <button role="menuitem" :disabled="!hasActivePlan" @click="pageExport"><Download :size="15" />导出 CSV</button>
                 </div>
               </Transition>
             </div>
@@ -314,14 +352,14 @@ function exportList() {
             @click="filterKey = key"
           >{{ key }}</button>
         </div>
-        <label class="search-field"><Search :size="15" /><input v-model="search" placeholder="搜索物品" /></label>
+        <label class="search-field" :class="{ disabled: !hasActivePlan }"><Search :size="15" /><input v-model="search" :disabled="!hasActivePlan" placeholder="搜索物品" /></label>
       </div>
 
       <!-- ══ 平铺列表 ══ -->
       <template v-if="filtered.length">
         <div class="shop2-flat-list">
           <div
-            v-for="item in filtered"
+            v-for="(item, index) in filtered"
             :key="item.id"
             class="shopping-item"
             :class="{ checked: item.purchased, substituted: isPendingSubstitution(item) }"
@@ -332,15 +370,16 @@ function exportList() {
             <span class="shopping-name">
               <strong>
                 {{ item.name }}
+                <em v-if="item.origin === 'extra_purchase'" class="origin-flag">仅采购</em>
                 <em v-if="isPendingSubstitution(item)" class="subst-flag pending">已替换</em>
                 <em v-else-if="item.substituted_accepted" class="subst-flag accepted">已确认</em>
               </strong>
               <small v-if="isPendingSubstitution(item)" class="subst-origin">原：{{ item.substituted_from }} · 待确认</small>
-              <small v-else>{{ item.quantity }}</small>
+              <small v-else>{{ displayCategory(item.category) }} · {{ item.quantity }}</small>
             </span>
             <b>¥{{ item.price }}</b>
             <span class="shopping-actions">
-              <div class="shopping-more">
+              <div class="shopping-more" :class="{ 'opens-up': index >= filtered.length - 2 }">
                 <button class="icon-button more-button" :aria-label="item.name + ' 更多操作'" aria-haspopup="menu" :aria-expanded="menuItemId === item.id" @click="toggleItemMenu(item.id)"><MoreHorizontal :size="16" /></button>
                 <Transition name="dropdown">
                   <div v-if="menuItemId === item.id" class="more-menu" role="menu">
@@ -353,7 +392,7 @@ function exportList() {
                       <button v-if="!item.purchased" role="menuitem" @click="menuTogglePurchased(item)"><Check :size="15" />标记已购</button>
                       <button v-else role="menuitem" @click="menuTogglePurchased(item)"><Undo2 :size="15" />标记未购</button>
                       <button role="menuitem" @click="menuOpenSubstitutions(item)"><Sparkles :size="15" />查找替换品</button>
-                      <button role="menuitem" @click="menuOpenEdit(item)"><Pencil :size="15" />修改数量</button>
+                      <button role="menuitem" @click="menuOpenEdit(item)"><Pencil :size="15" />编辑条目</button>
                       <button class="danger-item" role="menuitem" @click="menuRemove(item)"><Trash2 :size="15" />移除…</button>
                     </template>
                   </div>
@@ -365,8 +404,9 @@ function exportList() {
       </template>
       <div v-else class="state-box">
         <strong>{{ search || filterKey !== '全部' ? '没有匹配的物品' : '购物清单为空' }}</strong>
-        <p>{{ search || filterKey !== '全部' ? '调整筛选或搜索条件后重试。' : '添加第一项采购物品，勾选状态会保存到个人清单。' }}</p>
-        <button v-if="!search && filterKey === '全部'" class="button primary" @click="openCreate"><Plus :size="16" />添加商品</button>
+        <p>{{ !hasActivePlan ? '先生成并确认周计划，系统才会为本周建立购物清单。' : search || filterKey !== '全部' ? '调整筛选或搜索条件后重试。' : '添加第一项采购物品，勾选状态会保存到个人清单。' }}</p>
+        <button v-if="!hasActivePlan" class="button primary" @click="router.push('/planner?mode=generate')"><Sparkles :size="16" />去生成周计划</button>
+        <button v-else-if="!search && filterKey === '全部'" class="button primary" @click="openCreate"><Plus :size="16" />添加商品</button>
       </div>
 
       <div v-if="conversionNotes.length" class="conversion-notes"><h4>单位换算明细</h4><ul><li v-for="(note, idx) in conversionNotes" :key="idx"><strong>{{ note.name }}</strong>：{{ note.original }} → {{ note.converted }}</li></ul></div>
@@ -374,13 +414,13 @@ function exportList() {
     </div>
   </AsyncState>
 
-  <div v-if="dialogOpen" class="dialog-backdrop" @click.self="dialogOpen = false"><section class="member-dialog" role="dialog" aria-modal="true" aria-label="购物条目编辑"><header><div><h2>{{ editing ? '编辑购物条目' : '添加购物条目' }}</h2><p>维护分类、数量、估价和来源。</p></div><button class="icon-button" aria-label="关闭" @click="dialogOpen = false"><X :size="18" /></button></header><form @submit.prevent="save"><div class="member-form-grid"><label><span>物品名称</span><input v-model="form.name" maxlength="120" required /></label><label><span>分类</span><input v-model="form.category" maxlength="40" required /></label><label><span>数量</span><input v-model="form.quantity" maxlength="40" required placeholder="如：500 克 / 2 斤 / 3 个" /></label><label><span>估价</span><input v-model.number="form.price" type="number" min="0" step="0.01" required /></label><label class="wide"><span>来源</span><input v-model="form.source" maxlength="100" placeholder="周一晚餐 / 手工添加" /></label><label class="wide check-field"><input v-model="form.purchased" type="checkbox" /><span>已购买</span></label></div><p v-if="actionError" class="knowledge-error" aria-live="polite">{{ actionError }}</p><footer><span class="dialog-spacer" /><button type="button" class="button secondary" @click="dialogOpen = false">取消</button><button class="button primary" :disabled="submitting || !form.name.trim()">{{ submitting ? '保存中' : '保存物品' }}</button></footer></form></section></div>
+  <div v-if="dialogOpen" class="dialog-backdrop" @click.self="dialogOpen = false"><section class="member-dialog" role="dialog" aria-modal="true" aria-label="购物条目编辑"><header><div><h2>{{ editing ? '编辑购物条目' : '添加购物条目' }}</h2><p>{{ editing ? '更新采购信息；餐食食材的结构调整会先进入计划预览。' : '选择用途后再填写条目，预算会立即按采购清单更新。' }}</p></div><button class="icon-button" aria-label="关闭" @click="dialogOpen = false"><X :size="18" /></button></header><form @submit.prevent="save"><fieldset v-if="!editing" class="purchase-intent"><legend>添加到哪里</legend><label :class="{ selected: creationIntent === 'extra_purchase' }"><input v-model="creationIntent" type="radio" value="extra_purchase" /><span><strong>仅加入采购清单</strong><small>如纸巾、垃圾袋或额外食材；不改餐食。</small></span></label><label :class="{ selected: creationIntent === 'meal_ingredient' }"><input v-model="creationIntent" type="radio" value="meal_ingredient" /><span><strong>加入本周食谱</strong><small>先生成计划预览，确认后才创建新版本。</small></span></label></fieldset><div class="member-form-grid"><label><span>物品名称</span><input v-model="form.name" maxlength="120" required /></label><label><span>分类</span><select v-model="form.category" required><option v-for="category in SHOPPING_CATEGORIES" :key="category" :value="category">{{ category }}</option></select></label><label><span>数量</span><input v-model="form.quantity" maxlength="40" required placeholder="如：500 克 / 2 斤 / 3 个" /></label><label><span>估价</span><input v-model.number="form.price" type="number" min="0" step="0.01" required /></label><label class="wide"><span>来源</span><input v-model="form.source" maxlength="100" placeholder="周一晚餐 / 手工添加" /></label><label class="wide check-field"><input v-model="form.purchased" type="checkbox" /><span>已购买</span></label></div><p v-if="actionError" class="knowledge-error" aria-live="polite">{{ actionError }}</p><footer><span class="dialog-spacer" /><button type="button" class="button secondary" @click="dialogOpen = false">取消</button><button class="button primary" :disabled="submitting || !form.name.trim()">{{ submitting ? '处理中' : editing ? '保存物品' : creationIntent === 'meal_ingredient' ? '生成计划预览' : '加入采购清单' }}</button></footer></form></section></div>
 
   <div v-if="verifyOpen" class="dialog-backdrop" @click.self="verifyOpen = false"><section class="member-dialog" role="dialog" aria-modal="true" aria-label="采购核销"><header><div><h2>采购核销 · {{ verifyItem?.name }}</h2><p>实付金额与备注会回流为执行反馈，让预算智能体下一轮更准。</p></div><button class="icon-button" aria-label="关闭" @click="verifyOpen = false"><X :size="18" /></button></header><form @submit.prevent="confirmVerify"><div class="member-form-grid"><label><span>预估金额</span><input :value="verifyItem ? verifyItem.price : 0" type="number" step="0.01" min="0" disabled /></label><label><span>实付金额</span><input v-model.number="actualPrice" type="number" step="0.01" min="0" required /></label><label class="wide"><span>核销备注（可选）</span><input v-model="verifyNote" maxlength="500" placeholder="例如：促销价、缺货换了品牌" /></label></div><p v-if="actionError" class="knowledge-error" aria-live="polite">{{ actionError }}</p><footer><span class="dialog-spacer" /><button type="button" class="button secondary" @click="verifyOpen = false">取消</button><button class="button primary" :disabled="submitting">{{ submitting ? '核销中' : '确认核销' }}</button></footer></form></section></div>
 
   <div v-if="removeConfirmOpen && removeTarget" class="dialog-backdrop" @click.self="closeRemoveConfirm"><section class="member-dialog remove-confirm-dialog" role="dialog" aria-modal="true" aria-label="移除购物条目"><header><div><h2>移除购物条目</h2><p>确认后将从当前周计划的采购清单中移除该物品。</p></div><button class="icon-button" aria-label="关闭" @click="closeRemoveConfirm"><X :size="18" /></button></header><div class="remove-confirm-body"><strong>{{ removeTarget.name }}</strong><span>{{ removeTarget.category }} · {{ removeTarget.quantity }} · ¥{{ removeTarget.price }}</span><p>如果该食材被当前餐食使用，系统会先提示受影响的餐食，不会直接破坏计划。</p></div><footer><button type="button" class="button secondary" @click="closeRemoveConfirm">取消</button><button type="button" class="button danger" :disabled="submitting" @click="confirmRemove">{{ submitting ? '处理中…' : '确认移除' }}</button></footer></section></div>
 
-  <div v-if="impactOpen && impactResult" class="dialog-backdrop" @click.self="closeImpact"><section class="member-dialog impact-dialog" role="dialog" aria-modal="true" aria-label="计划影响提示"><header><div><h2>这项修改会影响餐食</h2><p>{{ impactResult.message }}</p></div><button class="icon-button" aria-label="关闭" @click="closeImpact"><X :size="18" /></button></header><div class="impact-body"><p>当前操作：{{ impactAction }}“{{ impactItem?.name }}”。请先通过调整计划生成替代方案，确认前不会修改现有计划。</p><ul><li v-for="meal in impactResult.affected_meals" :key="meal.id"><strong>{{ meal.day }} {{ meal.meal_type }}</strong><span>{{ meal.name }}</span></li></ul></div><footer><button type="button" class="button secondary" @click="closeImpact">取消</button><button type="button" class="button primary" @click="goToRevision">进入调整计划</button></footer></section></div>
+  <div v-if="impactOpen && impactResult" class="dialog-backdrop" @click.self="closeImpact"><section class="member-dialog impact-dialog" role="dialog" aria-modal="true" aria-label="计划影响提示"><header><div><h2>此操作会更新本周计划</h2><p>{{ impactResult.message }}</p></div><button class="icon-button" aria-label="关闭" @click="closeImpact"><X :size="18" /></button></header><div class="impact-body"><p>当前操作：{{ impactAction }}“{{ impactItem?.name }}”。请先通过调整计划生成新版本；原计划会保留，确认前不会改动当前餐食。</p><ul><li v-for="meal in impactResult.affected_meals" :key="meal.id"><strong>{{ meal.day }} {{ meal.meal_type }}</strong><span>{{ meal.name }}</span></li></ul></div><footer><button type="button" class="button secondary" @click="closeImpact">取消</button><button type="button" class="button primary" @click="goToRevision">调整本周计划</button></footer></section></div>
 
   <!-- G08 购物替代图谱化：图谱显式关系 + 营养相似度兜底 -->
   <div v-if="substOpen" class="dialog-backdrop" @click.self="substOpen = false"><section class="member-dialog subst-dialog" role="dialog" aria-modal="true" aria-label="购物替代建议"><header><div><h2>替代建议 · {{ substItem?.name }}</h2><p>图谱显式关系优先，营养相似度兜底。</p></div><button class="icon-button" aria-label="关闭" @click="substOpen = false"><X :size="18" /></button></header><div class="subst-body">
@@ -421,6 +461,14 @@ function exportList() {
 .impact-body li { display: flex; align-items: baseline; gap: 10px; padding: 8px 10px; border-left: 3px solid var(--orange); background: #fff8f1; font-size: var(--font-sm); }
 .impact-body li strong { min-width: 86px; color: var(--text); }
 .impact-body li span { color: var(--muted); }
+.purchase-intent { display: grid; gap: 8px; margin: 0 0 16px; padding: 0; border: 0; }
+.purchase-intent legend { margin-bottom: 8px; font-size: var(--font-sm); font-weight: 700; color: var(--text); }
+.purchase-intent label { display: grid; grid-template-columns: 20px minmax(0, 1fr); gap: 9px; align-items: start; padding: 10px 12px; border: 1px solid var(--line); border-radius: 6px; cursor: pointer; }
+.purchase-intent label.selected { border-color: var(--primary); background: var(--primary-light); }
+.purchase-intent input { width: 18px; height: 18px; margin: 1px 0 0; accent-color: var(--primary); }
+.purchase-intent strong, .purchase-intent small { display: block; }
+.purchase-intent strong { font-size: var(--font-sm); color: var(--text); }
+.purchase-intent small { margin-top: 3px; font-size: var(--font-xs); line-height: 1.5; color: var(--muted); }
 .shop2-hero-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
 .shop2-hero-head h2 {
   font-size: var(--font-xl); margin: 0; color: var(--text);
@@ -473,7 +521,7 @@ function exportList() {
   background: var(--surface);
   border: 1px solid var(--line);
   border-radius: var(--radius-md);
-  overflow: hidden;
+  overflow: visible;
 }
 .shopping-item {
   display: flex; align-items: center; gap: 12px;
@@ -482,6 +530,8 @@ function exportList() {
   transition: background var(--transition-base);
 }
 .shopping-item:last-child { border-bottom: 0; }
+.shopping-item:first-child { border-radius: var(--radius-md) var(--radius-md) 0 0; }
+.shopping-item:last-child { border-radius: 0 0 var(--radius-md) var(--radius-md); }
 .shopping-item:hover { background: #f7f9f8; }
 .shopping-item.checked { background: #f0f7f4; }
 .shopping-item.checked .shopping-name strong { color: #8a958f; text-decoration: line-through; }
@@ -510,7 +560,8 @@ function exportList() {
 .shopping-more { position: relative; }
 .shopping-actions .more-button { width: 30px; height: 30px; color: #5a6c63; }
 .shopping-actions .more-button:hover { border-color: #b7c6c0; color: var(--primary); }
-.more-menu { position: absolute; right: 0; top: calc(100% + 6px); z-index: 40; min-width: 176px; padding: 6px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-md); box-shadow: var(--shadow-lg); display: grid; gap: 2px; }
+.more-menu { position: absolute; right: 0; top: calc(100% + 6px); z-index: 60; min-width: 176px; padding: 6px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-md); box-shadow: var(--shadow-lg); display: grid; gap: 2px; }
+.shopping-more.opens-up .more-menu { top: auto; bottom: calc(100% + 6px); transform-origin: bottom right; }
 .more-menu button { display: flex; align-items: center; gap: 10px; width: 100%; padding: 9px 10px; border: 0; background: transparent; border-radius: 6px; font-size: var(--font-sm); font-weight: 600; color: var(--text); text-align: left; cursor: pointer; }
 .more-menu button:hover { background: #f1f5f2; color: var(--primary); }
 .more-menu button:disabled { opacity: .5; cursor: not-allowed; }
@@ -518,9 +569,12 @@ function exportList() {
 .more-menu button.danger-item:hover { background: #fdf1ec; color: var(--red); }
 .dropdown-enter-active, .dropdown-leave-active { transition: opacity var(--transition-fast), transform var(--transition-fast); transform-origin: top right; }
 .dropdown-enter-from, .dropdown-leave-to { opacity: 0; transform: translateY(-4px) scale(.98); }
+.shopping-more.opens-up .dropdown-enter-from,
+.shopping-more.opens-up .dropdown-leave-to { transform: translateY(4px) scale(.98); }
 
 /* 替换徽标 */
 .subst-flag { font-style: normal; font-size: 9px; font-weight: 600; line-height: 1; padding: 3px 6px; border-radius: 10px; white-space: nowrap; }
+.origin-flag { font-style: normal; font-size: 10px; font-weight: 600; line-height: 1; padding: 3px 6px; border-radius: 4px; white-space: nowrap; background: #edf1f6; color: #53657a; }
 .subst-flag.pending { background: #fef3e8; color: #d97757; }
 .subst-flag.accepted { background: var(--primary-light, #e8f2ed); color: var(--primary, #2F7D68); }
 .subst-origin { color: #d97757; }

@@ -112,7 +112,12 @@ def _try_bge_m3(settings: Settings) -> EmbeddingBackend | None:
             local_files_only=True,
         )
     except Exception as exc:
-        logger.warning("BGE-M3 模型加载失败 ({}): {}", model_ref, type(exc).__name__)
+        logger.warning(
+            "BGE-M3 模型加载失败 ({}): {} - {}",
+            model_ref,
+            type(exc).__name__,
+            str(exc)[:300],
+        )
         return None
     return EmbeddingBackend(
         function=cast(Any, SentenceTransformerEmbedding(cast(SupportsEncode, model))),

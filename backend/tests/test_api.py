@@ -161,10 +161,14 @@ def test_generate_weekly_plan_and_trace_are_user_scoped(
     assert payload["budget"]["estimated"] <= 500
     trace = client.get(f"/api/v1/agents/runs/{payload['run_id']}", headers=auth_headers)
     assert trace.status_code == 200
-    assert len(trace.json()["steps"]) == 11
+    assert len(trace.json()["steps"]) == 6
     assert any(step["name"] == "meal_agent" for step in trace.json()["steps"])
-    assert any(step["name"] == "domain_coordinator" for step in trace.json()["steps"])
+    assert any(step["name"] == "planner" for step in trace.json()["steps"])
     assert payload["domain"]["meal"]["strategy"]
+
+    retry = client.post(f"/api/v1/agents/runs/{payload['run_id']}/retry", headers=auth_headers)
+    assert retry.status_code == 409
+    assert "重新生成" in retry.json()["detail"]
 
     other_headers = _register_second_user(client, phone="13800000011", display_name="追踪隔离用户")
     cross_user_trace = client.get(
@@ -527,6 +531,7 @@ def test_domain_crud_is_persisted_and_user_scoped(
     )
     assert shopping.status_code == 201
     shopping_id = shopping.json()["id"]
+    assert shopping.json()["origin"] == "extra_purchase"
     checked = client.patch(
         f"/api/v1/shopping/{shopping_id}", headers=headers, json={"purchased": True}
     )
@@ -534,12 +539,12 @@ def test_domain_crud_is_persisted_and_user_scoped(
     assert checked.json()["purchased"] is True
     impact = client.get(f"/api/v1/shopping/{shopping_id}/impact", headers=headers)
     assert impact.status_code == 200
-    assert impact.json()["has_impact"] is True
-    assert impact.json()["affected_meals"][0]["name"] == "番茄鸡蛋面"
+    assert impact.json()["has_impact"] is False
     structural_update = client.patch(
         f"/api/v1/shopping/{shopping_id}", headers=headers, json={"quantity": "6 个"}
     )
-    assert structural_update.status_code == 409
+    assert structural_update.status_code == 200
+    assert structural_update.json()["quantity"] == "6 个"
     safe_price_update = client.patch(
         f"/api/v1/shopping/{shopping_id}", headers=headers, json={"price": 10}
     )
@@ -574,6 +579,28 @@ def test_domain_operations_close_the_household_loop(
     )
     assert replaced.status_code == 200
     assert "花生" not in replaced.json()["meal"]["ingredients"]
+
+    meal_ingredient = next(
+        item
+        for item in client.get("/api/v1/shopping", headers=auth_headers).json()
+        if item["origin"] == "meal_ingredient"
+    )
+    structural_update = client.patch(
+        f"/api/v1/shopping/{meal_ingredient['id']}",
+        headers=auth_headers,
+        json={"quantity": "2 份"},
+    )
+    assert structural_update.status_code == 409
+    structural_delete = client.delete(
+        f"/api/v1/shopping/{meal_ingredient['id']}", headers=auth_headers
+    )
+    assert structural_delete.status_code == 409
+    safe_price_update = client.patch(
+        f"/api/v1/shopping/{meal_ingredient['id']}",
+        headers=auth_headers,
+        json={"price": 10},
+    )
+    assert safe_price_update.status_code == 200
 
     duplicate = client.post(
         "/api/v1/shopping",

@@ -134,7 +134,7 @@ Recipe -[:HAS_TAG]-> Tag
 Feedback -[:ABOUT]-> Recipe
 ```
 
-Chroma 存储语义知识：
+Milvus 存储语义知识：
 
 - 菜谱 chunk
 - 食材营养 chunk
@@ -164,7 +164,7 @@ Chroma 存储语义知识：
 - 餐后记录喜欢/不喜欢、是否吃完、替换原因。
 - 购物后记录实际花费和未买到食材。
 - 汇总每日/每周热量、蛋白质、预算达标率。
-- 将反馈回流到偏好画像、Neo4j 和 Chroma。
+- 将反馈回流到偏好画像、Neo4j 和 Milvus。
 
 验收标准：
 
@@ -188,7 +188,7 @@ P0 必做：
 - 购物清单生成与核销
 - 食材替换与营养重算
 - 执行反馈与偏好学习
-- Chroma 菜谱/营养知识库
+- Milvus 菜谱/营养知识库
 - Neo4j 饮食关系图谱
 - LangGraph 多智能体规划流
 
@@ -259,7 +259,7 @@ services        # 业务编排
 ai              # LangGraph / Agent / RAG / Prompt
 worker          # Celery 异步任务
 core            # 配置、安全、日志
-db              # MySQL / Redis / Neo4j / Chroma 连接
+db              # MySQL / Redis / Neo4j / Milvus 连接
 ```
 
 ### 6.3 数据库与中间件
@@ -268,7 +268,7 @@ db              # MySQL / Redis / Neo4j / Chroma 连接
 |---|---|---|
 | MySQL 8 | 用户、画像、营养目标、计划、购物、反馈、Agent run | 主业务库，当前配置和 Docker Compose 已指向 MySQL |
 | Neo4j 5 Community | 用户偏好、食材、菜谱、营养、替代关系 | Graph RAG 核心 |
-| Chroma | 菜谱、营养知识、计划摘要、反馈摘要向量检索 | RAG 语义检索 |
+| Milvus | 菜谱、营养知识、计划摘要、反馈摘要向量检索 | RAG 语义检索 |
 | Redis | 缓存、Celery broker、运行状态 | 基础设施 |
 
 数据库选型结论：
@@ -345,7 +345,7 @@ POST /api/knowledge/rebuild-index
 已对齐：
 
 - 项目配置默认 `SoloChef API`。
-- `docker-compose.yml` 使用 MySQL、Redis、Neo4j、Chroma。
+- `docker-compose.yml` 使用 MySQL、Redis、Neo4j、Milvus。
 - Alembic 初始迁移命名为 `0001_initial_solochef`。
 - 部分 SQLAlchemy 模型已使用 `user_id`，并新增 `UserProfile`、`NutritionGoal`。
 

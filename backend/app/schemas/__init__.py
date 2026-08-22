@@ -92,6 +92,7 @@ from app.schemas.domain import (
     Recipe,
     RecipeInput,
     RecipeUpdate,
+    ResearchResult,
     RetrievalDiagnostics,
     ShoppingAgentResult,
     ShoppingItem,
@@ -148,7 +149,6 @@ from app.schemas.intent import (
     IntentHandoff,
     IntentHandoffKind,
     IntentOperation,
-    IntentRequest,
     IntentRoute,
 )
 
@@ -216,7 +216,6 @@ __all__ = [
     "IntentHandoff",
     "IntentHandoffKind",
     "IntentOperation",
-    "IntentRequest",
     "IntentRoute",
     "GraphSearchHit",
     "TaskItem",
@@ -255,6 +254,7 @@ __all__ = [
     "Recipe",
     "RecipeInput",
     "RecipeUpdate",
+    "ResearchResult",
     "RefreshRequest",
     "RegisterRequest",
     "ResetPasswordRequest",

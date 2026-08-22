@@ -98,6 +98,10 @@ class UserProfile(TimestampMixin, Base):
     )
     kitchenware: Mapped[list[str]] = mapped_column(JSON, default=list)
     prep_time_max: Mapped[int] = mapped_column(Integer, default=60, server_default="60")
+    # 建档状态与营养目标解耦：用户完成必填档案后置为 True。
+    profile_completed: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false(), nullable=False
+    )
 
     user: Mapped[User] = relationship(back_populates="profile")
 
@@ -251,10 +255,14 @@ class PlanShoppingItem(TimestampMixin, Base):
         ForeignKey("weekly_plans.id", ondelete="CASCADE"), index=True
     )
     name: Mapped[str] = mapped_column(String(120))
-    category: Mapped[str] = mapped_column(String(40), default="未分类", server_default="未分类")
+    category: Mapped[str] = mapped_column(String(40), default="其他", server_default="其他")
     quantity: Mapped[str] = mapped_column(String(40), default="1", server_default="1")
     price: Mapped[float] = mapped_column(default=0, server_default="0")
     source: Mapped[str] = mapped_column(String(100), default="", server_default="")
+    # meal_ingredient 由计划生成或计划修订产生；extra_purchase 只影响采购与预算。
+    origin: Mapped[str] = mapped_column(
+        String(24), default="meal_ingredient", server_default="meal_ingredient", index=True
+    )
     purchased: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
     # Phase 3 任务B：食材替换确认闭环
     # substituted_from 记录被替换前的原食材名；substituted_accepted 记录用户是否

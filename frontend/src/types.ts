@@ -9,8 +9,9 @@ export type MealItemInput = Omit<MealItem, 'id' | 'eaten' | 'eaten_at' | 'deviat
 export type MealDeviationType = 'not_available' | 'no_appetite' | 'ate_other'
 export interface TodayNutrient { target: number; consumed: number; remaining: number; percent: number }
 export interface TodayNutritionResponse { day: string; meal_count: number; eaten_count: number; nutrients: Record<string, TodayNutrient>; overall_percent: number }
-export interface ShoppingItem { id: number; name: string; category: string; quantity: string; price: number; source: string; purchased: boolean; actual_price?: number | null; verification_note?: string | null; substituted_from?: string | null; substituted_accepted?: boolean | null }
-export type ShoppingItemInput = Omit<ShoppingItem, 'id' | 'substituted_from' | 'substituted_accepted'>
+export type ShoppingOrigin = 'meal_ingredient' | 'extra_purchase'
+export interface ShoppingItem { id: number; name: string; category: string; quantity: string; price: number; source: string; origin: ShoppingOrigin; purchased: boolean; actual_price?: number | null; verification_note?: string | null; substituted_from?: string | null; substituted_accepted?: boolean | null }
+export type ShoppingItemInput = Omit<ShoppingItem, 'id' | 'origin' | 'substituted_from' | 'substituted_accepted'>
 export interface ShoppingImpactMeal { id: number; day: string; meal_type: string; name: string }
 export interface ShoppingImpactResponse { item_id: number; item_name: string; has_impact: boolean; affected_meals: ShoppingImpactMeal[]; message: string }
 export interface SubstitutionSuggestion { name: string; reason: string; similarity: number; source: 'graph' | 'nutrition'; nutrition?: Record<string, number> | null }
@@ -27,7 +28,8 @@ export interface SyncConsistencyResponse { vector_status: string; neo4j_status: 
 export interface RagEvalResult { query: string; recall_at_k: number; ndcg_at_k: number; hit_document_names: string[]; hit_entity_kinds: string[] }
 export interface RagEvalResponse { evaluated_at: string; embedding: string; reranker: string; top_k: number; case_count: number; mean_recall_at_k: number; mean_ndcg_at_k: number; results: RagEvalResult[]; notes: string[] }
 export interface LLMSmokeResponse { status: string; provider: string; model: string; latency_ms: number; message: string }
-export interface AgentStep { name: string; label: string; status: AgentStatus; duration_ms: number; summary: string; output: Record<string, unknown> }
+export interface AgentToolTrace { name: string; status: 'completed' | 'failed' | 'timeout'; iteration?: number }
+export interface AgentStep { name: string; label: string; status: AgentStatus; duration_ms: number; summary: string; output: Record<string, unknown>; tool_calls?: AgentToolTrace[]; tool_call_count?: number }
 export interface AgentRun { id: string; request: string; status: AgentStatus; started_at: string; finished_at: string | null; duration_ms: number; steps: AgentStep[]; error_message: string; error_type: string; failed_step: string; checkpoint?: Record<string, unknown> }
 export interface BudgetSummary { limit: number; estimated: number; saved: number; usage_percent: number; categories: Record<string, number> }
 export interface MealAgentResult { strategy: string; constraints_applied: string[]; excluded_ingredients: string[]; preferred_tags: string[]; max_duration_minutes: number }
@@ -67,7 +69,8 @@ export interface BackgroundJob { id: string; kind: string; status: string; resul
 export interface QueueStats { name: string; depth: number; routing_key: string }
 export interface CeleryStatsResponse { broker_connected: boolean; queues: QueueStats[]; status_counts: Record<string, number>; recent_jobs: BackgroundJob[]; dead_letter_count: number; result_expires: number; active_queues: string[] }
 export interface DeadLetterItem { id: string; kind: string; error_message: string; priority: string; created_at: string; finished_at: string | null }
-export type ChatStreamEvent = { event: 'message'; data: ChatMessage } | { event: 'step'; data: AgentStep } | { event: 'thinking'; data: { hint: string } } | { event: 'token'; data: { content: string } } | { event: 'complete'; data: { message: ChatMessage; plan: PlanningResponse | null } } | { event: 'cancelled' | 'error'; data: { message: string } }
+export interface ChatToolEvent { name: string; content?: string }
+export type ChatStreamEvent = { event: 'message'; data: ChatMessage } | { event: 'step'; data: AgentStep } | { event: 'thinking'; data: { hint: string } } | { event: 'tool_call' | 'tool_result'; data: ChatToolEvent } | { event: 'token'; data: { content: string } } | { event: 'complete'; data: { message: ChatMessage; plan: PlanningResponse | null } } | { event: 'cancelled' | 'error'; data: { message: string } }
 export interface PlanTask { id: number; title: string; assignee: string; duration: number; due: string; status: TaskStatus; category: string }
 export interface WeeklyPlanSummary { id: number; status: string; version: number; is_active: boolean; parent_plan_id: number | null; prompt: string; budget: number; summary: string; created_at: string; meal_count: number; task_count: number; shopping_count: number }
 export interface WeekNutrient { target: number; consumed: number; remaining: number; percent: number }
@@ -90,31 +93,7 @@ export interface PromptRegistryResponse { agents: Record<string, PromptVersionIn
 export interface InventoryEntry { id: number; name: string; category: string; quantity: string; quantity_value: number; unit: string; low_stock_threshold: number; note: string; is_low_stock: boolean }
 export type VisionScene = 'auto' | 'ingredient' | 'dish' | 'label' | 'receipt'
 export interface VisionResult { scene: VisionScene; summary: string; items: Record<string, unknown>[]; calories: number | null; raw_text: string }
-export type AssistantIntent = 'weekly_plan' | 'shopping' | 'budget' | 'consultation' | 'plan_revision'
-export type IntentOperation = 'create' | 'regenerate' | 'revise' | 'query'
 export type IntentCapability = 'meal' | 'shopping' | 'budget' | 'retrieval' | 'verifier'
-export type IntentEntryContext = 'assistant' | 'planner_generate' | 'planner_revision'
-export interface IntentHandoff {
-  kind: 'chat' | 'planner' | 'shopping'
-  path: string | null
-  mode: string | null
-  prompt: string | null
-  needs_confirmation: boolean
-  message: string
-}
-export interface IntentDecision {
-  intent: AssistantIntent
-  operation: IntentOperation
-  requires: IntentCapability[]
-  confidence: number
-  constraints: Record<string, unknown>
-  route: string
-  reason: string
-  needs_clarification: boolean
-  entry_context: IntentEntryContext
-  handoff: IntentHandoff | null
-  router_trace: string[]
-}
 export interface InventoryAdjustInput { name: string; category?: string; delta: number; unit?: string; quantity?: string | null; low_stock_threshold?: number | null; note?: string }
 export interface InventoryResponse { items: InventoryEntry[]; count: number; low_stock_count: number }
 export interface ArchivedPlanResponse { id: number; status: string; is_active: boolean; archived_at: string }

@@ -1,5 +1,3 @@
-from fastapi.testclient import TestClient
-
 from app.ai.intent_router import intent_router
 from app.schemas.intent import (
     AssistantIntent,
@@ -83,56 +81,3 @@ def test_ambiguous_request_requires_clarification() -> None:
     assert decision.intent is AssistantIntent.CONSULTATION
     assert decision.needs_clarification is True
     assert decision.confidence < 0.6
-
-
-def test_intent_endpoint_exposes_auditable_route(
-    client: TestClient, auth_headers: dict[str, str]
-) -> None:
-    response = client.post(
-        "/api/v1/assistant/intent",
-        headers=auth_headers,
-        json={"prompt": "只生成购物清单", "has_active_plan": False},
-    )
-
-    assert response.status_code == 200, response.text
-    assert response.json()["intent"] == "shopping"
-    assert response.json()["route"] == "shopping_subgraph"
-    assert response.json()["handoff"]["kind"] == "shopping"
-    assert response.json()["router_trace"] == ["intent", "shopping_subgraph"]
-
-
-def test_consultation_branch_stays_in_chat(
-    client: TestClient, auth_headers: dict[str, str]
-) -> None:
-    response = client.post(
-        "/api/v1/assistant/intent",
-        headers=auth_headers,
-        json={"prompt": "减脂期晚餐应该怎么吃？"},
-    )
-
-    assert response.status_code == 200, response.text
-    body = response.json()
-    assert body["intent"] == "consultation"
-    assert body["handoff"]["kind"] == "chat"
-    assert body["router_trace"] == ["intent", "consultation_subgraph"]
-
-
-def test_explicit_planner_entry_skips_ambiguous_free_text_classification(
-    client: TestClient, auth_headers: dict[str, str]
-) -> None:
-    response = client.post(
-        "/api/v1/assistant/intent",
-        headers=auth_headers,
-        json={
-            "prompt": "按我的最新目标重新安排",
-            "entry_context": "planner_generate",
-        },
-    )
-
-    assert response.status_code == 200, response.text
-    body = response.json()
-    assert body["intent"] == "weekly_plan"
-    assert body["confidence"] == 1.0
-    assert body["entry_context"] == "planner_generate"
-    assert body["handoff"]["mode"] == "generate"
-    assert body["router_trace"] == ["intent", "weekly_plan_subgraph"]

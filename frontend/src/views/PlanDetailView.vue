@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { Archive, ArchiveRestore, ArrowLeft, Check, Clock3, CopyPlus, GitCompare, MoreHorizontal, RotateCcw, X } from 'lucide-vue-next'
+import { Archive, ArchiveRestore, ArrowLeft, Bot, Check, Clock3, CopyPlus, GitCompare, MoreHorizontal, RotateCcw, Wrench, X } from 'lucide-vue-next'
 import { useRoute, useRouter } from 'vue-router'
 import { api, apiErrorMessage } from '../api'
-import type { PlanDiff, ShoppingItem, WeeklyPlanDetail, WeeklyPlanSummary } from '../types'
+import type { AgentRun, AgentToolTrace, PlanDiff, ShoppingItem, WeeklyPlanDetail, WeeklyPlanSummary } from '../types'
 
 const route = useRoute()
 const router = useRouter()
@@ -13,9 +13,19 @@ const loading = ref(true)
 const acting = ref(false)
 const error = ref('')
 const diff = ref<PlanDiff>()
+const agentRun = ref<AgentRun>()
 const planId = computed(() => Number(route.params.id))
 const weekdays = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'] as const
 const mealTypes = ['早餐', '午餐', '晚餐'] as const
+const SHOPPING_CATEGORIES = ['肉蛋奶', '蔬菜', '主食', '水果', '其他'] as const
+const CATEGORY_ALIASES: Record<string, string> = { '肉类': '肉蛋奶', '蛋类': '肉蛋奶', '乳制品': '肉蛋奶', '奶制品': '肉蛋奶', '调味料': '其他', '调味品': '其他', '日用品': '其他', '未分类': '其他' }
+const TRACE_LABELS: Record<string, string> = { retrieval: '信息整理', supervisor: '需求协调', meal_agent: '餐食安排', shopping_agent: '采购清单', budget_agent: '预算核算', planner: '计划生成', verifier: '营养与忌口检查', final_planner: '最终整理' }
+const TOOL_LABELS: Record<string, string> = { web_research: '联网搜索', graph_retrieval: '知识图谱', vector_retrieval: '语义知识库' }
+const traceOpen = ref(false)
+function displayCategory(category: string | null | undefined): string {
+  const value = category || ''
+  return CATEGORY_ALIASES[value] || (SHOPPING_CATEGORIES.includes(value as typeof SHOPPING_CATEGORIES[number]) ? value : '其他')
+}
 
 const mealRows = computed(() => weekdays.map((day) => ({
   day,
@@ -28,13 +38,20 @@ const mealRows = computed(() => weekdays.map((day) => ({
 const shoppingGroups = computed(() => {
   const groups = new Map<string, ShoppingItem[]>()
   for (const item of plan.value?.shopping ?? []) {
-    const category = item.category || '未分类'
+    const category = displayCategory(item.category)
     groups.set(category, [...(groups.get(category) ?? []), item])
   }
-  return [...groups.entries()].map(([category, items]) => ({ category, items }))
+  return [...groups.entries()].sort((a, b) => SHOPPING_CATEGORIES.indexOf(a[0] as typeof SHOPPING_CATEGORIES[number]) - SHOPPING_CATEGORIES.indexOf(b[0] as typeof SHOPPING_CATEGORIES[number])).map(([category, items]) => ({ category, items }))
 })
 
 const purchasedCount = computed(() => plan.value?.shopping.filter((item) => item.purchased).length ?? 0)
+const traceSteps = computed(() => agentRun.value?.steps ?? [])
+function toolCalls(step: AgentRun['steps'][number]): AgentToolTrace[] {
+  const value = step.output.tool_calls
+  return Array.isArray(value) ? value.filter((item): item is AgentToolTrace => (
+    typeof item === 'object' && item !== null && typeof (item as AgentToolTrace).name === 'string'
+  )) : []
+}
 
 // ── 2.5 计划归档（独立于版本回滚） ──
 const archivedPlans = ref<WeeklyPlanSummary[]>([])
@@ -49,6 +66,7 @@ async function load(id = planId.value) {
     const [detail, history] = await Promise.all([api.getPlan(id), api.listPlanVersions(id)])
     plan.value = detail
     versions.value = history
+    agentRun.value = detail.run_id ? await api.agentRun(detail.run_id).catch(() => undefined) : undefined
   } catch (reason) { error.value = apiErrorMessage(reason, '计划加载失败') }
   finally { loading.value = false }
 }
@@ -173,6 +191,19 @@ onMounted(() => load())
           <div><dt>采购进度</dt><dd>{{ purchasedCount }}<small> / {{ plan.shopping.length }} 项</small></dd></div>
         </dl>
       </section>
+      <section v-if="traceSteps.length" class="detail-section agent-trace" aria-label="生成过程">
+        <header class="detail-section-head">
+          <div><span class="eyebrow">PLAN JOURNEY</span><h3>这份计划是这样完成的</h3></div>
+          <button class="trace-toggle" :aria-expanded="traceOpen" @click="traceOpen = !traceOpen">{{ traceOpen ? '收起过程' : '查看过程' }} <span>{{ traceSteps.length }} 个阶段</span></button>
+        </header>
+        <ol v-if="traceOpen">
+          <li v-for="step in traceSteps" :key="`${step.name}-${step.duration_ms}`">
+            <Bot :size="16" aria-hidden="true" /><div><strong>{{ TRACE_LABELS[step.name] || step.label }}</strong><small>{{ step.summary }} · {{ step.duration_ms }}ms</small>
+              <div v-if="toolCalls(step).length" class="trace-tools"><Wrench :size="14" aria-hidden="true" /><span v-for="tool in toolCalls(step)" :key="tool.name">{{ TOOL_LABELS[tool.name] || tool.name }}</span></div>
+            </div><em :class="step.status">{{ step.status === 'completed' ? '已完成' : step.status === 'warning' ? '已用备用方案' : step.status === 'failed' ? '需要处理' : step.status }}</em>
+          </li>
+        </ol>
+      </section>
       <section v-if="diff" class="panel plan-diff">
         <header><div><span class="eyebrow">VERSION DIFF</span><h3>v{{ diff.from_version }} 到 v{{ diff.to_version }}</h3></div><button class="icon-button" aria-label="关闭对比" @click="diff = undefined"><X :size="16" /></button></header>
         <div v-for="(section, name) in diff.sections" :key="name" class="diff-row"><strong>{{ { meals: '餐食', shopping: '采购', tasks: '任务' }[name] }}</strong><span class="status success">新增 {{ section.added.length }}</span><span class="status neutral">修改 {{ section.changed.length }}</span><span class="status warning">移除 {{ section.removed.length }}</span></div>
@@ -246,6 +277,17 @@ onMounted(() => load())
 .detail-section-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 12px; }
 .detail-section-head h3 { margin: 3px 0 0; font-size: var(--font-md); }
 .detail-section-head > span { color: var(--muted); font-size: var(--font-xs); }
+.trace-toggle { display: inline-flex; align-items: center; gap: 8px; min-height: 36px; padding: 0 10px; border: 1px solid var(--line); border-radius: 4px; background: var(--surface); color: var(--primary); font-size: var(--font-xs); cursor: pointer; }
+.trace-toggle span { color: var(--muted); }
+.agent-trace ol { display: grid; gap: 0; margin: 0; padding: 0; list-style: none; border-top: 1px solid var(--line); }
+.agent-trace li { display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; gap: 9px; align-items: start; padding: 11px 0; border-bottom: 1px solid var(--line); color: var(--primary); }
+.agent-trace li > div { min-width: 0; display: grid; gap: 3px; }
+.agent-trace strong { color: var(--text); font-size: var(--font-sm); }
+.agent-trace small { color: var(--muted); font-size: var(--font-xs); line-height: 1.45; }
+.agent-trace em { padding: 2px 6px; border-radius: 4px; background: #edf4f1; color: #356b5d; font-size: 11px; font-style: normal; }
+.agent-trace em.warning { background: #fff4de; color: #946520; }
+.trace-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; margin-top: 3px; color: #64756c; }
+.trace-tools span { padding: 2px 5px; border: 1px solid #dce8e1; border-radius: 4px; font-size: 11px; }
 .meal-week-scroll { overflow-x: auto; padding-bottom: 4px; scrollbar-gutter: stable; }
 .meal-week-grid { min-width: 760px; border: 1px solid var(--line); border-radius: var(--radius-md); overflow: hidden; background: var(--surface); }
 .meal-row { display: grid; grid-template-columns: 78px repeat(3, minmax(0, 1fr)); min-height: 116px; border-top: 1px solid #edf0ee; }

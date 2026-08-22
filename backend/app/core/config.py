@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     app_name: str = "SoloChef API"
     app_env: str = "development"
     api_prefix: str = "/api/v1"
-    database_url: str = "mysql+aiomysql://solochef:solochef_password@localhost:3306/solochef"
+    database_url: str = "postgresql+asyncpg://solochef:solochef_password@localhost:5433/solochef"
     db_pool_size: int = 20
     db_max_overflow: int = 20
     db_pool_timeout: int = 30
@@ -57,6 +57,26 @@ class Settings(BaseSettings):
     ai_fallback_enabled: bool = True
     # 领域智能体默认使用确定性规则，避免与主规划器串联多次外部模型等待。
     domain_agents_llm_enabled: bool = False
+    # Agent capabilities are opt-in; the planner graph itself is always enabled.
+    workflow_supervisor_enabled: bool = False
+    supervisor_max_rounds: int = 2
+    supervisor_max_dispatches_per_round: int = 4
+    supervisor_max_total_dispatches: int = 6
+    domain_agent_max_iterations: int = 3
+    domain_agent_max_tool_calls: int = 4
+    domain_agent_tool_timeout_seconds: float = 8.0
+    chat_agent_enabled: bool = False
+    chat_agent_max_iterations: int = 6
+    chat_agent_tool_timeout_seconds: float = 8.0
+    tool_websearch_enabled: bool = False
+    tool_websearch_provider: str = "tavily"
+    tool_websearch_api_key: str = ""
+    tool_websearch_timeout_seconds: float = 8.0
+    checkpoint_backend: str = "memory"
+    checkpoint_redis_url: str = ""
+    checkpoint_postgres_url: str = ""
+    checkpoint_ttl_seconds: int = 86_400
+    checkpoint_retention_days: int = 7
     # 图谱实体抽取是增强功能。默认使用本地正则抽取，避免启动期因外部 LLM
     # 响应格式或网络问题阻塞 API；需要更丰富关系时可显式设为 true。
     entity_extraction_llm_enabled: bool = False

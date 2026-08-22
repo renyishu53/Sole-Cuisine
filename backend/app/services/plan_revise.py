@@ -45,6 +45,7 @@ from app.services.nutrition import (
     estimate_meal_nutrition,
     nutrition_delta,
 )
+from app.services.shopping_categories import normalize_shopping_category
 
 # LLM 解析失败重试次数（首次 + 重试 = 最多 3 次调用）
 _MAX_RETRIES = 2
@@ -514,6 +515,7 @@ class PlanReviseService:
                         "quantity": str(operation.target.get("quantity") or "1份"),
                         "price": float(price) if isinstance(price, (int, float)) else 0.0,
                         "source": "计划调整",
+                        "origin": "meal_ingredient",
                         "purchased": False,
                     }
                 )
@@ -573,7 +575,11 @@ class PlanReviseService:
 
         retained: list[dict[str, Any]] = []
         for item in shopping:
-            if item.get("name") in removed:
+            is_removed_meal_ingredient = (
+                item.get("origin", "meal_ingredient") == "meal_ingredient"
+                and item.get("name") in removed
+            )
+            if is_removed_meal_ingredient:
                 changes.append(f"移除不再需要的购物项：{item['name']}")
                 continue
             retained.append(item)
@@ -594,6 +600,7 @@ class PlanReviseService:
                     "quantity": "1份",
                     "price": 0.0,
                     "source": source,
+                    "origin": "meal_ingredient",
                     "purchased": False,
                 }
             )
@@ -659,6 +666,7 @@ class PlanReviseService:
             "quantity": item.quantity,
             "price": item.price,
             "source": item.source or "",
+            "origin": getattr(item, "origin", "meal_ingredient"),
             "purchased": item.purchased,
         }
 
@@ -679,13 +687,12 @@ class PlanReviseService:
     ) -> PlanSnapshot:
         """从 dict 列表构建 PlanSnapshot（用于 after 场景）。"""
         nutrition = self._sum_nutrition(meals, recipes)
-        estimated = sum(float(m.get("cost", 0)) for m in meals) + sum(
-            float(s.get("price", 0)) for s in shopping
-        )
+        # 预算只按采购清单计价。餐食 cost 是菜单估算，不得重复相加。
+        estimated = sum(float(s.get("price", 0)) for s in shopping)
         # 简单分类汇总（按购物 category）
         categories: dict[str, float] = {}
         for s in shopping:
-            cat = s.get("category", "未分类")
+            cat = normalize_shopping_category(s.get("category"), s.get("name", ""))
             categories[cat] = round(categories.get(cat, 0) + float(s.get("price", 0)), 2)
         return PlanSnapshot(
             meals=meals,

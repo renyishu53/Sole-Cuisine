@@ -1,6 +1,6 @@
 """add shopping substitution confirmation fields
 
-Revision ID: 0005_add_shopping_substitution_fields
+Revision ID: 0005_shopping_sub_fields
 Revises: 0004_add_lifestyle_constraints
 Create Date: 2026-08-14
 
@@ -15,7 +15,7 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision: str = "0005_add_shopping_substitution_fields"
+revision: str = "0005_shopping_sub_fields"
 down_revision: str = "0004_add_lifestyle_constraints"
 branch_labels: None | str = None
 depends_on: None | str = None

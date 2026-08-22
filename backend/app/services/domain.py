@@ -1,3 +1,4 @@
+
 import json
 from collections import defaultdict
 from collections.abc import Sequence
@@ -23,6 +24,7 @@ from app.services.nutrition import (
     estimate_meal_nutrition,
     sum_meal_nutrition,
 )
+from app.services.shopping_categories import normalize_shopping_category
 
 # 食材 → 采购分类的启发式映射，仅用于餐食替换联动生成购物项时的兜底归类。
 _INGREDIENT_CATEGORY: dict[str, list[str]] = {
@@ -38,17 +40,18 @@ _INGREDIENT_CATEGORY: dict[str, list[str]] = {
         "山药", "芋头", "红薯", "紫薯",
     ],
     "主食": ["米", "饭", "面", "馒头", "包子", "饺子", "面包", "燕麦", "小米"],
+    "水果": ["苹果", "香蕉", "橙", "柑", "橘", "柚", "葡萄", "草莓", "蓝莓", "桃", "梨", "猕猴桃", "芒果", "菠萝", "西瓜", "哈密瓜", "樱桃"],
 }
 _INGREDIENT_CATEGORY_ALIASES: dict[str, str] = {"西红柿": "番茄", "马铃薯": "土豆"}
 
 
 def _category_for_ingredient(name: str) -> str:
-    """按关键词命中采购分类；未命中回退"未分类"。"""
+    """按关键词命中采购分类；未命中统一归入“其他”。"""
     normalized = _INGREDIENT_CATEGORY_ALIASES.get(name, name)
     for category, keywords in _INGREDIENT_CATEGORY.items():
         if any(keyword in normalized for keyword in keywords):
             return category
-    return "未分类"
+    return normalize_shopping_category("其他", name)
 
 
 def _normalize_shopping_name(name: str) -> str:

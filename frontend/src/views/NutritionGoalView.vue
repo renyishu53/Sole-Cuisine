@@ -137,7 +137,9 @@ const donutStyle = computed(() => {
 const goalLabel = computed(() => GOAL_OPTIONS.find(o => o.value === goal.value)?.label ?? '未选择')
 const prevGoalLabel = computed(() => GOAL_OPTIONS.find(o => o.value === savedGoalType.value)?.label ?? '未选择')
 const goalDirty = computed(() => goal.value !== savedGoalType.value)
-const applyDisabled = computed(() => !goal.value || applying.value || (!goalDirty.value && !savedGoal.value))
+// 当前目标即使没有变化，也应允许用户从这里进入计划生成页。
+// 只有未选择目标或正在提交时才禁用按钮。
+const applyDisabled = computed(() => !goal.value || applying.value)
 
 /* 切换目标触发数值动画 */
 watch(goal, () => { animKey.value++ })
@@ -162,6 +164,11 @@ async function loadAll() {
 async function applyGoal() {
   if (!goal.value) {
     showToast('请先选择目标取向', 'error')
+    return
+  }
+  // 已保存且未改变目标时无需重复写入，直接开始生成计划。
+  if (!goalDirty.value && savedGoal.value) {
+    router.push('/planner?mode=generate')
     return
   }
   // 目标切换需二次确认，防误操作
