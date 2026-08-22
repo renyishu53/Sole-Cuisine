@@ -26,7 +26,7 @@ from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.llm import LLMGenerationError
-from app.ai.revision_workflow import PlanRevisionWorkflow
+from app.ai.revision_workflow import run_revision_workflow
 from app.core.config import Settings, get_settings
 from app.models import ChatSession, RecipeRecord, WeeklyPlan
 from app.repositories.conversations import ConversationRepository
@@ -249,7 +249,6 @@ class PlanReviseService:
                 max_retries=1,
                 max_tokens=2048,
             ).bind(response_format={"type": "json_object"})
-        self._revision_workflow = PlanRevisionWorkflow(self._apply_operation)
 
     # ── 公开 API ────────────────────────────────────────────────────
 
@@ -276,8 +275,8 @@ class PlanReviseService:
         operation = await self._parse_operation(message, plan, session, user_id)
         recipes = await DomainRepository(session).list_recipes(user_id)
         before = self._snapshot(plan, recipes)
-        routing, applied = await self._revision_workflow.run(
-            plan, operation, recipes
+        routing, applied = run_revision_workflow(
+            plan, operation, recipes, self._apply_operation
         )
         after_meals, after_shopping, after_budget, diff = applied
         after = self._snapshot_from(after_meals, after_shopping, after_budget, recipes)
