@@ -17,9 +17,17 @@ FlagEmbedding 1.3+ 兼容要点：
   离线保证只能靠「解析为本地快照目录后按路径加载」实现：
   ``snapshot_download(repo, local_files_only=True)`` 命中缓存返回本地路径，
   未缓存则抛错——绝不触发隐式下载。
+
+transformers 5.x 兼容要点：
+- transformers 5 移除了 ``PreTrainedTokenizerBase.prepare_for_model``，而
+  FlagEmbedding <=1.4.0 的 ``compute_score`` 依赖它，运行时抛
+  ``AttributeError``。此时降级为直接使用 FlagReranker 已加载的
+  ``model``/``tokenizer`` 走稳定标准 API（``tokenizer(text, text_pair)`` +
+  前向 + sigmoid）自行打分，语义与 ``compute_score(normalize=True)`` 一致。
 """
 
 import inspect
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -48,7 +56,12 @@ class RerankBackend:
         if not documents:
             return []
         pairs = [[query, doc] for doc in documents]
-        scores = self.model.compute_score(pairs, normalize=True)  # type: ignore[attr-defined]
+        try:
+            scores = self.model.compute_score(pairs, normalize=True)  # type: ignore[attr-defined]
+        except (AttributeError, TypeError):
+            # transformers 5.x 移除 prepare_for_model，FlagEmbedding <=1.4.0 的
+            # compute_score 不可用；改用已加载 model/tokenizer 直接打分
+            scores = _direct_score(self.model, query, documents)
         if hasattr(scores, "tolist"):
             scores = scores.tolist()  # numpy / torch tensor
         return [float(value) for value in scores]
@@ -125,3 +138,38 @@ def _load_reranker(model_cls: Any, model_ref: str, settings: Settings) -> Any:
     elif "device" in parameters:
         kwargs["device"] = settings.rerank_device
     return model_cls(model_ref, **kwargs)
+
+
+def _sigmoid(value: float) -> float:
+    """数值稳定的 sigmoid（与 FlagEmbedding ``normalize=True`` 语义一致）。"""
+    if value >= 0:
+        return 1.0 / (1.0 + math.exp(-value))
+    exponent = math.exp(value)
+    return exponent / (1.0 + exponent)
+
+
+def _direct_score(reranker: Any, query: str, documents: list[str]) -> list[float]:
+    """绕过 FlagEmbedding ``compute_score``，直接用其已加载组件打分。
+
+    仅使用 transformers 稳定公共 API（``tokenizer(text, text_pair)`` 调用 +
+    前向推理），在 4.x 与 5.x 上行为一致。
+    """
+    import torch
+
+    tokenizer = reranker.tokenizer
+    model = reranker.model
+    device = next(model.parameters()).device
+    max_length = int(getattr(reranker, "max_length", 0) or 512)
+    encoded = tokenizer(
+        [query] * len(documents),
+        documents,
+        padding=True,
+        truncation=True,
+        max_length=max_length,
+        return_tensors="pt",
+    )
+    encoded = {key: value.to(device) for key, value in encoded.items()}
+    with torch.no_grad():
+        logits = model(**encoded).logits
+    values = logits.view(-1).float().cpu().tolist()
+    return [_sigmoid(float(value)) for value in values]

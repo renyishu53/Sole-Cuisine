@@ -64,6 +64,78 @@ def test_reranker_factory_loads_from_local_path(monkeypatch, tmp_path):
     assert all(isinstance(s, float) for s in scores)
 
 
+def test_reranker_falls_back_to_direct_scoring(monkeypatch, tmp_path):
+    """transformers 5.x 下 FlagEmbedding compute_score 抛 AttributeError 时，
+    降级为直接用已加载 model/tokenizer 走标准 API 打分（sigmoid 归一化）。"""
+    import math
+
+    class _Tensor:
+        def __init__(self, values):
+            self._values = values
+
+        def to(self, device):
+            del device
+            return self
+
+        def view(self, dim):
+            del dim
+            return self
+
+        def float(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def tolist(self):
+            return list(self._values)
+
+    class _InnerModel:
+        def parameters(self):
+            yield types.SimpleNamespace(device="cpu")
+
+        def __call__(self, **encoded):
+            assert set(encoded) == {"input_ids", "attention_mask"}
+            return types.SimpleNamespace(logits=_Tensor([2.0, -2.0]))
+
+    class _Tokenizer:
+        def __call__(self, queries, passages, **kwargs):
+            assert len(queries) == len(passages) == 2
+            assert kwargs["truncation"] is True
+            return {"input_ids": _Tensor([1, 2]), "attention_mask": _Tensor([1, 1])}
+
+    class IncompatibleFlagReranker:
+        """模拟 FlagEmbedding <=1.4.0 + transformers 5.x：compute_score 崩溃。"""
+
+        max_length = 512
+
+        def __init__(self, model_ref, **kwargs):
+            self.model = _InnerModel()
+            self.tokenizer = _Tokenizer()
+
+        def compute_score(self, pairs, **kwargs):
+            raise AttributeError("XLMRobertaTokenizer has no attribute prepare_for_model")
+
+    module = types.ModuleType("FlagEmbedding")
+    module.FlagReranker = IncompatibleFlagReranker
+    monkeypatch.setitem(sys.modules, "FlagEmbedding", module)
+
+    from app.services.reranker import create_rerank_backend
+
+    model_dir = tmp_path / "rerank"
+    model_dir.mkdir()
+    backend = create_rerank_backend(
+        Settings(_env_file=None, rerank_enabled=True, rerank_model_path=str(model_dir))
+    )
+    assert backend is not None
+    scores = backend.rerank("孩子不吃辣", ["清淡的虾仁滑蛋", "麻辣香锅"])
+    assert len(scores) == 2
+    assert all(0.0 < s < 1.0 for s in scores)
+    assert scores[0] == pytest.approx(1.0 / (1.0 + math.exp(-2.0)), abs=1e-6)
+    assert scores[1] == pytest.approx(1.0 / (1.0 + math.exp(2.0)), abs=1e-6)
+    assert scores[0] > scores[1]
+
+
 def test_reranker_factory_resolves_hf_cache_snapshot(monkeypatch, tmp_path):
     """未配置本地路径时，从 HF 缓存解析快照目录（不下载）。"""
     capture = []
@@ -76,7 +148,12 @@ def test_reranker_factory_resolves_hf_cache_snapshot(monkeypatch, tmp_path):
     )
     from app.services.reranker import create_rerank_backend
 
-    backend = create_rerank_backend(Settings(_env_file=None, rerank_enabled=True))
+    # 显式清空本地模型路径：pymilvus 在 import 时调用 load_dotenv()，
+    # 会把项目 .env 里的 RERANK_MODEL_PATH 写入 os.environ，导致
+    # `_env_file=None` 仍从环境变量读到机器本地路径，破坏本用例的确定性。
+    backend = create_rerank_backend(
+        Settings(_env_file=None, rerank_enabled=True, rerank_model_path="")
+    )
     assert backend is not None
     assert capture[0]["model_ref"] == str(snapshot_dir)
 
@@ -94,7 +171,10 @@ def test_reranker_factory_never_downloads_implicitly(monkeypatch):
     monkeypatch.setattr("huggingface_hub.snapshot_download", _snapshot_download)
     from app.services.reranker import create_rerank_backend
 
-    backend = create_rerank_backend(Settings(_env_file=None, rerank_enabled=True))
+    # 同上：显式清空本地模型路径，规避 pymilvus load_dotenv 的环境污染。
+    backend = create_rerank_backend(
+        Settings(_env_file=None, rerank_enabled=True, rerank_model_path="")
+    )
     assert backend is None
     assert calls and calls[0]["repo_id"] == "BAAI/bge-reranker-v2-m3"
     assert calls[0]["local_files_only"] is True
