@@ -1,7 +1,7 @@
 import asyncio
 from logging.config import fileConfig
 
-from sqlalchemy import pool, text
+from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from alembic import context
@@ -47,17 +47,6 @@ def run_migrations_offline() -> None:
 
 
 def do_run_migrations(connection: object) -> None:
-    # alembic 默认把 alembic_version.version_num 建成 VARCHAR(32)，而部分迁移
-    # revision id 超过 32 字符（如 0011_normalize_shopping_categories、0013_...），
-    # 写入时触发 StringDataRightTruncation。这里主动以更长的列创建版本表，
-    # alembic 检测到表已存在时会直接复用，不影响正常迁移。
-    connection.execute(  # type: ignore[attr-defined]
-        text(
-            "CREATE TABLE IF NOT EXISTS alembic_version ("
-            "version_num VARCHAR(255) NOT NULL, "
-            "CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num))"
-        )
-    )
     context.configure(
         connection=connection,
         target_metadata=target_metadata,

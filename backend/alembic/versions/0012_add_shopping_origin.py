@@ -9,7 +9,7 @@ import sqlalchemy as sa
 
 
 revision = "0012_add_shopping_origin"
-down_revision = "0011_normalize_shopping_categories"
+down_revision = "0011_normalize_shopping_cat"
 branch_labels = None
 depends_on = None
 

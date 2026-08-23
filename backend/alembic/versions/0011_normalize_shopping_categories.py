@@ -4,7 +4,7 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "0011_normalize_shopping_categories"
+revision = "0011_normalize_shopping_cat"
 down_revision = "0010_add_profile_completed"
 branch_labels = None
 depends_on = None

@@ -8,7 +8,7 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "0013_remove_manual_shopping_fields"
+revision = "0013_remove_manual_fields"
 down_revision = "0012_add_shopping_origin"
 branch_labels = None
 depends_on = None
