@@ -10,20 +10,26 @@
 #   worker   (Celery)            - 后台任务消费者（知识入库/图谱同步/定时清理）
 #   postgres (PostgreSQL 16)      -> :5433  (宿主机映射)
 #   redis    (Redis 7)           -> :6379
-#   neo4j    (Neo4j 5 Community) -> :7474/:7687
-#   milvus   (Milvus 2.4 向量库) -> :19530/:9091
+#
+# ── rag profile（内存大户，按需启用）────────────────────────────────
+#   neo4j    (Neo4j 5 Community) -> :7474/:7687   ~1G
+#   milvus   (Milvus 2.4 向量库) -> :19530/:9091  ~2G
 #     └─ etcd + minio (Milvus 依赖)
 #
-# 启动: docker compose up -d
+# 两阶段部署（配置不够时先上线后升级）:
+#   阶段1 · 2核4G   基础栈: docker compose up -d
+#          .env 设 RAG_ENABLED=false（不配模型目录）
+#          → 注册登录/周计划/菜谱/AI聊天 可用，知识库检索关闭
+#   阶段2 · 升级 4核8G+ 后启用 RAG 全量:
+#          .env 设 RAG_ENABLED=true + 配置 BGE_M3_MODEL_DIR/RERANK_MODEL_DIR
+#          docker compose --profile rag up -d
+#          → 数据卷保留，知识库 RAG 检索（稠密+稀疏+精排）全量生效
+#
 # 日志: docker compose logs -f backend
 #
-# AI 模型（可选，启用 BGE-M3 语义检索 + bge-reranker-v2-m3 精排）:
-#   在 .env 中配置 BGE_M3_MODEL_DIR / RERANK_MODEL_DIR 指向服务器上的模型
-#   目录（如 /opt/solochef/models/bge-m3），容器内挂载为 /models/*。
-#   未配置时挂载空目录，检索链路自动降级（不阻断启动）。
-#
-# 内存提示: Milvus + Neo4j + 两个本地模型全开建议 4核8G 起步；
-# 2核4G 服务器请保持模型目录为空（走降级链路）。
+# AI 模型: BGE_M3_MODEL_DIR / RERANK_MODEL_DIR 指向服务器上的模型目录
+#   （如 /opt/solochef/models/bge-m3），容器内挂载为 /models/*。
+#   代码不会隐式下载模型；未挂载时检索链路自动降级（不阻断启动）。
 # =============================================================================
 services:
   # ── Backend FastAPI 后端 ──────────────────────────────────────────────
@@ -47,7 +53,8 @@ services:
       MILVUS_HOST: milvus-standalone
       MILVUS_PORT: 19530
       MILVUS_COLLECTION: solochef_knowledge
-      RAG_ENABLED: "true"
+      # 由 .env 控制：2核4G 阶段为 false（知识库关闭），升级后改 true
+      RAG_ENABLED: ${RAG_ENABLED:-false}
       # 覆盖 .env 中的本地路径：容器内统一从 /models/* 加载
       EMBEDDING_MODEL_PATH: /models/bge-m3
       RERANK_MODEL_PATH: /models/bge-reranker-v2-m3
@@ -59,14 +66,12 @@ services:
       - ${RERANK_MODEL_DIR:-./_models/bge-reranker-v2-m3}:/models/bge-reranker-v2-m3
     networks:
       - solochef-net
+    # 注意不 depends_on neo4j/milvus：二者属 rag profile，显式依赖会隐式
+    # 激活 profile；应用对检索底座不可达已有降级容错（不阻断启动）
     depends_on:
       postgres:
         condition: service_healthy
       redis:
-        condition: service_healthy
-      neo4j:
-        condition: service_healthy
-      milvus-standalone:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/docs"]
@@ -110,7 +115,7 @@ services:
       MILVUS_HOST: milvus-standalone
       MILVUS_PORT: 19530
       MILVUS_COLLECTION: solochef_knowledge
-      RAG_ENABLED: "true"
+      RAG_ENABLED: ${RAG_ENABLED:-false}
       EMBEDDING_MODEL_PATH: /models/bge-m3
       RERANK_MODEL_PATH: /models/bge-reranker-v2-m3
     volumes:
@@ -122,8 +127,6 @@ services:
       postgres:
         condition: service_healthy
       redis:
-        condition: service_healthy
-      milvus-standalone:
         condition: service_healthy
 
   # ── Frontend Nginx + Vue SPA ─────────────────────────────────────────
@@ -183,9 +186,11 @@ services:
       timeout: 5s
       retries: 5
 
-  # ── Neo4j 5 Community 图数据库 ──────────────────────────────────────
+  # ── Neo4j 5 Community 图数据库（rag profile）───────────────────────
+  # 阶段2 启用: docker compose --profile rag up -d
   neo4j:
     image: neo4j:5-community
+    profiles: ["rag"]
     container_name: solochef-neo4j
     restart: unless-stopped
     environment:
@@ -208,9 +213,10 @@ services:
       retries: 10
       start_period: 60s
 
-  # ── Milvus 向量数据库（依赖 etcd + minio） ──────────────────────────
+  # ── Milvus 向量数据库（依赖 etcd + minio，rag profile）─────────────
   etcd:
     image: quay.io/coreos/etcd:v3.5.5
+    profiles: ["rag"]
     container_name: solochef-etcd
     restart: unless-stopped
     environment:
@@ -226,6 +232,7 @@ services:
 
   minio:
     image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    profiles: ["rag"]
     container_name: solochef-minio
     restart: unless-stopped
     environment:
@@ -239,6 +246,7 @@ services:
 
   milvus-standalone:
     image: milvusdb/milvus:v2.4.4
+    profiles: ["rag"]
     container_name: solochef-milvus
     restart: unless-stopped
     command: ["milvus", "run", "standalone"]
