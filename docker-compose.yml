@@ -1,7 +1,27 @@
+# =============================================================================
+# SoloChef 全栈 Docker Compose 编排
+#
+# 参考: 阿里云 ECS + Docker Compose 部署最佳实践
+# (https://blog.csdn.net/2301_80216352/article/details/162310443)
+#
+# 服务拓扑:
+#   frontend (Nginx + Vue SPA)  -> :80     (对外)
+#   backend  (FastAPI + Uvicorn) -> :8000  (内部)
+#   worker   (Celery)            - 后台任务消费者
+#   postgres (PostgreSQL 16)      -> :5433  对外
+#   redis    (Redis 7)           -> :6379  对外
+#   neo4j    (Neo4j 5 Community) -> :7474/:7687
+#   milvus   (Milvus 2.4 向量库) -> :19530/:9091
+#     └─ etcd + minio (Milvus 依赖)
+# =============================================================================
 services:
+  # ── Backend FastAPI 后端 ──────────────────────────────────────────────
   backend:
     build:
       context: ./backend
+      dockerfile: Dockerfile
+    container_name: solochef-backend
+    restart: unless-stopped
     env_file:
       - .env
     environment:
@@ -17,20 +37,33 @@ services:
       MILVUS_PORT: 19530
       MILVUS_COLLECTION: solochef_knowledge
       RAG_ENABLED: "true"
-    ports: ["8000:8000"]
+    ports:
+      - "8000:8000"
+    networks:
+      - solochef-net
     depends_on:
+      postgres:
+        condition: service_healthy
       redis:
+        condition: service_healthy
+      neo4j:
         condition: service_started
       milvus-standalone:
         condition: service_started
-      neo4j:
-        condition: service_started
-      postgres:
-        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/docs')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
 
+  # ── Celery Worker 后台任务消费者 ─────────────────────────────────────
   worker:
     build:
       context: ./backend
+      dockerfile: Dockerfile
+    container_name: solochef-worker
+    restart: unless-stopped
     command: ["celery", "-A", "app.worker.celery_app", "worker", "--loglevel=INFO", "--concurrency=2"]
     env_file:
       - .env
@@ -47,22 +80,32 @@ services:
       MILVUS_PORT: 19530
       MILVUS_COLLECTION: solochef_knowledge
       RAG_ENABLED: "true"
+    networks:
+      - solochef-net
     depends_on:
-      redis:
-        condition: service_started
-      milvus-standalone:
-        condition: service_started
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+      milvus-standalone:
+        condition: service_started
 
+  # ── Frontend Nginx + Vue SPA ─────────────────────────────────────────
   frontend:
     build:
       context: ./frontend
-    ports: ["5173:80"]
+      dockerfile: Dockerfile
+    container_name: solochef-frontend
+    restart: unless-stopped
+    ports:
+      - "5173:80"
+    networks:
+      - solochef-net
     depends_on:
       backend:
         condition: service_started
 
+  # ── PostgreSQL 16 数据库 ─────────────────────────────────────────────
   postgres:
     image: postgres:16-alpine
     container_name: solochef-postgres
@@ -71,63 +114,102 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-solochef}
       POSTGRES_USER: ${POSTGRES_USER:-solochef}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-solochef_password}
-    ports: ["5433:5432"]
-    volumes: [solochef_postgres_data:/var/lib/postgresql/data]
+    ports:
+      - "5433:5432"
+    volumes:
+      - solochef_postgres_data:/var/lib/postgresql/data
+    networks:
+      - solochef-net
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-solochef} -d ${POSTGRES_DB:-solochef}"]
-      interval: 5s
-      timeout: 3s
+      interval: 10s
+      timeout: 5s
       retries: 10
+      start_period: 10s
 
+  # ── Redis 7 缓存 / Celery broker ─────────────────────────────────────
   redis:
     image: redis:7-alpine
-    ports: ["6379:6379"]
-    volumes: [redis_data:/data]
+    container_name: solochef-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - solochef-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
+  # ── Neo4j 5 Community 图数据库 ──────────────────────────────────────
   neo4j:
     image: neo4j:5-community
+    container_name: solochef-neo4j
     restart: unless-stopped
     environment:
       NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-solochef_password}
-    ports: ["7474:7474", "7687:7687"]
-    volumes: [neo4j_data:/data]
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - neo4j_data:/data
+    networks:
+      - solochef-net
 
-  # ── Milvus 向量数据库 ──────────────────────────────────────────
+  # ── Milvus 向量数据库（依赖 etcd + minio） ──────────────────────────
   etcd:
     image: quay.io/coreos/etcd:v3.5.5
+    container_name: solochef-etcd
     restart: unless-stopped
     environment:
       ETCD_AUTO_COMPACTION_MODE: revision
       ETCD_AUTO_COMPACTION_RETENTION: "1000"
       ETCD_QUOTA_BACKEND_BYTES: "4294967296"
       ETCD_SNAPSHOT_COUNT: "50000"
-    volumes: [etcd_data:/etcd]
+    volumes:
+      - etcd_data:/etcd
+    networks:
+      - solochef-net
     command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
 
   minio:
     image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    container_name: solochef-minio
     restart: unless-stopped
     environment:
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin
-    volumes: [minio_data:/minio_data]
+    volumes:
+      - minio_data:/minio_data
+    networks:
+      - solochef-net
     command: minio server /minio_data
 
   milvus-standalone:
     image: milvusdb/milvus:v2.4.4
+    container_name: solochef-milvus
     restart: unless-stopped
     command: ["milvus", "run", "standalone"]
     environment:
       ETCD_ENDPOINTS: etcd:2379
       MINIO_ADDRESS: minio:9000
-    ports: ["19530:19530", "9091:9091"]
-    volumes: [milvus_data:/var/lib/milvus]
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    volumes:
+      - milvus_data:/var/lib/milvus
+    networks:
+      - solochef-net
     depends_on:
       etcd:
         condition: service_started
       minio:
         condition: service_started
 
+# ── 持久化卷 ─────────────────────────────────────────────────────────
 volumes:
   solochef_postgres_data:
   redis_data:
@@ -135,3 +217,8 @@ volumes:
   etcd_data:
   minio_data:
   milvus_data:
+
+# ── 桥接网络：容器间通过服务名互访 ───────────────────────────────────
+networks:
+  solochef-net:
+    driver: bridge

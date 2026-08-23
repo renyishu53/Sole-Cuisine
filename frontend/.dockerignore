@@ -1,0 +1,19 @@
+# Docker 部署时忽略这些文件，避免无关文件进入镜像、加速构建
+node_modules/
+dist/
+.vite/
+.nuxt/
+
+# 测试
+coverage/
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# 文档
+*.md
+
+# 构建产物映射文件
+*.tsbuildinfo

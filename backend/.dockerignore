@@ -1,0 +1,37 @@
+# Docker 部署时忽略这些文件，避免无关文件进入镜像、加速构建
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+.eggs/
+*.egg-info/
+solochef_api.egg-info/
+casamind_api.egg-info/
+
+# 测试与日志
+tests/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+celery-worker*.log
+uvicorn*.log
+_rerank_*.txt
+_rerank_*.py
+_sparse_exit.txt
+_rerank_err.txt
+_rerank_exit.txt
+
+# 本地开发数据库 (不要打入镜像)
+solochef.db
+*.sqlite3
+
+# uv lock (使用 requirements.txt 即可)
+uv.lock
+
+# 文档
+*.md
