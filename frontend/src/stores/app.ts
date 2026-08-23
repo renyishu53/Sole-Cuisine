@@ -33,6 +33,7 @@ export const useAppStore = defineStore('app', {
     chatCompletedMessage: null as ChatMessage | null,
     chatToolEvents: [] as ({ event: 'tool_call' | 'tool_result' } & ChatToolEvent)[],
     activePlanVersion: null as number | null,
+    homeRefreshToken: 0,
   }),
   getters: {
     isAuthenticated: (state) => Boolean(state.session?.access_token),
@@ -197,6 +198,7 @@ export const useAppStore = defineStore('app', {
       }
     },
     setActivePlanVersion(version: number | null) { this.activePlanVersion = version },
+    notifyHomeDataChanged() { this.homeRefreshToken += 1 },
     setSession(session: AuthSession) { this.session = session; localStorage.setItem(SESSION_KEY, JSON.stringify(session)) },
     updateSessionUser(user: UserSummary) {
       if (!this.session) return

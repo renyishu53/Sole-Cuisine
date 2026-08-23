@@ -17,6 +17,7 @@ from app.schemas import (
     VectorSearchHit,
 )
 from app.services.documents import DEFAULT_METADATA, DocumentParseError, DocumentProcessor
+from app.services.embeddings import EmbeddingBackend
 from app.services.entity_extractor import extract_knowledge
 from app.services.graph_store import Neo4jGraphStore
 from app.services.milvus_store import MilvusVectorStore
@@ -291,8 +292,16 @@ class KnowledgeService:
                 neo4j=bundle.neo4j_status,
                 embedding=embedding.model_name,
                 rerank=bundle.rerank_status,
+                sparse=self._sparse_status(embedding, bundle.vector_status),
             ),
         )
+
+    @staticmethod
+    def _sparse_status(embedding: EmbeddingBackend, vector_status: str) -> str:
+        """稀疏检索诊断：后端具备能力且向量路连通 → hybrid，否则 disabled。"""
+        if not embedding.supports_sparse:
+            return "disabled"
+        return "hybrid (dense+lexical)" if vector_status == "connected" else vector_status
 
     async def status(self, user_id: int = 1) -> AIServiceStatus:
         vector_status = "connected"
@@ -310,10 +319,16 @@ class KnowledgeService:
         embedding = await self.vector_store.ensure_embedding()
         reranker = await self.ensure_reranker()
         reranker_label = reranker.label if reranker is not None else "未启用二阶段精排"
+        sparse_label = (
+            "BGE-M3 lexical 稀疏检索（稠密+稀疏双路 RRF）"
+            if embedding.supports_sparse
+            else "未启用稀疏检索（纯稠密召回）"
+        )
         return AIServiceStatus(
             rag_enabled=self.settings.rag_enabled,
             embedding=embedding.label,
             reranker=reranker_label,
+            sparse=sparse_label,
             llm_mode=(self.settings.llm_provider if self.settings.real_llm_enabled else "demo"),
             langgraph="compiled",
             vector_store=vector_status,

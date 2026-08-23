@@ -161,9 +161,8 @@ def test_generate_weekly_plan_and_trace_are_user_scoped(
     assert payload["budget"]["estimated"] <= 500
     trace = client.get(f"/api/v1/agents/runs/{payload['run_id']}", headers=auth_headers)
     assert trace.status_code == 200
-    assert len(trace.json()["steps"]) == 6
-    assert any(step["name"] == "meal_agent" for step in trace.json()["steps"])
-    assert any(step["name"] == "planner" for step in trace.json()["steps"])
+    step_names = {step["name"] for step in trace.json()["steps"]}
+    assert {"retrieval", "meal_agent", "shopping_agent", "budget_agent", "planner", "verifier"} <= step_names
     assert payload["domain"]["meal"]["strategy"]
 
     retry = client.post(f"/api/v1/agents/runs/{payload['run_id']}/retry", headers=auth_headers)
@@ -524,39 +523,39 @@ def test_domain_crud_is_persisted_and_user_scoped(
     assert updated_meal.status_code == 200
     assert updated_meal.json()["cost"] == 20
 
-    shopping = client.post(
-        "/api/v1/shopping",
+    generated = client.post(
+        "/api/v1/plans/generate-weekly",
         headers=headers,
-        json={"name": "鸡蛋", "category": "肉蛋奶", "quantity": "12 个", "price": 12},
+        json={"prompt": "生成一周测试计划", "budget": 500},
     )
-    assert shopping.status_code == 201
-    shopping_id = shopping.json()["id"]
-    assert shopping.json()["origin"] == "extra_purchase"
+    assert generated.status_code == 201
+    confirmed = client.post(
+        f"/api/v1/plans/{generated.json()['run_id']}/confirm", headers=headers
+    )
+    assert confirmed.status_code == 200
+
+    shopping_items = client.get("/api/v1/shopping", headers=headers).json()
+    assert shopping_items
+    shopping_id = shopping_items[0]["id"]
     checked = client.patch(
-        f"/api/v1/shopping/{shopping_id}", headers=headers, json={"purchased": True}
+        f"/api/v1/shopping/{shopping_id}",
+        headers=headers,
+        json={"purchased": True, "actual_price": 10, "verification_note": "促销"},
     )
     assert checked.status_code == 200
     assert checked.json()["purchased"] is True
-    impact = client.get(f"/api/v1/shopping/{shopping_id}/impact", headers=headers)
-    assert impact.status_code == 200
-    assert impact.json()["has_impact"] is False
     structural_update = client.patch(
         f"/api/v1/shopping/{shopping_id}", headers=headers, json={"quantity": "6 个"}
     )
-    assert structural_update.status_code == 200
-    assert structural_update.json()["quantity"] == "6 个"
-    safe_price_update = client.patch(
-        f"/api/v1/shopping/{shopping_id}", headers=headers, json={"price": 10}
-    )
-    assert safe_price_update.status_code == 200
-    assert safe_price_update.json()["price"] == 10
+    assert structural_update.status_code == 422
 
     # Phase 3 清理：/tasks 与 /budget (PATCH) 端点随 plan_tasks / plan_budgets 表一并移除，
     # 预算改由 WeeklyPlan.budget 标量列承载，不再单独 CRUD。
 
     assert client.get(f"/api/v1/meals/{meal_id}", headers=auth_headers).status_code == 404
     assert client.delete(f"/api/v1/meals/{meal_id}", headers=headers).status_code == 204
-    assert client.delete(f"/api/v1/shopping/{shopping_id}", headers=headers).status_code == 204
+    assert client.post("/api/v1/shopping", headers=headers, json={}).status_code in {404, 405}
+    assert client.delete(f"/api/v1/shopping/{shopping_id}", headers=headers).status_code in {404, 405}
 
 
 def test_domain_operations_close_the_household_loop(
@@ -580,55 +579,13 @@ def test_domain_operations_close_the_household_loop(
     assert replaced.status_code == 200
     assert "花生" not in replaced.json()["meal"]["ingredients"]
 
-    meal_ingredient = next(
-        item
-        for item in client.get("/api/v1/shopping", headers=auth_headers).json()
-        if item["origin"] == "meal_ingredient"
-    )
-    structural_update = client.patch(
-        f"/api/v1/shopping/{meal_ingredient['id']}",
-        headers=auth_headers,
-        json={"quantity": "2 份"},
-    )
-    assert structural_update.status_code == 409
-    structural_delete = client.delete(
-        f"/api/v1/shopping/{meal_ingredient['id']}", headers=auth_headers
-    )
-    assert structural_delete.status_code == 409
-    safe_price_update = client.patch(
-        f"/api/v1/shopping/{meal_ingredient['id']}",
-        headers=auth_headers,
-        json={"price": 10},
-    )
-    assert safe_price_update.status_code == 200
-
-    duplicate = client.post(
-        "/api/v1/shopping",
-        headers=auth_headers,
-        json={
-            "name": "鸡蛋",
-            "category": "肉蛋奶",
-            "quantity": "6 个",
-            "price": 8,
-            "source": "补充采购",
-        },
-    )
-    assert duplicate.status_code == 201
-    client.post(
-        "/api/v1/shopping",
-        headers=auth_headers,
-        json={
-            "name": " 鸡 蛋 ",
-            "category": "肉蛋奶",
-            "quantity": "12 个",
-            "price": 12,
-            "source": "早餐",
-        },
-    )
-    merged = client.post("/api/v1/shopping/merge", headers=auth_headers)
-    assert merged.status_code == 200
-    assert merged.json()["merged_groups"] >= 1
-    assert merged.json()["removed_items"] >= 1
+    shopping_items = client.get("/api/v1/shopping", headers=auth_headers).json()
+    assert shopping_items
+    shopping_id = shopping_items[0]["id"]
+    assert client.patch(
+        f"/api/v1/shopping/{shopping_id}", headers=auth_headers, json={"name": "鸡胸肉"}
+    ).status_code == 422
+    assert client.post("/api/v1/shopping/merge", headers=auth_headers).status_code in {404, 405}
 
     expense = client.post(
         "/api/v1/budget/expenses",
@@ -661,8 +618,10 @@ def test_recipe_and_chat_are_user_scoped(
 
     # 注入假的流式对话助手，避免依赖真实 DeepSeek 网络调用（测试确定性）。
     class FakeChatAssistant:
-        async def answer(self, question, context="", rag_snippets=None, history=None):
-            del question, context, rag_snippets, history
+        async def answer(
+            self, question, context="", rag_snippets=None, history=None, *args, **kwargs
+        ):
+            del question, context, rag_snippets, history, args, kwargs
             yield "已按清淡口味"
             yield "调整计划"
 

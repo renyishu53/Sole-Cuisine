@@ -1,5 +1,5 @@
 import axios, { AxiosError, type InternalAxiosRequestConfig } from 'axios'
-import type { AgentEvaluation, AgentRun, AIServiceStatus, ArchivedPlanResponse, AuthSession, BackgroundJob, BudgetAnalytics, CeleryStatsResponse, ChatSessionDetail, ChatSessionSummary, ChatStreamEvent, ChatTurnResponse, CurrentSession, Dashboard, DeadLetterItem, DeviceSession, FeedbackOverviewResponse, InventoryAdjustInput, InventoryEntry, InventoryResponse, KnowledgeDocument, KnowledgeSearchResponse, LLMSmokeResponse, MealDeviationType, MealItem, MealItemInput, MealReplacementResponse, NutritionGoalResponse, NutritionReport, PlanDiff, PlanningResponse, PromptRegistryResponse, RagEvalResponse, Recipe, RecipeDetail, RecipeInput, RecipeListResponse, RecipeSummary, RecipeTipsResponse, ShoppingItem, ShoppingItemInput, ShoppingMergeResponse, ShoppingSubstitutionDecision, ShoppingSubstitutionResponse, SMSCodeResponse, SyncConsistencyResponse, TasteProfileResponse, TasteVectorResponse, TodayNutritionResponse, UserProfileResponse, UserSummary, VisionResult, VisionScene, WeeklyPlanDetail, WeeklyPlanSummary, WeeklyReportResponse } from './types'
+import type { AgentEvaluation, AgentRun, AIServiceStatus, ArchivedPlanResponse, AuthSession, BackgroundJob, BudgetAnalytics, CeleryStatsResponse, ChatSessionDetail, ChatSessionSummary, ChatStreamEvent, ChatTurnResponse, CurrentSession, Dashboard, DeadLetterItem, DeviceSession, FeedbackOverviewResponse, InventoryAdjustInput, InventoryEntry, InventoryResponse, KnowledgeDocument, KnowledgeSearchResponse, LLMSmokeResponse, MealDeviationType, MealItem, MealItemInput, MealReplacementResponse, NutritionGoalResponse, NutritionReport, PlanDiff, PlanningResponse, PromptRegistryResponse, RagEvalResponse, Recipe, RecipeDetail, RecipeInput, RecipeListResponse, RecipeSummary, RecipeTipsResponse, ShoppingItem, SMSCodeResponse, SyncConsistencyResponse, TasteProfileResponse, TasteVectorResponse, TodayNutritionResponse, UserProfileResponse, UserSummary, VisionResult, VisionScene, WeeklyPlanDetail, WeeklyPlanSummary, WeeklyReportResponse } from './types'
 
 const baseURL = import.meta.env.VITE_API_BASE_URL || '/api/v1'
 const client = axios.create({ baseURL, timeout: 10000 })
@@ -157,14 +157,7 @@ export const api = {
   replaceMeal: (id: number, body: { feedback: string; rating?: number | null; tags?: string[] }) => client.post<MealReplacementResponse>(`/meals/${id}/replace`, body, { timeout: 120000 }).then(({ data }) => data),
   checkinMeal: (id: number, body: { eaten: boolean; deviation_type?: MealDeviationType | null; deviation_reason?: string }) => client.post<MealItem>(`/meals/${id}/checkin`, body).then(({ data }) => data),
   shopping: () => client.get<ShoppingItem[]>('/shopping').then(({ data }) => data),
-  createShoppingItem: (body: ShoppingItemInput) => client.post<ShoppingItem>('/shopping', body).then(({ data }) => data),
-  updateShoppingItem: (id: number, body: Partial<ShoppingItemInput>) => client.patch<ShoppingItem>(`/shopping/${id}`, body).then(({ data }) => data),
-  deleteShoppingItem: (id: number) => client.delete(`/shopping/${id}`),
-  shoppingImpact: (id: number) => client.get<import('./types').ShoppingImpactResponse>(`/shopping/${id}/impact`).then(({ data }) => data),
-  mergeShopping: () => client.post<ShoppingMergeResponse>('/shopping/merge').then(({ data }) => data),
-  shoppingSubstitutions: (id: number, limit = 5) => client.get<ShoppingSubstitutionResponse>(`/shopping/${id}/substitutions`, { params: { limit } }).then(({ data }) => data),
-  autoSubstituteShoppingItem: (id: number) => client.post<ShoppingItem>(`/shopping/${id}/auto-substitute`).then(({ data }) => data),
-  acceptShoppingSubstitution: (id: number, body: ShoppingSubstitutionDecision) => client.post<ShoppingItem>(`/shopping/${id}/substitution/accept`, body).then(({ data }) => data),
+  recordShoppingPurchase: (id: number, body: { purchased: boolean; actual_price?: number; verification_note?: string }) => client.patch<ShoppingItem>(`/shopping/${id}`, body).then(({ data }) => data),
   recipes: () => client.get<Recipe[]>('/recipes').then(({ data }) => data),
   listRecipes: (params?: { category?: string; page?: number; page_size?: number }) => client.get<RecipeListResponse>('/recipes', { params }).then(({ data }) => data),
   getRecipe: (id: string) => client.get<RecipeDetail>(`/recipes/${id}`).then(({ data }) => data),

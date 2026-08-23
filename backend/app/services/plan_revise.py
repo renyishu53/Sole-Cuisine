@@ -52,7 +52,6 @@ _MAX_RETRIES = 2
 
 # 关键词到 operation 的规则映射，仅 demo 模式使用
 _DEMO_PATTERNS: list[tuple[str, ReviseOperationType, list[str]]] = [
-    ("(购物|采购|清单).*(增加|添加|删除|移除|修改|改成)", "adjust_shopping", []),
     ("换成|替换|改吃|换为", "replace_meal", ["晚餐", "午餐", "早餐"]),
     ("不要|排除|去掉|别加|剔除", "exclude_ingredient", []),
     ("预算.*降|预算.*减|降到|减到", "update_budget", []),
@@ -139,29 +138,6 @@ def _parse_demo_operation(message: str, plan: WeeklyPlan) -> ReviseOperation | N
                 constraints={"main_ingredient": ingredient},
                 proposal=proposal,
                 reason=f"将{day}{meal_type}替换为{ingredient}主题餐",
-            )
-        if op_type == "adjust_shopping":
-            action = (
-                "remove"
-                if any(term in text for term in ("删除", "移除", "去掉"))
-                else "update"
-                if any(term in text for term in ("修改", "改成", "调整"))
-                else "add"
-            )
-            name = _ingredient_from_text(
-                text, ["鸡胸肉", "牛肉", "鱼肉", "虾仁", "豆腐", "鸡蛋", "牛奶", "蔬菜"]
-            ) or "食材"
-            quantity_match = re.search(r"(\d+(?:\.\d+)?\s*(?:斤|克|个|盒|袋|瓶))", text)
-            price_match = re.search(r"(?:价格|单价)[^\d]{0,4}(\d+(?:\.\d+)?)", text)
-            return ReviseOperation(
-                operation=op_type,
-                target={
-                    "action": action,
-                    "name": name,
-                    "quantity": quantity_match.group(1) if quantity_match else "1份",
-                    "price": float(price_match.group(1)) if price_match else None,
-                },
-                reason=f"购物清单{action}: {name}",
             )
         if op_type == "exclude_ingredient":
             ingredient = _ingredient_from_text(
@@ -367,8 +343,8 @@ class PlanReviseService:
         system_prompt = (
             "你是 SoloChef 备餐修改智能体。把用户的自然语言修改要求解析为结构化 JSON 指令。"
             "只输出符合 schema 的 JSON 对象，不要添加 Markdown 代码块或解释。"
-            "operation 必须是八种之一：replace_meal/remove_meal/add_meal/"
-            "exclude_ingredient/update_budget/skip_day/adjust_macro_target/adjust_shopping。"
+            "operation 必须是七种之一：replace_meal/remove_meal/add_meal/"
+            "exclude_ingredient/update_budget/skip_day/adjust_macro_target。"
             "target.day 用中文（周一~周日）。proposal 仅在 replace_meal/add_meal 时提供。"
         )
         user_prompt = (
@@ -498,46 +474,6 @@ class PlanReviseService:
                 "本次预览不直接应用。"
             )
 
-        elif op == "adjust_shopping":
-            action = str(operation.target.get("action") or "update")
-            name = str(operation.target.get("name") or "").strip()
-            index = next(
-                (i for i, item in enumerate(shopping) if name and name in item["name"]),
-                None,
-            )
-            if action == "add":
-                price = operation.target.get("price")
-                shopping.append(
-                    {
-                        "id": 0,
-                        "name": name or "新增食材",
-                        "category": str(operation.target.get("category") or "其他"),
-                        "quantity": str(operation.target.get("quantity") or "1份"),
-                        "price": float(price) if isinstance(price, (int, float)) else 0.0,
-                        "source": "计划调整",
-                        "origin": "meal_ingredient",
-                        "purchased": False,
-                    }
-                )
-                diff.changed_shopping.append(f"新增购物项：{name or '新增食材'}")
-            elif action == "remove" and index is not None:
-                removed = shopping.pop(index)
-                diff.changed_shopping.append(f"移除购物项：{removed['name']}")
-            elif action == "update" and index is not None:
-                item = shopping[index]
-                old_quantity = item["quantity"]
-                old_price = item["price"]
-                if operation.target.get("quantity"):
-                    item["quantity"] = str(operation.target["quantity"])
-                if isinstance(operation.target.get("price"), (int, float)):
-                    item["price"] = float(operation.target["price"])
-                diff.changed_shopping.append(
-                    f"更新购物项：{item['name']} {old_quantity} / ¥{old_price}"
-                    f" → {item['quantity']} / ¥{item['price']}"
-                )
-            else:
-                diff.conflict_warnings.append(f"购物清单中未找到「{name}」")
-
         if op in {"replace_meal", "add_meal", "remove_meal", "skip_day"}:
             shopping, shopping_changes = self._reconcile_shopping_with_meals(
                 shopping, original_meals, meals
@@ -575,11 +511,7 @@ class PlanReviseService:
 
         retained: list[dict[str, Any]] = []
         for item in shopping:
-            is_removed_meal_ingredient = (
-                item.get("origin", "meal_ingredient") == "meal_ingredient"
-                and item.get("name") in removed
-            )
-            if is_removed_meal_ingredient:
+            if item.get("name") in removed:
                 changes.append(f"移除不再需要的购物项：{item['name']}")
                 continue
             retained.append(item)
@@ -600,7 +532,6 @@ class PlanReviseService:
                     "quantity": "1份",
                     "price": 0.0,
                     "source": source,
-                    "origin": "meal_ingredient",
                     "purchased": False,
                 }
             )
@@ -666,7 +597,6 @@ class PlanReviseService:
             "quantity": item.quantity,
             "price": item.price,
             "source": item.source or "",
-            "origin": getattr(item, "origin", "meal_ingredient"),
             "purchased": item.purchased,
         }
 
@@ -770,10 +700,6 @@ class PlanReviseService:
             return (
                 f"已记录营养目标调整意图（{target}），需在营养目标页确认。"
             )
-        if op == "adjust_shopping":
-            actions = {"add": "新增", "remove": "移除", "update": "更新"}
-            action = actions.get(str(target.get("action")), "调整")
-            return f"{action}购物项「{target.get('name', '')}」，请确认清单与预算变化。"
         return f"已处理修改请求：{operation.reason or op}"
 
     async def _resolve_chat_session(

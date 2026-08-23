@@ -6,7 +6,7 @@ PlanReviseService 把用户的自然语言修改要求（如"把周三晚餐换�
 
 设计要点：
 - 八种 operation 覆盖常见修改场景（替换/移除/添加餐食、排除食材、
-  调整预算、跳过某天、调整营养目标与购物项）。
+  调整预算、跳过某天与调整营养目标）。
 - ``target`` / ``constraints`` 用 ``dict[str, Any]`` 而非嵌套模型，便于 LLM
   灵活输出；业务层按 operation 类型解释字段语义。
 - :class:`RevisePreviewResponse` 不持久化，存到 ``ChatMessage.payload`` 供
@@ -31,13 +31,11 @@ ReviseOperationType = Literal[
     "update_budget",       # 调整预算（如"总预算降到 300 元"）
     "skip_day",            # 跳过某天不做饭（如"周末外食"）
     "adjust_macro_target", # 调整营养目标（如"蛋白质提高到每天 120g"）
-    "adjust_shopping",     # 增删改计划关联的购物项
 ]
 
 
 class RevisionRoute(StrEnum):
     MEAL = "meal_revision_subgraph"
-    SHOPPING = "shopping_revision_subgraph"
     BUDGET = "budget_revision_subgraph"
     CONSTRAINT = "constraint_revision_subgraph"
     COMPOUND = "compound_revision_subgraph"
@@ -62,7 +60,6 @@ class ReviseOperation(BaseModel):
     - ``update_budget``: target={budget_limit}
     - ``skip_day``: target={day}
     - ``adjust_macro_target``: target={protein_g?, carbs_g?, fat_g?, calories?}
-    - ``adjust_shopping``: target={action, name, quantity?, price?}
     """
 
     model_config = ConfigDict(str_strip_whitespace=True)

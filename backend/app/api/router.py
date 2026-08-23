@@ -25,7 +25,6 @@ from app.api.dependencies import CurrentContext, OwnerContext, SessionDep
 from app.core.config import get_settings
 from app.models import (
     NutritionGoal,
-    PlanShoppingItem,
     RecipeRecord,
     UserProfile,
     WeeklyPlan,
@@ -57,8 +56,7 @@ from app.schemas import (
     RevisePreviewResponse,
     ReviseRequest,
     ShoppingItem,
-    ShoppingItemCreate,
-    ShoppingItemUpdate,
+    ShoppingPurchaseUpdate,
     WeeklyPlanDetail,
     WeeklyPlanSummary,
 )
@@ -107,13 +105,8 @@ from app.schemas.domain import (
     RecipeSummary,
     RecipeTipsResponse,
     RecipeUpdate,
-    ShoppingMergeResponse,
-    ShoppingImpactResponse,
-    ShoppingSubstitutionDecision,
-    ShoppingSubstitutionResponse,
     ShoppingSyncResult,
     SubstitutionSeedResponse,
-    SubstitutionSuggestion,
     SyncConsistencyResponse,
     TasteDimension,
     TasteProfileResponse,
@@ -156,10 +149,7 @@ from app.services.plan_revise import plan_revise_service
 from app.services.planning import planning_service
 from app.services.recipe import recipe_service
 from app.services.runtime import runtime_state
-from app.services.substitution import (
-    get_substitution_service,
-    seed_substitution_graph,
-)
+from app.services.substitution import seed_substitution_graph
 from app.services.weekly_report import weekly_report_service
 from app.worker import celery_app
 
@@ -358,56 +348,6 @@ def _shopping_budget_summary(plan: WeeklyPlan) -> BudgetSummary:
         saved=round(limit - estimated, 2),
         usage_percent=int(round(estimated / limit * 100)) if limit else 0,
         categories=categories,
-    )
-
-
-def _normalize_food_name(value: str) -> str:
-    """Normalize ingredient names for plan dependency checks."""
-    return "".join(character for character in value.casefold() if character.isalnum())
-
-
-def _shopping_impact_response(
-    plan: WeeklyPlan, item: PlanShoppingItem
-) -> ShoppingImpactResponse:
-    if item.origin == "extra_purchase":
-        return ShoppingImpactResponse(
-            item_id=item.id,
-            item_name=item.name,
-            has_impact=False,
-            message="这是仅采购条目，不参与餐食联动，可以直接维护。",
-        )
-    item_name = item.name
-    normalized_item = _normalize_food_name(item_name)
-    affected = []
-    if normalized_item:
-        for meal in plan.meals:
-            ingredients = meal.ingredients or []
-            if any(
-                normalized_item in normalized_ingredient or normalized_ingredient in normalized_item
-                for ingredient in ingredients
-                if (normalized_ingredient := _normalize_food_name(str(ingredient)))
-            ):
-                affected.append(
-                    {
-                        "id": meal.id,
-                        "day": meal.day,
-                        "meal_type": meal.meal_type,
-                        "name": meal.name,
-                    }
-                )
-    meal_labels = "、".join(
-        f"{meal['day']}{meal['meal_type']}《{meal['name']}》" for meal in affected
-    )
-    return ShoppingImpactResponse(
-        item_id=item.id,
-        item_name=item_name,
-        has_impact=bool(affected),
-        affected_meals=affected,
-        message=(
-            f"“{item_name}”被{meal_labels}使用，结构性修改需要通过调整计划生成新版本。"
-            if affected
-            else "该条目未被当前计划餐食直接引用，可以安全修改。"
-        ),
     )
 
 
@@ -707,9 +647,20 @@ async def today_nutrition(context: CurrentContext, session: SessionDep) -> Today
     targets = nutrition_goal_to_targets(goal) if goal is not None else None
     recipes = await DomainRepository(session).list_recipes(context.user_id)
 
-    day_label = _WEEKDAY_CN[datetime.now(UTC).weekday()]
+    # 今日口径必须与前端日历和打卡校验一致，使用产品时区而不是 UTC。
+    # 否则本地凌晨至早上会把周日请求误算成周六，已打卡餐食无法进入营养汇总。
+    day_label = _WEEKDAY_CN[datetime.now(_PRODUCT_TIMEZONE).weekday()]
+    today_date = datetime.now(_PRODUCT_TIMEZONE).date()
     today_meals = [item for item in plan.meals if item.day == day_label] if plan else []
-    eaten_meals = [item for item in today_meals if item.eaten]
+    # 以实际打卡日期作为强一致兜底：旧计划或模型输出的 day 文本可能与
+    # 当前星期不一致，但 eaten_at 记录了用户确实在今天完成了哪一餐。
+    eaten_today = [
+        item for item in (plan.meals if plan else [])
+        if item.eaten
+        and item.eaten_at is not None
+        and item.eaten_at.astimezone(_PRODUCT_TIMEZONE).date() == today_date
+    ]
+    eaten_meals = eaten_today or [item for item in today_meals if item.eaten]
 
     report = build_nutrition_report(eaten_meals, recipes, targets)
     nutrients = {
@@ -885,54 +836,10 @@ async def shopping(context: CurrentContext, session: SessionDep) -> list[Shoppin
     return [_shopping_response(item) for item in plan.shopping_items] if plan is not None else []
 
 
-@router.post("/shopping", response_model=ShoppingItem, status_code=status.HTTP_201_CREATED)
-async def create_shopping_item(
-    request: ShoppingItemCreate, context: CurrentContext, session: SessionDep
-) -> ShoppingItem:
-    repository = PlanningRepository(session)
-    await repository.expire_old_plans(context.user_id)
-    plan = await repository.get_active_plan(context.user_id)
-    if plan is None or not is_current_weekly_plan(plan):
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="请先生成并确认周计划，再维护购物清单",
-        )
-    item = await repository.create_shopping_item(
-        context.user_id,
-        **{**request.model_dump(), "origin": "extra_purchase"},
-    )
-    return _shopping_response(item)
-
-
-@router.get("/shopping/{item_id}/impact", response_model=ShoppingImpactResponse)
-async def shopping_item_impact(
-    item_id: int, context: CurrentContext, session: SessionDep
-) -> ShoppingImpactResponse:
-    """Return the meals that depend on a shopping item before structural edits."""
-    repository = PlanningRepository(session)
-    item = await repository.get_shopping_item(item_id, context.user_id)
-    if item is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="购物条目不存在")
-    plan = await repository.get_plan(item.plan_id, context.user_id)
-    if plan is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="关联计划不存在")
-    return _shopping_impact_response(plan, item)
-
-
-@router.get("/shopping/{item_id}", response_model=ShoppingItem)
-async def get_shopping_item(
-    item_id: int, context: CurrentContext, session: SessionDep
-) -> ShoppingItem:
-    item = await PlanningRepository(session).get_shopping_item(item_id, context.user_id)
-    if item is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="购物条目不存在")
-    return _shopping_response(item)
-
-
 @router.patch("/shopping/{item_id}", response_model=ShoppingItem)
-async def update_shopping_item(
+async def record_shopping_purchase(
     item_id: int,
-    request: ShoppingItemUpdate,
+    request: ShoppingPurchaseUpdate,
     context: CurrentContext,
     session: SessionDep,
 ) -> ShoppingItem:
@@ -942,24 +849,8 @@ async def update_shopping_item(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="购物条目不存在")
     was_purchased = item.purchased
     planned_price = item.price
-    changes = request.item_changes()
-    # 普通购物接口不允许改变来源类型。餐食食材只能由计划修订创建或调整。
-    changes.pop("origin", None)
-    if "category" in changes:
-        changes["category"] = normalize_shopping_category(changes["category"], item.name)
-    structural_change = any(
-        key in changes and changes[key] != getattr(item, key) for key in ("name", "quantity")
-    )
-    if structural_change and item.origin == "meal_ingredient":
-        plan = await repository.get_plan(item.plan_id, context.user_id)
-        impact = _shopping_impact_response(plan, item) if plan is not None else None
-        if impact is not None and impact.has_impact:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=impact.model_dump(),
-            )
-    for key, value in changes.items():
-        setattr(item, key, value)
+    if request.purchased is not None:
+        item.purchased = request.purchased
     await repository.save_item(item)
     # 采购项从未购买切换为已购买时，把核销结果回流为执行反馈
     # Phase 3 清理：库存入库（restock_from_shopping）随 inventory_items 表删除而移除
@@ -984,163 +875,6 @@ async def update_shopping_item(
             ),
         )
         await _invalidate_user_cache(context.user_id)
-    return _shopping_response(item)
-
-
-@router.delete("/shopping/{item_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_shopping_item(item_id: int, context: CurrentContext, session: SessionDep) -> None:
-    repository = PlanningRepository(session)
-    item = await repository.get_shopping_item(item_id, context.user_id)
-    if item is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="购物条目不存在")
-    plan = await repository.get_plan(item.plan_id, context.user_id)
-    impact = (
-        _shopping_impact_response(plan, item)
-        if plan is not None and item.origin == "meal_ingredient"
-        else None
-    )
-    if impact is not None and impact.has_impact:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=impact.model_dump(),
-        )
-    await repository.delete_item(item)
-
-
-@router.post("/shopping/merge", response_model=ShoppingMergeResponse)
-async def merge_shopping(context: CurrentContext, session: SessionDep) -> ShoppingMergeResponse:
-    repository = PlanningRepository(session)
-    await repository.expire_old_plans(context.user_id)
-    plan = await repository.get_active_plan(context.user_id)
-    if plan is None or not is_current_weekly_plan(plan):
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="请先生成并确认周计划，再合并购物清单",
-        )
-    merged_groups, removed_items, items, conversion_notes = await DomainRepository(
-        session
-    ).merge_shopping(context.user_id)
-    return ShoppingMergeResponse(
-        merged_groups=merged_groups,
-        removed_items=removed_items,
-        items=[_shopping_response(item) for item in items],
-        conversion_notes=conversion_notes,
-    )
-
-
-@router.get(
-    "/shopping/{item_id}/substitutions",
-    response_model=ShoppingSubstitutionResponse,
-)
-async def shopping_substitutions(
-    item_id: int,
-    context: CurrentContext,
-    session: SessionDep,
-    limit: int = Query(default=5, ge=1, le=10, description="返回替代建议数量"),
-) -> ShoppingSubstitutionResponse:
-    """G08 购物替代图谱化：图谱显式关系 + 营养相似度兜底。
-
-    优先查询 Neo4j ``SUBSTITUTABLE_FOR`` 边（人工标注的权威替代）；
-    图谱无命中时按食材营养库四维向量余弦相似度返回 Top-N 近似替代。
-    外部依赖不可用时只降级返回空列表，不阻断主业务。
-    """
-    item = await PlanningRepository(session).get_shopping_item(item_id, context.user_id)
-    if item is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="购物项不存在")
-
-    service = get_substitution_service()
-    suggestions = await service.suggest(item.name, limit=limit)
-
-    # 按来源统计命中数，便于前端区分"权威替代"与"营养近似"
-    source_summary: dict[str, int] = {}
-    for suggestion in suggestions:
-        source_summary[suggestion.source] = source_summary.get(suggestion.source, 0) + 1
-
-    return ShoppingSubstitutionResponse(
-        item_id=item.id,
-        name=item.name,
-        suggestions=[
-            SubstitutionSuggestion(
-                name=s.name,
-                reason=s.reason,
-                similarity=s.similarity,
-                source=s.source,
-                nutrition=s.nutrition,
-            )
-            for s in suggestions
-        ],
-        source_summary=source_summary,
-    )
-
-
-@router.post("/shopping/{item_id}/auto-substitute", response_model=ShoppingItem)
-async def auto_substitute_shopping_item(
-    item_id: int, context: CurrentContext, session: SessionDep
-) -> ShoppingItem:
-    """食材替换确认闭环：自动召回等价品替换当前购物项。
-
-    对购物项名称召回 Top-1 替代建议（图谱显式关系优先，营养相似度兜底），
-    有命中时把名称替换为替代品并记录 ``substituted_from``（原食材名）、
-    ``substituted_accepted=None``（待用户确认）。无命中时原样返回
-    （``substituted_from`` 保持 None），由前端提示"暂无替代"。
-    """
-    repository = PlanningRepository(session)
-    item = await repository.get_shopping_item(item_id, context.user_id)
-    if item is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="购物项不存在")
-
-    service = get_substitution_service()
-    suggestions = await service.suggest(item.name, limit=1)
-    if not suggestions:
-        return _shopping_response(item)
-
-    item.substituted_from = item.name
-    item.name = suggestions[0].name
-    item.substituted_accepted = None
-    await repository.save_item(item)
-    return _shopping_response(item)
-
-
-@router.post("/shopping/{item_id}/substitution/accept", response_model=ShoppingItem)
-async def accept_shopping_substitution(
-    item_id: int,
-    request: ShoppingSubstitutionDecision,
-    context: CurrentContext,
-    session: SessionDep,
-) -> ShoppingItem:
-    """食材替换确认闭环：接受 / 拒绝 / 换一个。
-
-    - ``accept``：确认替换（``substituted_accepted=True``）。
-    - ``reject``：回退到 ``substituted_from`` 并清空替换标记。
-    - ``swap``：换成指定替代品（或自动召回下一条），保持待确认状态。
-    """
-    repository = PlanningRepository(session)
-    item = await repository.get_shopping_item(item_id, context.user_id)
-    if item is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="购物项不存在")
-
-    original = item.substituted_from
-    if original is None:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="该购物项没有待确认的替换")
-
-    if request.action == "accept":
-        item.substituted_accepted = True
-    elif request.action == "reject":
-        item.name = original
-        item.substituted_from = None
-        item.substituted_accepted = None
-    else:  # swap
-        next_name = request.name
-        if not next_name:
-            service = get_substitution_service()
-            suggestions = await service.suggest(original, limit=10)
-            next_name = next((s.name for s in suggestions if s.name != item.name), None)
-        if not next_name:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="没有更多替代建议")
-        item.name = next_name
-        item.substituted_accepted = None
-
-    await repository.save_item(item)
     return _shopping_response(item)
 
 

@@ -9,8 +9,17 @@ the chain is never interrupted.
 The design deliberately mirrors :mod:`app.services.embeddings` — a frozen
 dataclass carrying the resolved callable plus display metadata, and a factory
 that never triggers an implicit multi-GB download.
+
+FlagEmbedding 1.3+ 兼容要点：
+- ``FlagModel`` 在 1.3+ 已变为 embedder（无 ``compute_score``），reranker 须用
+  ``FlagReranker``；1.2.x 经典版两者均有，优先取 ``FlagReranker``。
+- ``**kwargs`` 中的 ``local_files_only`` 不会被转发给 ``from_pretrained``，
+  离线保证只能靠「解析为本地快照目录后按路径加载」实现：
+  ``snapshot_download(repo, local_files_only=True)`` 命中缓存返回本地路径，
+  未缓存则抛错——绝不触发隐式下载。
 """
 
+import inspect
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -48,29 +57,21 @@ class RerankBackend:
 def create_rerank_backend(settings: Settings) -> RerankBackend | None:
     """Resolve the reranker backend, returning ``None`` when unavailable.
 
-    依赖 ``FlagEmbedding`` 包与本地 bge-reranker-v2-m3 模型文件；二者任一缺失
-    即优雅降级为 ``None``（检索链路继续用首阶段排序，不中断）。绝不触发隐式下载。
+    依赖 ``FlagEmbedding`` 包与本地 bge-reranker-v2-m3 模型（显式路径或 HF
+    缓存快照）；二者任一缺失即优雅降级为 ``None``（检索链路继续用首阶段
+    排序，不中断）。绝不触发隐式下载。
     """
     if not settings.rerank_enabled:
         return None
-    try:
-        from FlagEmbedding import FlagModel
-    except ImportError:
+    model_cls = _resolve_reranker_class()
+    if model_cls is None:
         logger.warning("FlagEmbedding 未安装，二阶段精排（rerank）不可用，退回首阶段排序")
         return None
-    local_path = settings.rerank_model_path.strip()
-    if local_path and not Path(local_path).is_dir():
-        logger.warning("rerank 本地模型目录不存在: {}", local_path)
+    model_ref = _resolve_model_ref(settings)
+    if model_ref is None:
         return None
-    model_ref = local_path or settings.rerank_model
     try:
-        model = FlagModel(
-            model_ref,
-            use_fp16=False,
-            device=settings.rerank_device,
-            # 与 BGE-M3 一致：绝不触发隐式下载，模型必须预置于本地。
-            local_files_only=True,
-        )
+        model = _load_reranker(model_cls, model_ref, settings)
     except Exception as exc:
         logger.warning("rerank 模型加载失败 ({}): {}", model_ref, type(exc).__name__)
         return None
@@ -79,4 +80,48 @@ def create_rerank_backend(settings: Settings) -> RerankBackend | None:
         model_name=f"bge-reranker-v2-m3 ({model_ref})",
         label="二阶段精排模型 bge-reranker-v2-m3",
     )
-  
+
+
+def _resolve_reranker_class() -> Any | None:
+    """优先 ``FlagReranker``（1.2+ 均导出），避免 1.3+ 误用 embedder FlagModel。"""
+    try:
+        from FlagEmbedding import FlagReranker
+    except ImportError:
+        try:
+            from FlagEmbedding import FlagModel as FlagReranker  # type: ignore[no-redef]
+        except ImportError:
+            return None
+    return FlagReranker
+
+
+def _resolve_model_ref(settings: Settings) -> str | None:
+    """解析为本地模型引用：显式路径优先，其次 HF 缓存快照（绝不下载）。"""
+    local_path = settings.rerank_model_path.strip()
+    if local_path:
+        if Path(local_path).is_dir():
+            return local_path
+        logger.warning("rerank 本地模型目录不存在: {}", local_path)
+        return None
+    try:
+        from huggingface_hub import snapshot_download
+
+        # local_files_only=True：仅命中本地缓存返回路径，未缓存直接抛错
+        return str(snapshot_download(settings.rerank_model, local_files_only=True))
+    except Exception:
+        logger.info(
+            "HF 缓存中未找到 {} ，rerank 不可用（如需启用请在 RERANK_MODEL_PATH "
+            "配置本地模型目录）",
+            settings.rerank_model,
+        )
+        return None
+
+
+def _load_reranker(model_cls: Any, model_ref: str, settings: Settings) -> Any:
+    """加载 reranker，兼容 devices (1.2+/1.4) 与 device（旧版）参数名。"""
+    parameters = inspect.signature(model_cls.__init__).parameters
+    kwargs: dict[str, Any] = {"use_fp16": False}
+    if "devices" in parameters:
+        kwargs["devices"] = [settings.rerank_device]
+    elif "device" in parameters:
+        kwargs["device"] = settings.rerank_device
+    return model_cls(model_ref, **kwargs)

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   AlertCircle, ArrowRight, CheckCircle2,
@@ -8,7 +8,7 @@ import {
 } from 'lucide-vue-next'
 import { api, apiErrorMessage } from '../api'
 import { useAppStore } from '../stores/app'
-import type { BudgetAnalytics, Dashboard, MealItem, RecipeSummary, TodayNutritionResponse, UserProfileResponse } from '../types'
+import type { BudgetAnalytics, Dashboard, MealItem, RecipeSummary, ShoppingItem, TodayNutritionResponse, UserProfileResponse } from '../types'
 
 const router = useRouter()
 const store = useAppStore()
@@ -27,6 +27,8 @@ const todayMeals = ref<MealItem[]>([])
 const todayNutrition = ref<TodayNutritionResponse | null>(null)
 const dashboard = ref<Dashboard | null>(null)
 const budget = ref<BudgetAnalytics | null>(null)
+const shoppingItems = ref<ShoppingItem[]>([])
+let homeRequestSeq = 0
 
 /* ───────── 日期与问候 ───────── */
 const DAY_LABELS = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
@@ -113,8 +115,10 @@ const progressBars = computed<ProgressBar[]>(() => {
 })
 
 /* ───────── ③ 购物摘要 ───────── */
-const shoppingBudget = computed(() => budget.value?.limit ?? dashboard.value?.budget?.limit ?? 0)
-const shoppingSpent = computed(() => budget.value?.actual_spent ?? dashboard.value?.budget?.estimated ?? 0)
+// 首页购物摘要统一使用当前周计划派生的购物清单金额，避免把预算上限
+// （例如 ¥300）与清单估价（例如 ¥97）混在同一组指标中。
+const shoppingBudget = computed(() => shoppingItems.value.reduce((sum, item) => sum + item.price, 0))
+const shoppingSpent = computed(() => shoppingItems.value.filter(item => item.purchased).reduce((sum, item) => sum + item.price, 0))
 const shoppingRemaining = computed(() => Math.max(0, shoppingBudget.value - shoppingSpent.value))
 
 /* ───────── 数据加载 ───────── */
@@ -139,19 +143,24 @@ function generateExpiredPlan() {
 
 async function fetchHomeCards() {
   if (!store.isAuthenticated) return
+  const requestSeq = ++homeRequestSeq
   const results = await Promise.allSettled([
     api.profile(),
     api.meals(),
     api.todayNutrition(),
     api.dashboard(),
     api.budgetAnalytics(),
+    api.shopping(),
   ])
-  const [profileRes, mealsRes, nutritionRes, dashboardRes, budgetRes] = results
+  // 打卡/核销后可能与首次加载并发；丢弃较早请求，避免旧数据覆盖新状态。
+  if (requestSeq !== homeRequestSeq) return
+  const [profileRes, mealsRes, nutritionRes, dashboardRes, budgetRes, shoppingRes] = results
   if (profileRes.status === 'fulfilled') profile.value = profileRes.value
   if (mealsRes.status === 'fulfilled') todayMeals.value = mealsRes.value
   if (nutritionRes.status === 'fulfilled') todayNutrition.value = nutritionRes.value
   if (dashboardRes.status === 'fulfilled') dashboard.value = dashboardRes.value
   if (budgetRes.status === 'fulfilled') budget.value = budgetRes.value
+  if (shoppingRes.status === 'fulfilled') shoppingItems.value = shoppingRes.value
 }
 
 async function fetchRecipes() {
@@ -168,6 +177,10 @@ async function fetchRecipes() {
 }
 
 onMounted(() => { fetchRecipes(); fetchHomeCards() })
+watch(() => store.homeRefreshToken, () => { void fetchHomeCards() })
+function refreshOnFocus() { if (document.visibilityState === 'visible') void fetchHomeCards() }
+onMounted(() => window.addEventListener('focus', refreshOnFocus))
+onUnmounted(() => window.removeEventListener('focus', refreshOnFocus))
 </script>
 
 <template>

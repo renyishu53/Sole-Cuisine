@@ -18,18 +18,21 @@ from app.services.query_rewriter import rewrite_query
 
 
 def _fake_flag_embedding(monkeypatch, capture):
+    """模拟 FlagEmbedding 1.4+：reranker 由 ``FlagReranker`` 提供（devices 参数）。"""
     module = types.ModuleType("FlagEmbedding")
 
-    class FakeFlagModel:
-        def __init__(self, model_ref, **kwargs):
-            capture.append({"model_ref": model_ref, **kwargs})
+    class FakeFlagReranker:
+        def __init__(self, model_ref, use_fp16=False, devices=None, **kwargs):
+            capture.append(
+                {"model_ref": model_ref, "use_fp16": use_fp16, "devices": devices, **kwargs}
+            )
 
         def compute_score(self, pairs, **kwargs):
             del kwargs
             # 返回与输入等长、可降序排列的分数
             return [float(len(pair[1]) % 5) for pair in pairs]
 
-    module.FlagModel = FakeFlagModel
+    module.FlagReranker = FakeFlagReranker
     monkeypatch.setitem(sys.modules, "FlagEmbedding", module)
     return module
 
@@ -54,21 +57,47 @@ def test_reranker_factory_loads_from_local_path(monkeypatch, tmp_path):
     )
     assert backend is not None
     assert capture[0]["model_ref"] == str(model_dir)
-    assert capture[0]["local_files_only"] is True
+    assert capture[0]["devices"] == ["cpu"]
+    assert capture[0]["use_fp16"] is False
     scores = backend.rerank("本人不吃辣", ["虾仁滑蛋盖饭约18分钟", "番茄鸡蛋面"])
     assert len(scores) == 2
     assert all(isinstance(s, float) for s in scores)
 
 
-def test_reranker_factory_never_downloads_implicitly(monkeypatch):
+def test_reranker_factory_resolves_hf_cache_snapshot(monkeypatch, tmp_path):
+    """未配置本地路径时，从 HF 缓存解析快照目录（不下载）。"""
     capture = []
     _fake_flag_embedding(monkeypatch, capture)
+    snapshot_dir = tmp_path / "snapshot"
+    snapshot_dir.mkdir()
+    monkeypatch.setattr(
+        "huggingface_hub.snapshot_download",
+        lambda repo_id, **kwargs: str(snapshot_dir),
+    )
     from app.services.reranker import create_rerank_backend
 
     backend = create_rerank_backend(Settings(_env_file=None, rerank_enabled=True))
     assert backend is not None
-    assert capture[0]["model_ref"] == "BAAI/bge-reranker-v2-m3"
-    assert capture[0]["local_files_only"] is True
+    assert capture[0]["model_ref"] == str(snapshot_dir)
+
+
+def test_reranker_factory_never_downloads_implicitly(monkeypatch):
+    """HF 缓存未命中时必须直接降级，绝不触发隐式下载。"""
+    capture = []
+    _fake_flag_embedding(monkeypatch, capture)
+    calls = []
+
+    def _snapshot_download(repo_id, **kwargs):
+        calls.append({"repo_id": repo_id, **kwargs})
+        raise FileNotFoundError("cache miss")
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", _snapshot_download)
+    from app.services.reranker import create_rerank_backend
+
+    backend = create_rerank_backend(Settings(_env_file=None, rerank_enabled=True))
+    assert backend is None
+    assert calls and calls[0]["repo_id"] == "BAAI/bge-reranker-v2-m3"
+    assert calls[0]["local_files_only"] is True
 
 
 def test_reranker_factory_disabled_returns_none():

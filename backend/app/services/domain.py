@@ -55,7 +55,7 @@ def _category_for_ingredient(name: str) -> str:
 
 
 def _normalize_shopping_name(name: str) -> str:
-    """与 ``DomainRepository.merge_shopping`` 对齐的归一化，用于去重判断。"""
+    """Normalize ingredient names when synchronizing plan-derived shopping items."""
     normalized = "".join(name.lower().split())
     return _INGREDIENT_CATEGORY_ALIASES.get(normalized, normalized)
 

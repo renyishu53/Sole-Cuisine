@@ -1,6 +1,6 @@
 from datetime import date, datetime
 from enum import StrEnum
-from typing import Any, ClassVar, Literal
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -436,12 +436,7 @@ class ShoppingItem(BaseModel):
     quantity: str
     price: float
     source: str
-    origin: Literal["meal_ingredient", "extra_purchase"] = "meal_ingredient"
     purchased: bool = False
-    # 食材替换确认闭环：substituted_from 记录被替换前的原食材名，
-    # substituted_accepted 记录用户是否确认（None=待确认，True=已接受，False=已拒绝并回退）。
-    substituted_from: str | None = None
-    substituted_accepted: bool | None = None
 
     @model_validator(mode="after")
     def normalize_category(self) -> "ShoppingItem":
@@ -449,77 +444,20 @@ class ShoppingItem(BaseModel):
         return self
 
 
-class ShoppingItemCreate(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True)
+class ShoppingPurchaseUpdate(BaseModel):
+    """Record procurement execution without mutating plan-derived item structure."""
 
-    name: str = Field(min_length=1, max_length=120)
-    category: str = Field(default="其他", min_length=1, max_length=40)
-    quantity: str = Field(default="1", min_length=1, max_length=40)
-    price: float = Field(default=0, ge=0, le=100000)
-    source: str = Field(default="手工添加", max_length=100)
-    purchased: bool = False
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
-    @model_validator(mode="after")
-    def normalize_category(self) -> "ShoppingItemCreate":
-        self.category = normalize_shopping_category(self.category, self.name)
-        return self
-
-
-class ShoppingItemUpdate(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True)
-
-    name: str | None = Field(default=None, min_length=1, max_length=120)
-    category: str | None = Field(default=None, min_length=1, max_length=40)
-    quantity: str | None = Field(default=None, min_length=1, max_length=40)
-    price: float | None = Field(default=None, ge=0, le=100000)
-    source: str | None = Field(default=None, max_length=100)
-    origin: Literal["meal_ingredient", "extra_purchase"] | None = None
     purchased: bool | None = None
-    # 核销反馈：仅在 purchased 由 false → true 时参与闭环回流，不落到 PlanShoppingItem
     actual_price: float | None = Field(default=None, ge=0, le=100000)
     verification_note: str | None = Field(default=None, max_length=500)
 
-    #: 反馈字段不是购物条目的持久化列，写回 ORM 前需要剔除
-    FEEDBACK_FIELDS: ClassVar[frozenset[str]] = frozenset({"actual_price", "verification_note"})
-
     @model_validator(mode="after")
-    def ensure_values(self) -> "ShoppingItemUpdate":
+    def ensure_values(self) -> "ShoppingPurchaseUpdate":
         if not self.model_fields_set:
             raise ValueError("至少提供一个需要修改的字段")
         return self
-
-    @model_validator(mode="after")
-    def normalize_category(self) -> "ShoppingItemUpdate":
-        if self.category is not None:
-            self.category = normalize_shopping_category(self.category, self.name or "")
-        return self
-
-    def item_changes(self) -> dict[str, Any]:
-        """只返回需要写回购物条目的字段。"""
-        return {
-            key: value
-            for key, value in self.model_dump(exclude_unset=True).items()
-            if key not in self.FEEDBACK_FIELDS
-        }
-
-
-class ShoppingImpactMeal(BaseModel):
-    """餐食与购物条目的依赖关系摘要。"""
-
-    id: int
-    day: str
-    meal_type: str
-    name: str
-
-
-class ShoppingImpactResponse(BaseModel):
-    """描述修改购物条目是否会破坏当前计划的餐食依赖。"""
-
-    item_id: int
-    item_name: str
-    has_impact: bool
-    affected_meals: list[ShoppingImpactMeal] = Field(default_factory=list)
-    message: str = ""
 
 
 class MealReplacementRequest(BaseModel):
@@ -558,13 +496,6 @@ class TodayNutritionResponse(BaseModel):
     eaten_count: int = 0
     nutrients: dict[str, TodayNutrient] = Field(default_factory=dict)
     overall_percent: float = 0
-
-
-class ShoppingMergeResponse(BaseModel):
-    merged_groups: int
-    removed_items: int
-    items: list[ShoppingItem]
-    conversion_notes: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ExpenseHistoryItem(BaseModel):
@@ -990,6 +921,8 @@ class RetrievalDiagnostics(BaseModel):
     neo4j: str
     embedding: str = "all-MiniLM-L6-v2 (384d)"
     rerank: str = "disabled"
+    # 稀疏检索状态：hybrid（稠密+稀疏双路 RRF）/ disabled（纯稠密召回）
+    sparse: str = "disabled"
 
 
 class KnowledgeSearchResponse(BaseModel):
@@ -1016,6 +949,7 @@ class AIServiceStatus(BaseModel):
     celery: str = "configured"
     embedding: str = "内置轻量语义模型"
     reranker: str = "未启用二阶段精排"
+    sparse: str = "未启用稀疏检索"
 
 
 class SyncConsistencyResponse(BaseModel):
@@ -1497,52 +1431,6 @@ class ArchivedPlanResponse(BaseModel):
     status: str
     is_active: bool
     archived_at: datetime
-
-
-# ---------- G08 购物替代图谱化 ----------
-
-
-class SubstitutionSuggestion(BaseModel):
-    """单条食材替代建议。
-
-    ``source`` 标识数据来源：``graph`` 为 Neo4j 显式 SUBSTITUTABLE_FOR 关系，
-    ``nutrition`` 为食材营养库余弦相似度兜底。前端可据此区分"权威替代"
-    与"营养近似"。
-    """
-
-    name: str = Field(min_length=1, max_length=120)
-    reason: str = ""
-    similarity: float = Field(ge=0.0, le=1.0)
-    source: str = Field(default="graph", pattern="^(graph|nutrition)$")
-    nutrition: dict[str, float] | None = Field(
-        default=None,
-        description="替代食材每 100g 营养快照，用于前端对比展示",
-    )
-
-
-class ShoppingSubstitutionResponse(BaseModel):
-    """购物替代建议响应。"""
-
-    item_id: int
-    name: str
-    suggestions: list[SubstitutionSuggestion]
-    source_summary: dict[str, int] = Field(
-        default_factory=dict,
-        description="按来源统计的命中数，如 {'graph': 2, 'nutrition': 3}",
-    )
-
-
-class ShoppingSubstitutionDecision(BaseModel):
-    """购物项替换确认请求（接受 / 拒绝 / 换一个）。
-
-    - ``accept``：确认当前替换，``substituted_accepted=True``。
-    - ``reject``：拒绝替换，回退到 ``substituted_from`` 并清空替换标记。
-    - ``swap``：换一个替代品；``name`` 传前端选定的新食材名，缺省时自动召回
-      与当前名称不同的下一条替代建议。
-    """
-
-    action: Literal["accept", "reject", "swap"] = "accept"
-    name: str | None = Field(default=None, min_length=1, max_length=120)
 
 
 class SubstitutionSeedResponse(BaseModel):

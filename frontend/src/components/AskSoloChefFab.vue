@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Camera, Flame, History, ImagePlus, Loader2, MessageCircleMore, Plus, Send, ShoppingBag, Sparkles, Trash2, UserRound, Utensils, X } from 'lucide-vue-next'
+import { Camera, Flame, History, ImagePlus, Loader2, MessageCircleMore, Plus, RotateCcw, Send, ShoppingBag, Sparkles, Trash2, UserRound, Utensils, X } from 'lucide-vue-next'
 import { api, apiErrorMessage } from '../api'
 import { useAppStore } from '../stores/app'
 import type { VisionResult, VisionScene } from '../types'
@@ -24,6 +24,88 @@ const streamedText = computed(() => store.chatStreamText)
 const toolEvents = computed(() => store.chatToolEvents)
 const thinkingHint = computed(() => store.chatThinkingHint)
 const bodyEl = ref<HTMLElement>()
+
+type AssistantCorner = 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right'
+
+const ASSISTANT_POSITION_KEY = 'solochef:assistant-corner'
+const DEFAULT_CORNER: AssistantCorner = 'bottom-right'
+const assistantCorner = ref<AssistantCorner>(readAssistantCorner())
+const dragging = ref(false)
+const dragMoved = ref(false)
+const dragPoint = ref({ x: 0, y: 0 })
+
+function readAssistantCorner(): AssistantCorner {
+  const value = localStorage.getItem(ASSISTANT_POSITION_KEY)
+  return value === 'top-left' || value === 'top-right' || value === 'bottom-left' || value === 'bottom-right'
+    ? value
+    : DEFAULT_CORNER
+}
+
+function publishAssistantCorner(): void {
+  localStorage.setItem(ASSISTANT_POSITION_KEY, assistantCorner.value)
+  window.dispatchEvent(new CustomEvent('solochef:assistant-position', {
+    detail: { corner: assistantCorner.value },
+  }))
+}
+
+const fabPosition = computed<Record<string, string>>(() => {
+  if (dragging.value) {
+    return {
+      left: `${Math.max(12, Math.min(window.innerWidth - 62, dragPoint.value.x - 25))}px`,
+      top: `${Math.max(12, Math.min(window.innerHeight - 62, dragPoint.value.y - 25))}px`,
+      right: 'auto',
+      bottom: 'auto',
+    }
+  }
+  const margin = window.innerWidth <= 820 ? '16px' : '26px'
+  const plannerBottom = window.innerWidth <= 820 ? '150px' : '132px'
+  const bottom = inPlanner.value ? plannerBottom : window.innerWidth <= 820 ? '82px' : '58px'
+  return {
+    left: assistantCorner.value.endsWith('left') ? margin : 'auto',
+    right: assistantCorner.value.endsWith('right') ? margin : 'auto',
+    top: assistantCorner.value.startsWith('top') ? margin : 'auto',
+    bottom: assistantCorner.value.startsWith('bottom') ? bottom : 'auto',
+  }
+})
+
+function beginDrag(event: PointerEvent): void {
+  if (open.value) return
+  dragging.value = true
+  dragMoved.value = false
+  dragPoint.value = { x: event.clientX, y: event.clientY }
+  window.addEventListener('pointermove', moveAssistant)
+  window.addEventListener('pointerup', endDrag, { once: true })
+}
+
+function moveAssistant(event: PointerEvent): void {
+  if (!dragging.value) return
+  if (Math.abs(event.clientX - dragPoint.value.x) > 4 || Math.abs(event.clientY - dragPoint.value.y) > 4) {
+    dragMoved.value = true
+  }
+  dragPoint.value = { x: event.clientX, y: event.clientY }
+}
+
+function endDrag(event: PointerEvent): void {
+  if (!dragging.value) return
+  dragging.value = false
+  window.removeEventListener('pointermove', moveAssistant)
+  if (!dragMoved.value) return
+  assistantCorner.value = `${event.clientY < window.innerHeight / 2 ? 'top' : 'bottom'}-${event.clientX < window.innerWidth / 2 ? 'left' : 'right'}` as AssistantCorner
+  publishAssistantCorner()
+}
+
+function openAssistant(): void {
+  if (dragMoved.value) {
+    dragMoved.value = false
+    return
+  }
+  store.openChat()
+}
+
+function resetAssistantPosition(): void {
+  assistantCorner.value = DEFAULT_CORNER
+  publishAssistantCorner()
+}
 
 // 快捷问题：饮食/食谱、购物/预算、热量/营养（禁用 emoji，统一 Lucide SVG）
 const QUICK_QUESTIONS = [
@@ -147,6 +229,8 @@ onMounted(() => {
   }
 })
 
+onBeforeUnmount(() => window.removeEventListener('pointermove', moveAssistant))
+
 watch(
   () => [messages.value.length, streamedText.value, thinkingHint.value],
   () => { void scrollBottom() },
@@ -154,22 +238,24 @@ watch(
 </script>
 
 <template>
-  <div v-if="!store.assistantSuppressed || open" class="ask-fab-root">
+  <div v-if="!store.assistantSuppressed" class="ask-fab-root">
     <!-- FAB 按钮：触控目标 50×50 ≥ 44px -->
     <button
       v-if="!open"
       class="ask-fab"
-      :class="{ 'planner-page': inPlanner }"
+      :class="{ dragging }"
+      :style="fabPosition"
       aria-label="问 SoloChef"
       aria-expanded="false"
-      @click="store.openChat"
+      @pointerdown="beginDrag"
+      @click="openAssistant"
     >
       <MessageCircleMore :size="22" /><span>问 SoloChef</span>
     </button>
 
     <!-- 滑出面板：问答与安全业务 handoff -->
     <Transition name="slide">
-      <section v-if="open" :class="['ask-panel', { 'planner-page': inPlanner, 'history-open': historyOpen }]" role="dialog" aria-label="SoloChef 助手">
+      <section v-if="open" :class="['ask-panel', `corner-${assistantCorner}`, { 'planner-page': inPlanner, 'history-open': historyOpen }]" role="dialog" aria-label="SoloChef 助手">
         <header class="ask-panel-head">
           <div class="ask-brand">
             <span class="ask-brand-mark"><Sparkles :size="16" /></span>
@@ -180,6 +266,7 @@ watch(
           </div>
           <div class="ask-panel-head-actions">
             <button class="ask-history-toggle" type="button" @click="historyOpen = !historyOpen"><History :size="15" />对话历史</button>
+            <button class="icon-button" type="button" aria-label="恢复助手默认位置" title="恢复默认位置" @click="resetAssistantPosition"><RotateCcw :size="16" /></button>
             <button class="icon-button" aria-label="关闭助手" @click="store.closeChat"><X :size="18" /></button>
           </div>
         </header>
@@ -294,7 +381,7 @@ watch(
 .ask-fab-root { position: fixed; z-index: 50; }
 
 .ask-fab {
-  position: fixed; right: 26px; bottom: 58px; z-index: 51;
+  position: fixed; z-index: 51;
   display: inline-flex; align-items: center; gap: 8px; height: 50px; padding: 0 20px;
   border: 0; border-radius: 25px; cursor: pointer;
   background: var(--primary); color: #fff;
@@ -307,7 +394,7 @@ watch(
 .ask-fab:active { transform: scale(0.98); }
 .ask-fab:focus-visible { outline: 3px solid #fff; outline-offset: 2px; box-shadow: 0 0 0 4px var(--primary), 0 10px 24px rgba(24, 66, 53, .32); }
 .ask-fab.open { background: var(--text); padding: 0; width: 50px; justify-content: center; }
-.ask-fab.planner-page { bottom: 132px; }
+.ask-fab.dragging { cursor: grabbing; transition: none; }
 
 .ask-panel {
   position: fixed; right: 26px; bottom: 118px; z-index: 51;
@@ -324,6 +411,9 @@ watch(
   padding: 14px 16px; border-bottom: 1px solid var(--line);
   background: linear-gradient(135deg, var(--primary-light), #e7f0ea);
 }
+.ask-panel.corner-bottom-left { left: 26px; right: auto; }
+.ask-panel.corner-top-right { top: 26px; bottom: auto; }
+.ask-panel.corner-top-left { top: 26px; bottom: auto; left: 26px; right: auto; }
 .ask-panel-head-actions { display: flex; align-items: center; gap: 6px; }
 .ask-history-toggle { display: none; }
 .ask-brand { display: flex; align-items: center; gap: 10px; }
@@ -460,9 +550,10 @@ watch(
 .slide-enter-from, .slide-leave-to { transform: translateX(18px) translateY(10px); opacity: 0; }
 
 @media (max-width: 820px) {
-  .ask-fab { right: 16px; bottom: 82px; }
-  .ask-fab.planner-page { bottom: 150px; }
   .ask-panel { right: 12px; bottom: 140px; width: calc(100vw - 24px); height: min(680px, calc(100dvh - 160px)); }
+  .ask-panel.corner-bottom-left { left: 12px; right: auto; }
+  .ask-panel.corner-top-right { top: 12px; bottom: auto; }
+  .ask-panel.corner-top-left { top: 12px; bottom: auto; left: 12px; right: auto; }
   .ask-panel.planner-page { bottom: 208px; height: min(680px, calc(100dvh - 228px)); }
   .ask-history-toggle { min-height: 34px; display: inline-flex; align-items: center; gap: 5px; padding: 0 8px; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--primary); font-size: var(--font-xs); font-weight: 600; }
   .ask-history { display: none; width: min(280px, calc(100% - 36px)); box-shadow: var(--shadow-lg); }

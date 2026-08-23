@@ -832,13 +832,25 @@ class SoloChefWorkflow:
                 )
             )
 
+        # 预算超限优先交给 Supervisor 重派专家修正；只有达到轮次上限后
+        # 才进入人工接管，避免“能检测超预算、却永远不会自动重试”。
+        budget_retry_available = (
+            shopping_estimated > request.budget
+            and self._settings.workflow_supervisor_enabled
+            and int(state.get("supervisor_round", 0)) < self._settings.supervisor_max_rounds
+            and int(state.get("supervisor_total_dispatches", 0)) < self._settings.supervisor_max_total_dispatches
+        )
+
         # 第 3 级人工接管判定：硬冲突率 > 30% → 提示放宽条件
         needs_manual_review, manual_review_hint = evaluate_manual_review(
             conflicts, len(draft.meals)
         )
-        if shopping_estimated > request.budget:
+        if shopping_estimated > request.budget and not budget_retry_available:
             needs_manual_review = True
             manual_review_hint = "采购估价超过预算，请调整餐食、采购数量或预算后再确认"
+        elif budget_retry_available:
+            needs_manual_review = False
+            manual_review_hint = "采购估价超过预算，正在让餐食与采购专家重新压缩方案"
 
         # 扁平化冲突信息（向后兼容 PlanningResponse.conflicts / WeeklyPlan.conflicts）
         flat_conflicts = [conflict.message for conflict in conflicts]

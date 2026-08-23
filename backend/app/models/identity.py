@@ -259,16 +259,7 @@ class PlanShoppingItem(TimestampMixin, Base):
     quantity: Mapped[str] = mapped_column(String(40), default="1", server_default="1")
     price: Mapped[float] = mapped_column(default=0, server_default="0")
     source: Mapped[str] = mapped_column(String(100), default="", server_default="")
-    # meal_ingredient 由计划生成或计划修订产生；extra_purchase 只影响采购与预算。
-    origin: Mapped[str] = mapped_column(
-        String(24), default="meal_ingredient", server_default="meal_ingredient", index=True
-    )
     purchased: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
-    # Phase 3 任务B：食材替换确认闭环
-    # substituted_from 记录被替换前的原食材名；substituted_accepted 记录用户是否
-    # 确认该替换（None=待确认，True=已接受，False=已拒绝并回退）。
-    substituted_from: Mapped[str | None] = mapped_column(String(120), nullable=True)
-    substituted_accepted: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
 
     plan: Mapped[WeeklyPlan] = relationship(back_populates="shopping_items")
 

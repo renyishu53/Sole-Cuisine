@@ -30,17 +30,7 @@ ApplyRevision: TypeAlias = Callable[[Any, ReviseOperation, list[Any]], AppliedRe
 def route_revision(operation: ReviseOperation) -> RevisionRouteDecision:
     """Map a parsed operation to affected planning capabilities."""
     operation_type = operation.operation
-    if operation_type == "adjust_shopping":
-        routing = RevisionRouteDecision(
-            route=RevisionRoute.SHOPPING,
-            requires=[
-                IntentCapability.SHOPPING,
-                IntentCapability.BUDGET,
-                IntentCapability.VERIFIER,
-            ],
-            reason="购物项变化需要同步重算采购估价并校验预算",
-        )
-    elif operation_type == "update_budget":
+    if operation_type == "update_budget":
         routing = RevisionRouteDecision(
             route=RevisionRoute.BUDGET,
             requires=[IntentCapability.BUDGET, IntentCapability.VERIFIER],

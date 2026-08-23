@@ -9,21 +9,13 @@ export type MealItemInput = Omit<MealItem, 'id' | 'eaten' | 'eaten_at' | 'deviat
 export type MealDeviationType = 'not_available' | 'no_appetite' | 'ate_other'
 export interface TodayNutrient { target: number; consumed: number; remaining: number; percent: number }
 export interface TodayNutritionResponse { day: string; meal_count: number; eaten_count: number; nutrients: Record<string, TodayNutrient>; overall_percent: number }
-export type ShoppingOrigin = 'meal_ingredient' | 'extra_purchase'
-export interface ShoppingItem { id: number; name: string; category: string; quantity: string; price: number; source: string; origin: ShoppingOrigin; purchased: boolean; actual_price?: number | null; verification_note?: string | null; substituted_from?: string | null; substituted_accepted?: boolean | null }
-export type ShoppingItemInput = Omit<ShoppingItem, 'id' | 'origin' | 'substituted_from' | 'substituted_accepted'>
-export interface ShoppingImpactMeal { id: number; day: string; meal_type: string; name: string }
-export interface ShoppingImpactResponse { item_id: number; item_name: string; has_impact: boolean; affected_meals: ShoppingImpactMeal[]; message: string }
-export interface SubstitutionSuggestion { name: string; reason: string; similarity: number; source: 'graph' | 'nutrition'; nutrition?: Record<string, number> | null }
-export interface ShoppingSubstitutionResponse { item_id: number; name: string; suggestions: SubstitutionSuggestion[]; source_summary: Record<string, number> }
-export type ShoppingSubstitutionAction = 'accept' | 'reject' | 'swap'
-export interface ShoppingSubstitutionDecision { action: ShoppingSubstitutionAction; name?: string | null }
+export interface ShoppingItem { id: number; name: string; category: string; quantity: string; price: number; source: string; purchased: boolean }
 export interface KnowledgeDocument { id: string | number; name: string; category: string; status: string; chunks: number; updated_at: string }
 export interface VectorSearchHit { document_id: string; document_name: string; category: string; content: string; chunk_index: number; score: number; goal_type?: string; meal_time?: string; allergens?: string; nutrition_focus?: string }
 export interface GraphSearchHit { subject: string; relation: string; target: string; detail: string }
-export interface RetrievalDiagnostics { vector_store: string; neo4j: string; embedding: string; rerank?: string }
+export interface RetrievalDiagnostics { vector_store: string; neo4j: string; embedding: string; rerank?: string; sparse?: string }
 export interface KnowledgeSearchResponse { query: string; vector_hits: VectorSearchHit[]; graph_hits: GraphSearchHit[]; elapsed_ms: number; diagnostics: RetrievalDiagnostics }
-export interface AIServiceStatus { rag_enabled: boolean; llm_mode: string; langgraph: string; vector_store: string; neo4j: string; collection: string; documents: number; chunks: number; llm_provider: string; llm_model: string; llm_configured: boolean; redis: string; celery: string; embedding: string; reranker?: string }
+export interface AIServiceStatus { rag_enabled: boolean; llm_mode: string; langgraph: string; vector_store: string; neo4j: string; collection: string; documents: number; chunks: number; llm_provider: string; llm_model: string; llm_configured: boolean; redis: string; celery: string; embedding: string; reranker?: string; sparse?: string }
 export interface SyncConsistencyResponse { vector_status: string; neo4j_status: string; vector_documents: number; vector_chunks: number; neo4j_documents: number; neo4j_entities: number; missing_in_neo4j: string[]; orphan_in_neo4j: string[]; consistent: boolean; notes: string[] }
 export interface RagEvalResult { query: string; recall_at_k: number; ndcg_at_k: number; hit_document_names: string[]; hit_entity_kinds: string[] }
 export interface RagEvalResponse { evaluated_at: string; embedding: string; reranker: string; top_k: number; case_count: number; mean_recall_at_k: number; mean_ndcg_at_k: number; results: RagEvalResult[]; notes: string[] }
@@ -36,7 +28,6 @@ export interface MealAgentResult { strategy: string; constraints_applied: string
 export interface ShoppingAgentResult { strategy: string; merge_keys: string[]; preferred_categories: string[]; purchase_windows: string[] }
 export interface BudgetAgentResult { strategy: string; limit: number; reserve: number; warning_threshold_percent: number; category_limits: Record<string, number> }
 export interface DomainAgentBundle { meal: MealAgentResult; shopping: ShoppingAgentResult; budget: BudgetAgentResult; merged_constraints: string[] }
-export interface ShoppingMergeResponse { merged_groups: number; removed_items: number; items: ShoppingItem[]; conversion_notes: { name: string; original: string; converted: string }[] }
 export interface UserProfileResponse { user_id: number; height_cm: number; weight_kg: number; age: number; gender: string; activity_level: string; goal_type: string; preferences: string[]; constraints: string[]; budget_limit: number; notes: string; cooking_skill: string; kitchenware: string[]; prep_time_max: number; needs_replan: boolean; profile_complete: boolean }
 export interface NutritionGoalResponse { user_id: number; goal_type: string; bmr: number; tdee: number; target_calories: number; protein_g: number; carb_g: number; fat_g: number; activity_level: string; calories_min: number; calories_max: number; protein_min: number; protein_max: number; carb_min: number; carb_max: number; fat_min: number; fat_max: number; hints?: Record<string, string> }
 export interface FeedbackSyncInfo { feedback_id: number; sentiment: 'positive' | 'neutral' | 'negative'; deviation: number; graph_synced: boolean; vector_synced: boolean; notes: string[] }
@@ -99,7 +90,7 @@ export interface InventoryResponse { items: InventoryEntry[]; count: number; low
 export interface ArchivedPlanResponse { id: number; status: string; is_active: boolean; archived_at: string }
 
 // ── Plan Revise（备餐规划局部修改）──
-export type ReviseOperationType = 'replace_meal' | 'remove_meal' | 'add_meal' | 'exclude_ingredient' | 'update_budget' | 'skip_day' | 'adjust_macro_target' | 'adjust_shopping'
+export type ReviseOperationType = 'replace_meal' | 'remove_meal' | 'add_meal' | 'exclude_ingredient' | 'update_budget' | 'skip_day' | 'adjust_macro_target'
 export interface MealProposal { day: string; meal_type: string; name: string; duration: number; cost: number; tags: string[]; reason: string; ingredients: string[] }
 export interface ReviseOperation { operation: ReviseOperationType; target: Record<string, unknown>; constraints: Record<string, unknown>; proposal: MealProposal | null; reason: string }
 export interface NutritionSnapshot { calories: number; protein_g: number; fat_g: number; carbs_g: number }

@@ -2,12 +2,14 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, apiErrorMessage } from '../api'
+import { useAppStore } from '../stores/app'
 import { useToast } from '../composables/useToast'
 import type { MealDeviationType, MealItem, RevisePreviewResponse, WeeklyPlanDetail, WeeklyPlanSummary } from '../types'
 
 const router = useRouter()
 const route = useRoute()
 const toast = useToast()
+const appStore = useAppStore()
 const plan = ref<WeeklyPlanDetail | null>(null)
 const planRequired = computed(() => plan.value as WeeklyPlanDetail)
 const versions = ref<WeeklyPlanSummary[]>([])
@@ -153,6 +155,7 @@ async function checkin(meal: MealItem) {
   meal.eaten = !meal.eaten
   try {
     Object.assign(meal, await api.checkinMeal(meal.id, { eaten: meal.eaten }))
+    appStore.notifyHomeDataChanged()
     toast.show(meal.eaten ? 'Meal checked in' : 'Check-in cancelled', 'success')
   } catch (reason) {
     meal.eaten = before
@@ -172,6 +175,7 @@ async function submitFeedback() {
   checkingId.value = feedbackMeal.value.id
   try {
     Object.assign(feedbackMeal.value, await api.checkinMeal(feedbackMeal.value.id, { eaten: false, deviation_type: feedbackType.value, deviation_reason: feedbackReason.value.trim() }))
+    appStore.notifyHomeDataChanged()
     feedbackMeal.value = null
     toast.show('Feedback saved for the next plan', 'success')
   } catch (reason) { toast.show(apiErrorMessage(reason, '提交反馈失败'), 'error') }

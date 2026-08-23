@@ -48,6 +48,14 @@ class Settings(BaseSettings):
     rerank_device: str = "cpu"
     # 二阶段精排候选倍数：首阶段召回 top_k * multiplier，再用 reranker 精排回 top_k
     rerank_candidate_multiplier: int = 3
+
+    # ── 稀疏向量检索（BGE-M3 lexical weights 可选增强）────────────
+    # 开启后优先经 FlagEmbedding BGEM3FlagModel 同时产出稠密+稀疏向量，
+    # Milvus 双路召回（COSINE 稠密 + IP 稀疏）RRF 融合；模型/依赖缺失时
+    # 自动降级为纯稠密检索，链路不中断。
+    sparse_enabled: bool = True
+    # RRF 融合参数 k：score = Σ 1/(k + rank)，k 越大两路排名权重越平均
+    sparse_rrf_k: int = 60
     llm_provider: str = "demo"
     llm_api_key: str = ""
     llm_model: str = "deepseek-chat"

@@ -84,9 +84,7 @@ class DomainRepository:
             normalized = "".join(item.name.lower().split())
             aliases = {"西红柿": "番茄", "土豆": "马铃薯", "鸡蛋": "蛋", "生抽酱油": "生抽"}
             normalized = aliases.get(normalized, normalized)
-            # Extra purchases are independent procurement records.  They must
-            # never be merged into a meal-derived ingredient merely by name.
-            groups[(item.origin, normalized, item.category)].append(item)
+            groups[(normalized, item.category)].append(item)
         merged_groups = 0
         removed = 0
         conversion_notes: list[dict[str, Any]] = []

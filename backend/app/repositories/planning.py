@@ -557,15 +557,6 @@ class PlanningRepository:
         await self._session.refresh(item)
         return item
 
-    async def create_shopping_item(self, user_id: int, **values: Any) -> PlanShoppingItem:
-        plan = await self.get_or_create_active_plan(user_id)
-        values["category"] = normalize_shopping_category(values.get("category"), values.get("name", ""))
-        item = PlanShoppingItem(plan_id=plan.id, **values)
-        self._session.add(item)
-        await self._session.commit()
-        await self._session.refresh(item)
-        return item
-
     async def save_item(self, item: PlanMealItem | PlanShoppingItem) -> None:
         await self._session.commit()
         await self._session.refresh(item)

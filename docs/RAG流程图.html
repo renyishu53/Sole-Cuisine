@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>SoloChef RAG 流程图（离线 + 在线）</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #0f1115; color: #e6e9ef; font-family: system-ui, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; }
+  .sub { color: #9aa3b2; font-size: 13px; margin: 0 0 18px; }
+  .phase { margin: 22px 0 10px; font-size: 15px; font-weight: 600; padding-left: 10px; border-left: 4px solid #4f8cff; }
+  .phase.online { border-color: #4fd08a; }
+  .legend { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12px; color: #9aa3b2; margin: 8px 0 0; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .dot { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+  svg { width: 100%; height: auto; display: block; background: #141821; border-radius: 12px; padding: 8px 0; }
+  .code { background: #141821; border: 1px solid #232a36; border-radius: 10px; padding: 14px 16px; margin-top: 18px; font-size: 12.5px; line-height: 1.7; color: #c7cdd8; }
+  .code b { color: #e6e9ef; }
+  .code .f { color: #7fd1ff; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>SoloChef RAG 流程图</h1>
+  <p class="sub">离线构建索引（写库）与在线检索（读库）全链路 · 双底座：Milvus（稠密向量）+ Neo4j（关系图谱）</p>
+
+  <div class="legend">
+    <span><i class="dot" style="background:#0C447C"></i>离线主链</span>
+    <span><i class="dot" style="background:#3C3489"></i>离线旁路（并行）</span>
+    <span><i class="dot" style="background:#085041"></i>持久化底座</span>
+    <span><i class="dot" style="background:#27500A"></i>在线主链</span>
+    <span><i class="dot" style="background:#3a4250"></i>在线旁路（并行）</span>
+  </div>
+
+  <svg viewBox="0 0 680 1010" role="img" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <marker id="ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+        <path d="M2 1L8 5L2 9" fill="none" stroke="#7a8494" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+      </marker>
+    </defs>
+
+    <!-- 离线阶段 -->
+    <g>
+      <rect x="50" y="34" width="580" height="56" rx="10" fill="#0C447C" stroke="#85B7EB" stroke-width="0.6"/>
+      <text x="340" y="54" text-anchor="middle" fill="#ECEFF6" font-size="14" font-weight="600" dominant-baseline="central">① 文档来源（离线）</text>
+      <text x="340" y="72" text-anchor="middle" fill="#B6BDCC" font-size="11.5" dominant-baseline="central">内置 3 篇 BOOTSTRAP_DOCUMENTS / knowledge_docs/ 递归 / 上传 API / Celery 异步任务</text>
+    </g>
+    <line x1="340" y1="90" x2="340" y2="106" stroke="#7a8494" stroke-width="1.5" marker-end="url(#ar)"/>
+
+    <g>
+      <rect x="50" y="106" width="580" height="56" rx="10" fill="#0C447C" stroke="#85B7EB" stroke-width="0.6"/>
+      <text x="340" y="126" text-anchor="middle" fill="#ECEFF6" font-size="14" font-weight="600" dominant-baseline="central">② 解析 + 分块</text>
+      <text x="340" y="144" text-anchor="middle" fill="#B6BDCC" font-size="11.5" dominant-baseline="central">parse_frontmatter(中文 frontmatter→元数据) + RecursiveCharacterTextSplitter(chunk_size/overlap)</text>
+    </g>
+    <line x1="340" y1="162" x2="340" y2="178" stroke="#7a8494" stroke-width="1.5" marker-end="url(#ar)"/>
+
+    <!-- ③ 向量化 -->
+    <g>
+      <rect x="50" y="178" width="580" height="56" rx="10" fill="#0C447C" stroke="#85B7EB" stroke-width="0.6"/>
+      <text x="340" y="198" text-anchor="middle" fill="#ECEFF6" font-size="14" font-weight="600" dominant-baseline="central">③ 向量化 Embedding</text>
+      <text x="340" y="216" text-anchor="middle" fill="#B6BDCC" font-size="11.5" dominant-baseline="central">BGE-M3 (1024d) 优先；缺失回退 all-MiniLM-L6-v2 (384d)；绝不隐式下载</text>
+    </g>
+    <line x1="340" y1="234" x2="340" y2="250" stroke="#7a8494" stroke-width="1.5" marker-end="url(#ar)"/>
+
+    <!-- ④ 写 Milvus -->
+    <g>
+      <rect x="50" y="250" width="580" height="56" rx="10" fill="#0C447C" stroke="#85B7EB" stroke-width="0.6"/>
+      <text x="340" y="270" text-anchor="middle" fill="#ECEFF6" font-size="14" font-weight="600" dominant-baseline="central">④ 写 Milvus 向量库</text>
+      <text x="340" y="288" text-anchor="middle" fill="#B6BDCC" font-size="11.5" dominant-baseline="central">upsert_document；集合按模型分 _bge_m3；元数据 goal_type/meal_time/allergens/nutrition_focus；user_id 隔离</text>
+    </g>
+
+    <!-- ③' 抽取 旁路 -->
+    <g>
+      <rect x="50" y="320" width="580" height="56" rx="10" fill="#3C3489" stroke="#AFA9EC" stroke-width="0.6"/>
+      <text x="340" y="340" text-anchor="middle" fill="#ECEFF6" font-size="14" font-weight="600" dominant-baseline="central">③′ 实体/关系抽取（与③并行）</text>
+      <text x="340" y="358" text-anchor="middle" fill="#B6BDCC" font-size="11.5" dominant-baseline="central">extract_knowledge：LLM 级 JSON 抽取 / 正则级「类型:值」兜底；失败不阻断入库</text>
+    </g>
+    <line x1="340" y1="376" x2="340" y2="392" stroke="#7a8494" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ar)"/>
+
+    <!-- ④' 写 Neo4j 旁路 -->
+    <g>
+      <rect x="50" y="392" width="580" height="56" rx="10" fill="#3C3489" stroke="#AFA9EC" stroke-width="0.6"/>
+      <text x2="340" y="412" text-anchor="middle" fill="#ECEFF6" font-size="14" font-weight="600" dominant-baseline="central">④′ 写 Neo4j 图谱（与④并行）</text>
+      <text x="340" y="430" text-anchor="middle" fill="#B6BDCC" font-size="11.5" dominant-baseline="central">sync_document_knowledge：MERGE 实体 + :MENTIONS / :RELATION 关系</text>
+    </g>
+
+    <!-- 底座 -->
+    <g>
+      <rect x="50" y="462" width="580" height="56" rx="10" fill="#085041" stroke="#5DCAA5" stroke-width="0.6"/>
+      <text x="340" y="482" text-anchor="middle" fill="#ECEFF6" font-size="14" font-weight="600" dominant-baseline="central">持久化底座（离线产出 / 在线消费）</text>
+      <text x="340" y="500" text-anchor="middle" fill="#B6BDCC" font-size="11.5" dominant-baseline="central">Milvus（稠密向量，COSINE）+ Neo4j（关系图谱，Cypher）</text>
+    </g>
+
+    <!-- 在线阶段 -->
+    <text x="50" y="552" fill="#4fd08a" font-size="14" font-weight="600">—— 在线阶段（检索） ——</text>
+
+    <g>
+      <rect x="50" y="566" width="580" height="56" rx="10" fill="#27500A" stroke="#97C459" stroke-width="0.6"/>
+      <text x="340" y="586" text-anchor="middle" fill="#ECEFF6" font-size="14" font-weight="600" dominant-baseline="central">⑤ 用户 Query（在线）</text>
+      <text x="340" y="604" text-anchor="middle" fill="#B6BDCC" font-size="11.5" dominant-baseline="central">来自生成工作流 retrieval 节点 / 问答服务</text>
+    </g>
+    <line x1="340" y1="622" x2="340" y2="638" stroke="#7a8494" stroke-width="1.5" marker-end="url(#ar)"/>
+
+    <g>
+      <rect x="50" y="638" width="580" height="56" rx="10" fill="#27500A" stroke="#97C459" stroke-width="0.6"/>
+      <text x="340" y="658" text-anchor="middle" fill="#ECEFF6" font-size="14" font-weight="600" dominant-baseline="central">⑥ Query 重写</text>
+      <text x="340" y="676" text-anchor="middle" fill="#B6BDCC" font-size="11.5" dominant-baseline="central">query_rewriter：简单中文分词 → QuerySpec(keywords / entity_kinds / relations)</text>
+    </g>
+    <line x1="340" y1="694" x2="340" y2="710" stroke="#7a8494" stroke-width="1.5" marker-end="url(#ar)"/>
+
+    <!-- ⑦ 向量路 -->
+    <g>
+      <rect x="50" y="710" width="580" height="56" rx="10" fill="#27500A" stroke="#97C459" stroke-width="0.6"/>
+      <text x="340" y="730" text-anchor="middle" fill="#ECEFF6" font-size="14" font-weight="600" dominant-baseline="central">⑦ 向量路检索（+可选 Rerank）</text>
+      <text x="340" y="748" text-anchor="middle" fill="#B6BDCC" font-size="11.5" dominant-baseline="central">Embedding(query)→Milvus search(过滤: user_id + 目标∪通用)→rerank(bge-reranker-v2-m3 二阶段)→top_k</text>
+    </g>
+
+    <!-- ⑦' 图谱路 旁路 -->
+    <g>
+      <rect x="50" y="780" width="580" height="56" rx="10" fill="#3a4250" stroke="#9aa3b2" stroke-width="0.6"/>
+      <text x="340" y="800" text-anchor="middle" fill="#ECEFF6" font-size="14" font-weight="600" dominant-baseline="central">⑦′ 图谱路检索（与⑦并行）</text>
+      <text x="340" y="818" text-anchor="middle" fill="#cfd4de" font-size="11.5" dominant-baseline="central">Neo4j search：Cypher CONTAINS 关键词 + 反馈子图；异常返空+状态标记</text>
+    </g>
+
+    <!-- ⑧ 融合 -->
+    <g>
+      <rect x="50" y="850" width="580" height="56" rx="10" fill="#27500A" stroke="#97C459" stroke-width="0.6"/>
+      <text x="340" y="870" text-anchor="middle" fill="#ECEFF6" font-size="14" font-weight="600" dominant-baseline="central">⑧ 双路并行融合</text>
+      <text x="340" y="888" text-anchor="middle" fill="#B6BDCC" font-size="11.5" dominant-baseline="central">asyncio.gather → RetrievalBundle(向量 hits + 图谱 hits + 各状态)</text>
+    </g>
+    <line x1="340" y1="906" x2="340" y2="922" stroke="#7a8494" stroke-width="1.5" marker-end="url(#ar)"/>
+
+    <!-- ⑨ 拼 context -->
+    <g>
+      <rect x="50" y="922" width="580" height="56" rx="10" fill="#27500A" stroke="#97C459" stroke-width="0.6"/>
+      <text x="340" y="942" text-anchor="middle" fill="#ECEFF6" font-size="14" font-weight="600" dominant-baseline="central">⑨ 拼 Context → 喂 Planner</text>
+      <text x="340" y="960" text-anchor="middle" fill="#B6BDCC" font-size="11.5" dominant-baseline="central">图谱行(subject--rel-->target) + 向量行([doc#chunk,score]) 拼文本，注入生成工作流</text>
+    </g>
+  </svg>
+
+  <div class="code">
+    <b>关键代码位置</b><br/>
+    <span class="f">离线</span> · 入口 <b>KnowledgeService.ingest_text/ingest_file</b> (knowledge.py:102/122) → 分块 <b>DocumentProcessor.split/parse</b> (documents.py:100/86) → 向量写 <b>MilvusVectorStore.upsert_document</b> (milvus_store.py:79) → 抽取 <b>extract_knowledge</b> (entity_extractor.py:36) → 图谱写 <b>Neo4jGraphStore.sync_document_knowledge</b> (graph_store.py:126)<br/>
+    <span class="f">触发</span> · bootstrap(knowledge.py:142) / Celery <b>process_knowledge_text/file</b> (worker.py:105/144) / 脚本 <b>import_knowledge_docs.py</b> / API <b>ingest_knowledge_text/file</b> (router.py:1134/1165)<br/>
+    <span class="f">在线</span> · 检索 <b>KnowledgeService.retrieve</b> (knowledge.py:247, asyncio.gather 双路) → 向量 <b>retrieve_vector</b>(:196, 含 rerank) / 图谱 <b>retrieve_graph</b>(:231) → 重写 <b>rewrite_query→QuerySpec</b> (query_rewriter.py) → 拼 context 喂 <b>workflow.retrieval</b> 节点
+  </div>
+</div>
+</body>
+</html>

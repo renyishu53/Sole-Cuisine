@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 # ── 辅助：准备一个已确认的 plan，返回 plan_id ──────────────────
 
@@ -144,22 +145,16 @@ def test_demo_parse_update_budget() -> None:
     assert op.target.get("budget_limit") == 300.0
 
 
-def test_demo_parse_shopping_adjustment() -> None:
-    """购物清单增删改应进入独立的购物调整操作。"""
-    from app.services.plan_revise import _parse_demo_operation
+def test_shopping_structure_is_not_a_revision_operation() -> None:
+    """购物清单只由餐食派生，不能单独添加或修改。"""
+    from app.schemas.plan_revise import ReviseOperation
 
-    class _FakePlan:
-        meals: list[object] = []
-        shopping_items: list[object] = []
-
-    op = _parse_demo_operation(
-        "购物清单添加鸡胸肉2斤，价格30元", _FakePlan()  # type: ignore[arg-type]
-    )
-    assert op is not None
-    assert op.operation == "adjust_shopping"
-    assert op.target["action"] == "add"
-    assert op.target["name"] == "鸡胸肉"
-    assert op.target["quantity"] == "2斤"
+    try:
+        ReviseOperation.model_validate({"operation": "adjust_shopping"})
+    except ValidationError:
+        pass
+    else:
+        raise AssertionError("adjust_shopping must not be an accepted revision operation")
 
 
 # ── API 端到端测试 ────────────────────────────────────────────────
@@ -219,25 +214,6 @@ def test_macro_target_preview_cannot_confirm_unchanged_plan(
         headers=auth_headers,
     )
     assert confirm.status_code == 409
-
-
-def test_shopping_revision_uses_shopping_branch(
-    client: TestClient, auth_headers: dict[str, str]
-) -> None:
-    plan_id = _prepare_confirmed_plan(client, auth_headers)
-    preview = client.post(
-        f"/api/v1/plans/{plan_id}/revise",
-        headers=auth_headers,
-        json={"message": "购物清单添加鸡胸肉2斤，价格30元"},
-    )
-
-    assert preview.status_code == 200, preview.text
-    body = preview.json()
-    assert body["operation"]["operation"] == "adjust_shopping"
-    assert body["routing"]["route"] == "shopping_revision_subgraph"
-    assert body["routing"]["requires"] == ["shopping", "budget", "verifier"]
-    assert body["can_confirm"] is True
-    assert any("鸡胸肉" in item for item in body["diff"]["changed_shopping"])
 
 
 def test_revise_404_when_plan_missing(

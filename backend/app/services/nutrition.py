@@ -14,6 +14,7 @@ SoloChef 的营养目标来源于 :class:`~app.models.NutritionGoal`（TDEE + �
 from __future__ import annotations
 
 from collections.abc import Sequence
+import re
 from typing import Protocol
 
 from app.data import load_ingredient_nutrition
@@ -265,7 +266,19 @@ _INGREDIENT_NUTRITION = load_ingredient_nutrition()
 
 # 按 key 长度降序预排序，使长名优先于短子串命中（如"鸡蛋"优先于"鸡"）。
 # 模块级一次性排序，避免 _ingredient_nutrition_for 每次调用重复排序。
-_INGREDIENT_KEYWORDS_BY_LEN = sorted(_INGREDIENT_NUTRITION, key=len, reverse=True)
+def _ingredient_aliases(keyword: str) -> set[str]:
+    """Extract aliases from规范名，如 ``松花蛋（鸭蛋）[皮蛋]``。"""
+    aliases = {keyword}
+    aliases.update(re.findall(r"\[([^\]]+)\]", keyword))
+    aliases.update(re.findall(r"[（(]([^）)]+)[）)]", keyword))
+    return {alias.strip() for alias in aliases if len(alias.strip()) >= 2}
+
+
+_INGREDIENT_KEYWORDS_BY_LEN = sorted(
+    ((alias, keyword) for keyword in _INGREDIENT_NUTRITION for alias in _ingredient_aliases(keyword)),
+    key=lambda pair: len(pair[0]),
+    reverse=True,
+)
 
 
 def _match_recipe(meal: MealLike, recipes: Sequence[RecipeRecord]) -> RecipeRecord | None:
@@ -286,8 +299,8 @@ def _ingredient_nutrition_for(name: str) -> tuple[dict[str, float], bool]:
     匹配优先级: 按 key 长度降序遍历，长名优先于短子串命中——避免"鸡"过早
     截断"鸡蛋"查询。预排序在模块级完成，单次查询不重复排序。
     """
-    for keyword in _INGREDIENT_KEYWORDS_BY_LEN:
-        if keyword in name:
+    for alias, keyword in _INGREDIENT_KEYWORDS_BY_LEN:
+        if alias in name:
             entry = _INGREDIENT_NUTRITION[keyword]
             portion = entry.get("default_portion_g", 100)
             scale = portion / 100.0
@@ -346,7 +359,12 @@ def estimate_meal_nutrition(
         scale = 1.0 / servings  # 单份
         return {key: round(value * scale, 1) for key, value in recipe.nutrition.items()}, True
     estimate: dict[str, float] = {}
-    for ingredient in meal.ingredients:
+    # 计划生成/历史数据可能没有保存 ingredients，但餐食名称通常仍包含
+    # 主要食材（如“皮蛋瘦肉粥”）。用名称做兜底，避免打卡后营养进度恒为 0。
+    ingredient_names = list(meal.ingredients or [])
+    if not ingredient_names:
+        ingredient_names = [meal.name]
+    for ingredient in ingredient_names:
         nutrition, hit = _ingredient_nutrition_for(ingredient)
         if not hit:
             continue

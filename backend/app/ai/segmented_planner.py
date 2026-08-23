@@ -85,7 +85,9 @@ _SHOPPING_SYSTEM = (
 
 _SHOPPING_USER = (
     "已确定的一周菜单：\n{meals_json}\n\n"
+    "用户本周采购预算上限：¥{budget}\n"
     "请根据菜单中的 ingredients 推导采购清单，合并同类项。"
+    "采购清单价格合计不得超过预算上限；如菜单成本过高，优先减少高价食材、调整数量或使用低价替代品。"
     "每项含 name/category/quantity/price/source/purchased(false)。category 只能是：肉蛋奶、蔬菜、主食、水果、其他。\n"
     "只输出 {{\"shopping\": [...]}} 格式的 JSON。"
 )
@@ -171,7 +173,7 @@ class SegmentedPlanGenerator:
         )
         shopping_stage = await self._call_stage(
             system=_SHOPPING_SYSTEM,
-            user=_SHOPPING_USER.format(meals_json=meals_json),
+            user=_SHOPPING_USER.format(meals_json=meals_json, budget=request.budget),
             schema_cls=ShoppingStage,
             stage_name="shopping",
         )

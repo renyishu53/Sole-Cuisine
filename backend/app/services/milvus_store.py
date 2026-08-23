@@ -6,6 +6,12 @@
 - 无内置 embedding function，需手动 encode 文本为向量再插入
 - 过滤表达式用 expr 字符串（Chroma 用 where dict）
 - COSINE 指标下 distance 即相似度（Chroma 用距离，需 1-distance 转换）
+
+稀疏混合检索（可选增强）：embedding 后端具备稀疏能力时，集合附加
+``sparse_vector`` SPARSE_FLOAT_VECTOR 字段（SPARSE_INVERTED_INDEX/IP），
+入库同写双向量；检索走 ``hybrid_search`` 双路召回（稠密 COSINE +
+稀疏 IP），RRF 融合排序。集合 schema 形状与后端能力绑定——不匹配时
+drop 重建，由 bootstrap 幂等重灌。
 """
 
 import asyncio
@@ -14,7 +20,7 @@ from datetime import date
 from typing import Any, cast
 from uuid import uuid4
 
-from pymilvus import DataType, MilvusClient
+from pymilvus import AnnSearchRequest, DataType, MilvusClient, RRFRanker
 
 from app.core.config import Settings
 from app.schemas import KnowledgeDocument, VectorSearchHit
@@ -89,15 +95,17 @@ class MilvusVectorStore:
         client = await self._get_client()
         backend = await self.ensure_embedding()
         collection = self.collection_name_for(backend)
-        await self._ensure_collection(collection, self._dim_for(backend))
+        await self._ensure_collection(collection, backend)
 
         doc_id = document_id or str(uuid4())
         today = date.today().isoformat()
-        vectors = backend.encode(list(chunks))
+        # 一次前向同时产出稠密+稀疏（后端无稀疏能力时 sparse 为 None）
+        vectors, sparse_vectors = backend.encode_both(list(chunks))
         meta = metadata or {}
 
-        data: list[dict[str, Any]] = [
-            {
+        data: list[dict[str, Any]] = []
+        for index, chunk in enumerate(chunks):
+            row: dict[str, Any] = {
                 "id": f"{doc_id}:{index}",
                 "vector": vectors[index],
                 "document_id": doc_id,
@@ -109,8 +117,9 @@ class MilvusVectorStore:
                 "updated_at": today,
                 **self._metadata_row(meta),
             }
-            for index, chunk in enumerate(chunks)
-        ]
+            if sparse_vectors is not None:
+                row["sparse_vector"] = sparse_vectors[index]
+            data.append(row)
         await asyncio.to_thread(
             client.upsert,
             collection_name=collection,
@@ -140,7 +149,7 @@ class MilvusVectorStore:
         collection = self.collection_name_for(backend)
         # 先确保集合存在（幂等创建/迁移），否则全新部署首次 delete 会因
         # collection not found 抛错，bootstrap 无法冷启动。
-        await self._ensure_collection(collection, self._dim_for(backend))
+        await self._ensure_collection(collection, backend)
         escaped_name = self._escape_filter(name)
         await asyncio.to_thread(
             client.delete,
@@ -172,51 +181,100 @@ class MilvusVectorStore:
         exists = await asyncio.to_thread(client.has_collection, collection)
         if not exists:
             return []
-        # 旧集合缺元数据字段时在此重建（bootstrap 会幂等重灌），保证过滤字段可用。
-        await self._ensure_collection(collection, self._dim_for(backend))
+        # 旧集合缺元数据/稀疏字段时在此重建（bootstrap 会幂等重灌），保证过滤字段可用。
+        await self._ensure_collection(collection, backend)
         stats = await asyncio.to_thread(client.get_collection_stats, collection)
         if stats.get("row_count", 0) == 0:
             return []
 
-        query_vec = backend.encode([query])
+        filter_expr = self._build_filter(user_id, goal_type, meal_time)
+        output_fields = [
+            "document_id",
+            "document_name",
+            "category",
+            "content",
+            "chunk_index",
+            *METADATA_FIELDS,
+        ]
+        limit = min(top_k, stats.get("row_count", top_k))
+
+        # 一次前向同时产出 query 的稠密+稀疏向量
+        query_vectors, query_sparse = backend.encode_both([query])
+        if query_sparse is not None:
+            # 混合检索：稠密 COSINE + 稀疏 IP 双路召回，RRF 融合排序
+            results = await asyncio.to_thread(
+                client.hybrid_search,
+                collection_name=collection,
+                reqs=[
+                    AnnSearchRequest(
+                        data=[query_vectors[0]],
+                        anns_field="vector",
+                        param={"metric_type": "COSINE", "params": {"nprobe": 16}},
+                        limit=limit,
+                        expr=filter_expr,
+                    ),
+                    AnnSearchRequest(
+                        data=[query_sparse[0]],
+                        anns_field="sparse_vector",
+                        param={"metric_type": "IP"},
+                        limit=limit,
+                        expr=filter_expr,
+                    ),
+                ],
+                ranker=RRFRanker(self._settings.sparse_rrf_k),
+                limit=limit,
+                output_fields=output_fields,
+            )
+            # RRF 融合分数非相似度量纲：以 top 命中为基准归一化到 (0, 1]
+            rows = results[0] if results else []
+            top_score = max(
+                (float(row.get("distance", 0.0)) for row in rows), default=0.0
+            ) or 1.0
+            scores = [
+                round(max(0.0, min(1.0, float(row.get("distance", 0.0)) / top_score)), 4)
+                for row in rows
+            ]
+            return [
+                self._to_hit(row, score)
+                for row, score in zip(rows, scores, strict=False)
+            ]
+
+        query_vec = query_vectors[0]
         results = await asyncio.to_thread(
             client.search,
             collection_name=collection,
-            data=[query_vec[0]],
-            filter=self._build_filter(user_id, goal_type, meal_time),
-            limit=min(top_k, stats.get("row_count", top_k)),
-            output_fields=[
-                "document_id",
-                "document_name",
-                "category",
-                "content",
-                "chunk_index",
-                *METADATA_FIELDS,
-            ],
+            data=[query_vec],
+            filter=filter_expr,
+            limit=limit,
+            output_fields=output_fields,
         )
-
         hits: list[VectorSearchHit] = []
         for result in results[0]:
-            entity = result.get("entity", {})
             distance = float(result.get("distance", 0.0))
             # COSINE 指标下 distance 即相似度（范围 [-1,1]，归一化后通常 [0,1]）
             score = round(max(0.0, min(1.0, distance)), 4)
-            meta_row = {k: str(entity.get(k) or DEFAULT_METADATA[k]) for k in METADATA_FIELDS}
-            hits.append(
-                VectorSearchHit(
-                    document_id=str(entity.get("document_id", "")),
-                    document_name=str(entity.get("document_name", "")),
-                    category=str(entity.get("category", "")),
-                    content=str(entity.get("content", "")),
-                    chunk_index=int(entity.get("chunk_index", 0)),
-                    score=score,
-                    goal_type=meta_row["goal_type"],
-                    meal_time=meta_row["meal_time"],
-                    allergens=meta_row["allergens"],
-                    nutrition_focus=meta_row["nutrition_focus"],
-                )
-            )
+            hits.append(self._to_hit(result, score))
         return hits
+
+    def _to_hit(self, row: dict[str, Any], score: float) -> VectorSearchHit:
+        """把 Milvus 检索行（``{id, distance, entity}``）转为 VectorSearchHit。
+
+        ``client.search`` 与 ``client.hybrid_search`` 返回行结构一致，两路共用。
+        """
+        entity = row.get("entity", {}) or {}
+        meta_row = {k: str(entity.get(k) or DEFAULT_METADATA[k]) for k in METADATA_FIELDS}
+        return VectorSearchHit(
+            document_id=str(entity.get("document_id", "")),
+            document_name=str(entity.get("document_name", "")),
+            category=str(entity.get("category", "")),
+            content=str(entity.get("content", "")),
+            chunk_index=int(entity.get("chunk_index", 0)),
+            score=score,
+            goal_type=meta_row["goal_type"],
+            meal_time=meta_row["meal_time"],
+            allergens=meta_row["allergens"],
+            nutrition_focus=meta_row["nutrition_focus"],
+        )
 
     def _build_filter(
         self,
@@ -304,22 +362,23 @@ class MilvusVectorStore:
                 self._client = await asyncio.to_thread(MilvusClient, **kwargs)
         return cast(MilvusClient, self._client)
 
-    async def _ensure_collection(self, collection_name: str, dim: int) -> None:
-        """幂等创建集合（含 schema + 索引）。
+    async def _ensure_collection(self, collection_name: str, backend: EmbeddingBackend) -> None:
+        """幂等创建集合（含 schema + 索引），schema 形状与后端能力绑定。
 
-        已存在时检查是否缺少元数据字段——旧 schema 缺 ``goal_type`` 等字段则
-        重建集合，由 ``bootstrap`` 幂等重灌，避免新旧 schema 混用导致写入/过滤报错。
+        已存在时检查是否与后端能力匹配——缺元数据字段（旧 schema）或稀疏
+        字段与 ``backend.supports_sparse`` 不一致（能力切换）均重建集合，
+        由 ``bootstrap`` 幂等重灌，避免 schema 混用导致写入/过滤/检索报错。
         """
         client = await self._get_client()
         exists = await asyncio.to_thread(client.has_collection, collection_name)
         if exists:
-            if await self._has_metadata_fields(collection_name):
+            if await self._schema_matches(collection_name, backend.supports_sparse):
                 return
             await asyncio.to_thread(client.drop_collection, collection_name)
 
         schema = client.create_schema(auto_id=False, enable_dynamic_field=False)
         schema.add_field("id", DataType.VARCHAR, max_length=128, is_primary=True)
-        schema.add_field("vector", DataType.FLOAT_VECTOR, dim=dim)
+        schema.add_field("vector", DataType.FLOAT_VECTOR, dim=self._dim_for(backend))
         schema.add_field("document_id", DataType.VARCHAR, max_length=64)
         schema.add_field("document_name", DataType.VARCHAR, max_length=256)
         schema.add_field("category", DataType.VARCHAR, max_length=64)
@@ -331,6 +390,9 @@ class MilvusVectorStore:
         schema.add_field("meal_time", DataType.VARCHAR, max_length=32)
         schema.add_field("allergens", DataType.VARCHAR, max_length=256)
         schema.add_field("nutrition_focus", DataType.VARCHAR, max_length=64)
+        # 稀疏向量字段（lexical 权重）：仅后端支持时创建
+        if backend.supports_sparse:
+            schema.add_field("sparse_vector", DataType.SPARSE_FLOAT_VECTOR)
 
         index_params = client.prepare_index_params()
         index_params.add_index(
@@ -339,6 +401,12 @@ class MilvusVectorStore:
             metric_type="COSINE",
             params={"nlist": 128},
         )
+        if backend.supports_sparse:
+            index_params.add_index(
+                field_name="sparse_vector",
+                index_type="SPARSE_INVERTED_INDEX",
+                metric_type="IP",
+            )
         index_params.add_index(
             field_name="user_id",
             index_type="INVERTED",
@@ -351,9 +419,13 @@ class MilvusVectorStore:
             index_params=index_params,
         )
 
-    async def _has_metadata_fields(self, collection_name: str) -> bool:
-        """判断集合 schema 是否已包含元数据字段（以 ``goal_type`` 为准）。"""
+    async def _schema_matches(
+        self, collection_name: str, want_sparse: bool
+    ) -> bool:
+        """集合 schema 是否与后端能力匹配（含元数据字段与稀疏向量字段）。"""
         client = await self._get_client()
         info = await asyncio.to_thread(client.describe_collection, collection_name)
         field_names = {str(f.get("name")) for f in info.get("fields", [])}
-        return "goal_type" in field_names
+        if "goal_type" not in field_names:
+            return False
+        return ("sparse_vector" in field_names) == want_sparse

@@ -32,6 +32,15 @@ const syncError = ref('')
 const totalChunks = computed(() => data.value?.reduce((sum, doc) => sum + doc.chunks, 0) ?? 0)
 const totalDocs = computed(() => data.value?.length ?? 0)
 
+// 稀疏检索是否生效：diagnostics.sparse 以 hybrid 开头表示稠密+稀疏双路 RRF 召回
+const hybridRetrieval = computed(() => (result.value?.diagnostics.sparse ?? '').startsWith('hybrid'))
+const retrievalBadge = computed(() => {
+  const sparse = result.value?.diagnostics.sparse ?? ''
+  if (sparse.startsWith('hybrid')) return { text: '混合检索（稠密+稀疏）', variant: 'success' }
+  if (sparse && sparse !== 'disabled') return { text: '稀疏检索异常', variant: 'warning' }
+  return { text: '纯稠密检索', variant: 'warning' }
+})
+
 // 目标取向英文词表（bulk/cut/maintain）→ 中文展示标签
 const GOAL_LABELS: Record<string, string> = { bulk: '增肌', cut: '减脂', maintain: '健康维护' }
 function goalLabel(value?: string) { return value ? (GOAL_LABELS[value] ?? value) : '' }
@@ -160,9 +169,12 @@ async function loadSync() {
         <label>测试问题<textarea v-model="query" rows="5" /></label>
         <button class="button primary full" :disabled="searching || query.trim().length < 2" @click="search"><Play :size="16" />{{ searching ? '检索中' : '运行检索' }}</button>
         <div v-if="result" class="retrieval-results">
-          <span class="eyebrow">关系 {{ result.graph_hits.length }} 条 · 文档 {{ result.vector_hits.length }} 条 · {{ result.elapsed_ms }}ms</span>
+          <div class="retrieval-meta">
+            <span class="eyebrow">关系 {{ result.graph_hits.length }} 条 · 文档 {{ result.vector_hits.length }} 条 · {{ result.elapsed_ms }}ms</span>
+            <span class="status-badge" :class="retrievalBadge.variant">{{ retrievalBadge.text }}</span>
+          </div>
           <article v-for="(hit, index) in result.graph_hits" :key="`graph-${index}`"><strong><Network :size="15" />{{ hit.subject }} · {{ hit.relation }}</strong><p>{{ hit.target }} <span v-if="hit.detail">· {{ hit.detail }}</span></p></article>
-          <article v-for="hit in result.vector_hits" :key="`${hit.document_id}-${hit.chunk_index}`"><strong><BookOpen :size="15" />{{ hit.document_name }}</strong><p>{{ hit.content }}</p><div v-if="metaTags(hit).length" class="hit-tags"><span v-for="tag in metaTags(hit)" :key="tag" class="hit-tag">{{ tag }}</span><span v-if="hit.allergens" class="hit-tag warn">忌口：{{ hit.allergens }}</span></div><small>相似度 {{ hit.score.toFixed(3) }} · 片段 {{ hit.chunk_index }}</small></article>
+          <article v-for="hit in result.vector_hits" :key="`${hit.document_id}-${hit.chunk_index}`"><strong><BookOpen :size="15" />{{ hit.document_name }}</strong><p>{{ hit.content }}</p><div v-if="metaTags(hit).length" class="hit-tags"><span v-for="tag in metaTags(hit)" :key="tag" class="hit-tag">{{ tag }}</span><span v-if="hit.allergens" class="hit-tag warn">忌口：{{ hit.allergens }}</span></div><small>{{ hybridRetrieval ? '混合分' : '相似度' }} {{ hit.score.toFixed(3) }} · 片段 {{ hit.chunk_index }}</small></article>
           <p v-if="!result.graph_hits.length && !result.vector_hits.length" class="empty-result">没有召回结果，请先初始化或上传知识文档。</p>
         </div>
       </aside>
@@ -294,6 +306,19 @@ async function loadSync() {
       color: #b0721b;
       background: rgba(190, 130, 40, 0.12);
     }
+  }
+}
+
+.retrieval-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+
+  .status-badge {
+    font-size: var(--font-xs, 12px);
+    padding: 3px 8px;
+    border-radius: 4px;
   }
 }
 
