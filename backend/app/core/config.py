@@ -61,6 +61,8 @@ class Settings(BaseSettings):
     llm_model: str = "deepseek-chat"
     llm_base_url: str = "https://api.deepseek.com/v1"
     llm_timeout_seconds: float = 60.0
+    # RAG 仅为规划增强，任一路首次加载模型或外部索引变慢时不可阻塞周计划主流程。
+    rag_retrieval_timeout_seconds: float = 20.0
     plan_generation_timeout_seconds: float = 45.0
     ai_fallback_enabled: bool = True
     # 领域智能体默认使用确定性规则，避免与主规划器串联多次外部模型等待。

@@ -5,14 +5,25 @@
 # (https://blog.csdn.net/2301_80216352/article/details/162310443)
 #
 # 服务拓扑:
-#   frontend (Nginx + Vue SPA)  -> :80     (对外)
-#   backend  (FastAPI + Uvicorn) -> :8000  (内部)
-#   worker   (Celery)            - 后台任务消费者
-#   postgres (PostgreSQL 16)      -> :5433  对外
-#   redis    (Redis 7)           -> :6379  对外
+#   frontend (Nginx + Vue SPA)  -> :80     (对外，端口可用 FRONTEND_PORT 覆盖)
+#   backend  (FastAPI + Uvicorn) -> :8000  (对外，Nginx 反代 /api/)
+#   worker   (Celery)            - 后台任务消费者（知识入库/图谱同步/定时清理）
+#   postgres (PostgreSQL 16)      -> :5433  (宿主机映射)
+#   redis    (Redis 7)           -> :6379
 #   neo4j    (Neo4j 5 Community) -> :7474/:7687
 #   milvus   (Milvus 2.4 向量库) -> :19530/:9091
 #     └─ etcd + minio (Milvus 依赖)
+#
+# 启动: docker compose up -d
+# 日志: docker compose logs -f backend
+#
+# AI 模型（可选，启用 BGE-M3 语义检索 + bge-reranker-v2-m3 精排）:
+#   在 .env 中配置 BGE_M3_MODEL_DIR / RERANK_MODEL_DIR 指向服务器上的模型
+#   目录（如 /opt/solochef/models/bge-m3），容器内挂载为 /models/*。
+#   未配置时挂载空目录，检索链路自动降级（不阻断启动）。
+#
+# 内存提示: Milvus + Neo4j + 两个本地模型全开建议 4核8G 起步；
+# 2核4G 服务器请保持模型目录为空（走降级链路）。
 # =============================================================================
 services:
   # ── Backend FastAPI 后端 ──────────────────────────────────────────────
@@ -37,8 +48,15 @@ services:
       MILVUS_PORT: 19530
       MILVUS_COLLECTION: solochef_knowledge
       RAG_ENABLED: "true"
+      # 覆盖 .env 中的本地路径：容器内统一从 /models/* 加载
+      EMBEDDING_MODEL_PATH: /models/bge-m3
+      RERANK_MODEL_PATH: /models/bge-reranker-v2-m3
     ports:
       - "8000:8000"
+    volumes:
+      # 本地模型挂载（.env 未配置时挂默认空目录，检索降级不阻断）
+      - ${BGE_M3_MODEL_DIR:-./_models/bge-m3}:/models/bge-m3
+      - ${RERANK_MODEL_DIR:-./_models/bge-reranker-v2-m3}:/models/bge-reranker-v2-m3
     networks:
       - solochef-net
     depends_on:
@@ -47,24 +65,37 @@ services:
       redis:
         condition: service_healthy
       neo4j:
-        condition: service_started
+        condition: service_healthy
       milvus-standalone:
-        condition: service_started
+        condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/docs')"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/docs"]
       interval: 15s
       timeout: 5s
       retries: 5
-      start_period: 40s
+      start_period: 60s
 
   # ── Celery Worker 后台任务消费者 ─────────────────────────────────────
+  # -Q 消费全部队列（knowledge/graph/maintenance/default，与 worker.py
+  #    task_routes 对应）；-B 内嵌 beat 使每日 3 点清理任务生效
   worker:
     build:
       context: ./backend
       dockerfile: Dockerfile
     container_name: solochef-worker
     restart: unless-stopped
-    command: ["celery", "-A", "app.worker.celery_app", "worker", "--loglevel=INFO", "--concurrency=2"]
+    command:
+      [
+        "celery",
+        "-A",
+        "app.worker.celery_app",
+        "worker",
+        "--loglevel=INFO",
+        "--concurrency=2",
+        "-Q",
+        "default,knowledge,graph,maintenance",
+        "-B",
+      ]
     env_file:
       - .env
     environment:
@@ -80,6 +111,11 @@ services:
       MILVUS_PORT: 19530
       MILVUS_COLLECTION: solochef_knowledge
       RAG_ENABLED: "true"
+      EMBEDDING_MODEL_PATH: /models/bge-m3
+      RERANK_MODEL_PATH: /models/bge-reranker-v2-m3
+    volumes:
+      - ${BGE_M3_MODEL_DIR:-./_models/bge-m3}:/models/bge-m3
+      - ${RERANK_MODEL_DIR:-./_models/bge-reranker-v2-m3}:/models/bge-reranker-v2-m3
     networks:
       - solochef-net
     depends_on:
@@ -88,17 +124,20 @@ services:
       redis:
         condition: service_healthy
       milvus-standalone:
-        condition: service_started
+        condition: service_healthy
 
   # ── Frontend Nginx + Vue SPA ─────────────────────────────────────────
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      args:
+        # 同源反代（默认）；直连后端改成 http://<服务器IP>:8000/api/v1
+        VITE_API_BASE_URL: /api/v1
     container_name: solochef-frontend
     restart: unless-stopped
     ports:
-      - "5173:80"
+      - "${FRONTEND_PORT:-80}:80"
     networks:
       - solochef-net
     depends_on:
@@ -158,6 +197,16 @@ services:
       - neo4j_data:/data
     networks:
       - solochef-net
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "cypher-shell -a bolt://localhost:7687 -u neo4j -p ${NEO4J_PASSWORD:-solochef_password} 'RETURN 1' || exit 1",
+        ]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
 
   # ── Milvus 向量数据库（依赖 etcd + minio） ──────────────────────────
   etcd:
@@ -208,6 +257,12 @@ services:
         condition: service_started
       minio:
         condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      timeout: 20s
+      retries: 10
+      start_period: 90s
 
 # ── 持久化卷 ─────────────────────────────────────────────────────────
 volumes:

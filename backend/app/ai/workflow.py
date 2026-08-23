@@ -261,13 +261,28 @@ class SoloChefWorkflow:
         """Run both retrieval paths concurrently and emit one useful trace phase."""
         start = perf_counter()
         request = state["request"]
+
+        async def retrieve_with_timeout(awaitable: Awaitable[object], source: str) -> object:
+            try:
+                return await asyncio.wait_for(
+                    awaitable,
+                    timeout=self._settings.rag_retrieval_timeout_seconds,
+                )
+            except TimeoutError:
+                return TimeoutError(f"{source} retrieval timed out")
+
         graph_result, vector_result = await asyncio.gather(
-            self._knowledge.retrieve_graph(request.prompt, request.user_id),
-            self._knowledge.retrieve_vector(
-                request.prompt,
-                request.user_id,
-                self._settings.rag_top_k,
-                goal_type=state.get("goal_type"),
+            retrieve_with_timeout(
+                self._knowledge.retrieve_graph(request.prompt, request.user_id), "graph"
+            ),
+            retrieve_with_timeout(
+                self._knowledge.retrieve_vector(
+                    request.prompt,
+                    request.user_id,
+                    self._settings.rag_top_k,
+                    goal_type=state.get("goal_type"),
+                ),
+                "vector",
             ),
             return_exceptions=True,
         )

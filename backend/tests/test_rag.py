@@ -104,6 +104,41 @@ def test_demo_langgraph_workflow_has_parallel_specialists() -> None:
     assert response.conflicts == []
 
 
+def test_workflow_continues_when_retrieval_exceeds_time_budget() -> None:
+    class SlowKnowledgeService:
+        async def retrieve_graph(
+            self, query: str, user_id: int
+        ) -> tuple[list[GraphSearchHit], str]:
+            del query, user_id
+            await asyncio.sleep(0.05)
+            return [], "connected"
+
+        async def retrieve_vector(
+            self,
+            query: str,
+            user_id: int,
+            top_k: int,
+            *,
+            goal_type: str | None = None,
+        ) -> tuple[list[VectorSearchHit], str, str]:
+            del query, user_id, top_k, goal_type
+            await asyncio.sleep(0.05)
+            return [], "connected", "disabled"
+
+    workflow = SoloChefWorkflow(
+        settings=Settings(_env_file=None, rag_retrieval_timeout_seconds=0.01),
+        knowledge=SlowKnowledgeService(),
+        generator=DemoPlanGenerator(),
+    )
+
+    response = asyncio.run(workflow.run(PlanningRequest(prompt="生成本周健康菜单", budget=500)))
+
+    retrieval = next(step for step in response.trace if step.name == "retrieval")
+    assert len(response.meals) == 21
+    assert retrieval.status.value == "warning"
+    assert retrieval.output["warnings"] == ["graph: TimeoutError", "vector: TimeoutError"]
+
+
 def test_workflow_uses_shopping_total_as_authoritative_budget_estimate() -> None:
     class OverBudgetGenerator(DemoPlanGenerator):
         async def generate(self, request: PlanningRequest, context: str) -> PlanDraft:

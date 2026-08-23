@@ -6,14 +6,22 @@
 # ── 阶段 1: Node 构建 ──
 FROM node:22-alpine AS builder
 
+# 国内服务器构建加速（可 --build-arg 覆盖为官方源）
+ARG NPM_REGISTRY=https://registry.npmmirror.com
+
+# 前端经 Nginx 反代同源访问后端，故默认相对路径；
+# 直连后端(如 http://<服务器IP>:8000/api/v1)时用 --build-arg 覆盖
+ARG VITE_API_BASE_URL=/api/v1
+
 WORKDIR /app
 
 # 先复制依赖清单，利用 npm ci + Docker 层缓存加速构建
 COPY package*.json ./
-RUN npm ci
+RUN npm config set registry ${NPM_REGISTRY} && npm ci
 
-# 复制源码并构建
+# 复制源码并构建（Vite 在构建期读取 VITE_API_BASE_URL 固化进产物）
 COPY . .
+ENV VITE_API_BASE_URL=${VITE_API_BASE_URL}
 RUN npm run build
 
 # ── 阶段 2: Nginx 运行 ──

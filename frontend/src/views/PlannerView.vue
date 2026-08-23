@@ -15,6 +15,7 @@ const planRequired = computed(() => plan.value as WeeklyPlanDetail)
 const versions = ref<WeeklyPlanSummary[]>([])
 const loading = ref(true)
 const generating = ref(false)
+const generationStatus = ref('')
 const error = ref('')
 const expanded = ref(false)
 const checkingId = ref<number | null>(null)
@@ -116,7 +117,11 @@ async function generateNewPlan() {
     return
   }
   generating.value = true
+  generationStatus.value = '正在读取偏好并生成本周计划...'
   error.value = ''
+  const progressTimer = window.setTimeout(() => {
+    generationStatus.value = '正在生成菜单与购物清单，首次加载知识库可能需要更久。'
+  }, 12000)
   try {
     const prompt = generationPrompt.value.trim() || '生成本周健康备餐计划，每天包含早餐、午餐和晚餐，共 21 餐。'
     const preview = await api.generatePlan(prompt, budget)
@@ -130,7 +135,11 @@ async function generateNewPlan() {
     const message = apiErrorMessage(reason, '生成计划失败')
     error.value = message
     toast.show(message, 'error')
-  } finally { generating.value = false }
+  } finally {
+    window.clearTimeout(progressTimer)
+    generationStatus.value = ''
+    generating.value = false
+  }
 }
 
 async function selectVersion(id: number, updateLoading = true) {
@@ -245,6 +254,7 @@ watch(() => route.query.mode, () => { void handleRouteMode() })
         <label for="plan-special-request">本周特别要求（可选）</label>
         <textarea id="plan-special-request" v-model="generationPrompt" rows="3" maxlength="1000" :disabled="generating" placeholder="例如：周三晚餐想吃鱼，尽量安排 30 分钟内完成的快手菜" />
         <button class="button primary" type="submit" :disabled="generating || budgetLoading">{{ generating ? '生成中...' : '生成本周计划' }}</button>
+        <p v-if="generating" class="generation-status" role="status" aria-live="polite">{{ generationStatus }}</p>
       </form>
     </section>
     <template v-else>
@@ -255,7 +265,7 @@ watch(() => route.query.mode, () => { void handleRouteMode() })
     </template>
   </main>
   <div v-if="feedbackMeal" class="planner-modal-backdrop" @click.self="feedbackMeal = null"><section class="planner-modal" role="dialog" aria-modal="true"><h3>餐食反馈 · {{ feedbackMeal.name }}</h3><div class="feedback-options"><button v-for="option in [{ value: 'not_available', label: '没买到' }, { value: 'no_appetite', label: '不想吃' }, { value: 'ate_other', label: '吃了别的' }]" :key="option.value" :class="{ selected: feedbackType === option.value }" @click="feedbackType = option.value as MealDeviationType">{{ option.label }}</button></div><label>补充说明<textarea v-model="feedbackReason" rows="3" maxlength="500" /></label><footer><button class="button secondary" @click="feedbackMeal = null">取消</button><button class="button primary" :disabled="!feedbackType || feedbackReason.trim().length < 2 || checkingId !== null" @click="submitFeedback">提交反馈</button></footer></section></div>
-  <div v-if="generateOpen" class="planner-modal-backdrop" @click.self="generateOpen = false"><section class="planner-modal" role="dialog" aria-modal="true"><h3>重新生成本周计划</h3><p>将重新生成 7 天三餐、购物清单与预算预估，确认后成为本周的新版本。</p><form class="plan-budget-form" @submit.prevent="generateNewPlan"><label for="regenerate-budget">本周预算（元）</label><div class="budget-input-row"><span>¥</span><input id="regenerate-budget" v-model.number="planBudget" type="number" min="1" max="100000" step="1" :disabled="generating || budgetLoading" required></div><div class="budget-options" aria-label="常用预算"><button v-for="option in budgetOptions" :key="option" type="button" :class="{ selected: planBudget === option }" :disabled="generating" @click="planBudget = option">¥{{ option }}</button></div><label for="regenerate-special-request">本周特别要求（可选）</label><textarea id="regenerate-special-request" v-model="generationPrompt" rows="3" maxlength="1000" :disabled="generating" placeholder="例如：减少重复食材，周末安排一顿适合聚餐的菜" /><footer><button class="button secondary" type="button" @click="generateOpen = false">取消</button><button class="button primary" type="submit" :disabled="generating || budgetLoading">{{ generating ? '生成中...' : '生成新版本' }}</button></footer></form></section></div>
+  <div v-if="generateOpen" class="planner-modal-backdrop" @click.self="generateOpen = false"><section class="planner-modal" role="dialog" aria-modal="true"><h3>重新生成本周计划</h3><p>将重新生成 7 天三餐、购物清单与预算预估，确认后成为本周的新版本。</p><form class="plan-budget-form" @submit.prevent="generateNewPlan"><label for="regenerate-budget">本周预算（元）</label><div class="budget-input-row"><span>¥</span><input id="regenerate-budget" v-model.number="planBudget" type="number" min="1" max="100000" step="1" :disabled="generating || budgetLoading" required></div><div class="budget-options" aria-label="常用预算"><button v-for="option in budgetOptions" :key="option" type="button" :class="{ selected: planBudget === option }" :disabled="generating" @click="planBudget = option">¥{{ option }}</button></div><label for="regenerate-special-request">本周特别要求（可选）</label><textarea id="regenerate-special-request" v-model="generationPrompt" rows="3" maxlength="1000" :disabled="generating" placeholder="例如：减少重复食材，周末安排一顿适合聚餐的菜" /><p v-if="generating" class="generation-status" role="status" aria-live="polite">{{ generationStatus }}</p><footer><button class="button secondary" type="button" :disabled="generating" @click="generateOpen = false">取消</button><button class="button primary" type="submit" :disabled="generating || budgetLoading">{{ generating ? '生成中...' : '生成新版本' }}</button></footer></form></section></div>
   <div v-if="reviseOpen" class="planner-modal-backdrop" @click.self="reviseOpen = false"><section class="planner-modal revision-modal" role="dialog" aria-modal="true"><h3>调整计划</h3><p>描述需要修改的餐食、食材、预算或营养目标。</p><textarea v-model="reviseMessage" rows="4" maxlength="1000" placeholder="例如：将周三晚餐换成不含海鲜的高蛋白餐" /><div v-if="revisePreview" class="revision-preview" aria-live="polite"><div class="revision-preview-head"><strong>新版本预览</strong><span>确认前不会修改当前计划</span></div><div class="revision-impact"><strong>本次影响</strong><span v-for="item in revisePreview.routing.requires" :key="item">{{ capabilityLabel(item) }}</span></div><div class="revision-week"><article v-for="column in revisionColumns" :key="column.day" class="revision-day"><strong>{{ column.day }}</strong><div v-for="meal in column.meals" :key="`${meal.day}:${meal.meal_type}`" class="revision-meal" :class="{ changed: changedRevisionSlots.has(`${meal.day}:${meal.meal_type}`) }"><small>{{ meal.meal_type }}</small><span>{{ meal.name }}</span><em>¥{{ money(meal.cost) }} · {{ meal.duration }}min</em></div></article></div><div class="revision-metrics"><span>预算 ¥{{ money(revisePreview.after.budget.estimated) }} / ¥{{ money(revisePreview.after.budget.limit) }}</span><span>蛋白质 {{ Math.round(revisePreview.after.nutrition.protein_g) }}g</span><span>购物 {{ revisePreview.after.shopping.length }} 项</span></div><div v-if="revisePreview.diff.changed_meals.length || revisePreview.diff.changed_shopping.length" class="revision-diff"><p v-for="item in [...revisePreview.diff.changed_meals, ...revisePreview.diff.changed_shopping]" :key="item">{{ item }}</p></div><div v-if="revisePreview.diff.conflict_warnings.length" class="revision-warnings"><p v-for="warning in revisePreview.diff.conflict_warnings" :key="warning">{{ warning }}</p></div><p v-if="!hasEffectiveRevision" class="revision-empty">当前要求尚未生成可应用的计划变化，请补充更明确的调整要求。</p></div><footer><button class="button secondary" @click="backOrCloseRevision">{{ revisePreview ? '继续修改' : '取消' }}</button><button v-if="!revisePreview" class="button primary" :disabled="revising || !reviseMessage.trim()" @click="previewRevision">{{ revising ? '预览中...' : '预览调整' }}</button><button v-else class="button primary" :disabled="confirming || !hasEffectiveRevision" @click="confirmRevision">{{ confirming ? '确认中...' : '确认生成新版本' }}</button></footer></section></div>
 </template><style scoped lang="scss">
 .planner { display: grid; gap: 14px; }

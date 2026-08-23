@@ -39,6 +39,11 @@ describe('apiErrorMessage', () => {
     expect(apiErrorMessage(error, fallback)).toBe(fallback)
   })
 
+  it('将 Axios 超时转换为可恢复的计划生成提示', () => {
+    const error = new axios.AxiosError('timeout of 120000ms exceeded', 'ECONNABORTED')
+    expect(apiErrorMessage(error, fallback)).toContain('生成请求超时')
+  })
+
   it('普通 Error 返回其 message', () => {
     const error = new Error('网络连接断开')
     expect(apiErrorMessage(error, fallback)).toBe('网络连接断开')

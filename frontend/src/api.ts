@@ -40,6 +40,9 @@ client.interceptors.response.use(undefined, async (error: AxiosError) => {
 
 export function apiErrorMessage(reason: unknown, fallback: string): string {
   if (axios.isAxiosError(reason)) {
+    if (reason.code === 'ECONNABORTED' || /timeout/i.test(reason.message)) {
+      return '生成请求超时。服务仍可能在处理，请稍后刷新计划列表后重试。'
+    }
     const detail = (reason.response?.data as { detail?: unknown } | undefined)?.detail
     if (typeof detail === 'string') return detail
     if (detail && typeof detail === 'object' && 'message' in detail) {
@@ -193,7 +196,7 @@ export const api = {
   sendChatMessage: (id: string, content: string, budget: number) => client.post<ChatTurnResponse>(`/chat/sessions/${id}/messages`, { content, budget }, { timeout: 120000 }).then(({ data }) => data),
   streamChat,
   cancelChat: (id: string) => client.post<{ status: string }>(`/chat/sessions/${id}/cancel`).then(({ data }) => data),
-  generatePlan: (prompt: string, budget: number) => client.post<PlanningResponse>('/plans/generate-weekly', { prompt, budget }, { timeout: 90000 }).then(({ data }) => data),
+  generatePlan: (prompt: string, budget: number) => client.post<PlanningResponse>('/plans/generate-weekly', { prompt, budget }, { timeout: 120000 }).then(({ data }) => data),
   confirmPlan: (id: string) => client.post<WeeklyPlanDetail>(`/plans/${id}/confirm`).then(({ data }) => data),
   agentRun: (id: string) => client.get<AgentRun>(`/agents/runs/${id}`).then(({ data }) => data),
   listAgentRuns: () => client.get<AgentRun[]>('/agents/runs').then(({ data }) => data),

@@ -97,6 +97,7 @@
 
 .alternative-slot { display: flex; align-items: center; gap: 4px; color: var(--primary) !important; }
 .plan-save-error { margin: 0; padding: 7px 15px; background: var(--primary-soft); color: var(--red); font-size: 10px; }
+.generation-status { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
 .history-plans { grid-column: 1 / -1; }
 .history-list { display: grid; }
 .history-item { display: grid; grid-template-columns: 38px minmax(0, 1fr) auto auto; align-items: center; gap: 10px; padding: 12px 18px; border-bottom: 1px solid var(--line); }
