@@ -40,6 +40,9 @@ const retrievalBadge = computed(() => {
   if (sparse && sparse !== 'disabled') return { text: '稀疏检索异常', variant: 'warning' }
   return { text: '纯稠密检索', variant: 'warning' }
 })
+const knowledgeBadge = computed(() => result.value?.diagnostics.knowledge_status === 'no_match'
+  ? { text: '未找到本地知识', variant: 'warning' }
+  : { text: '已命中本地知识', variant: 'success' })
 
 // 目标取向英文词表（bulk/cut/maintain）→ 中文展示标签
 const GOAL_LABELS: Record<string, string> = { bulk: '增肌', cut: '减脂', maintain: '健康维护' }
@@ -171,11 +174,12 @@ async function loadSync() {
         <div v-if="result" class="retrieval-results">
           <div class="retrieval-meta">
             <span class="eyebrow">关系 {{ result.graph_hits.length }} 条 · 文档 {{ result.vector_hits.length }} 条 · {{ result.elapsed_ms }}ms</span>
+            <span class="status-badge" :class="knowledgeBadge.variant">{{ knowledgeBadge.text }}</span>
             <span class="status-badge" :class="retrievalBadge.variant">{{ retrievalBadge.text }}</span>
           </div>
           <article v-for="(hit, index) in result.graph_hits" :key="`graph-${index}`"><strong><Network :size="15" />{{ hit.subject }} · {{ hit.relation }}</strong><p>{{ hit.target }} <span v-if="hit.detail">· {{ hit.detail }}</span></p></article>
           <article v-for="hit in result.vector_hits" :key="`${hit.document_id}-${hit.chunk_index}`"><strong><BookOpen :size="15" />{{ hit.document_name }}</strong><p>{{ hit.content }}</p><div v-if="metaTags(hit).length" class="hit-tags"><span v-for="tag in metaTags(hit)" :key="tag" class="hit-tag">{{ tag }}</span><span v-if="hit.allergens" class="hit-tag warn">忌口：{{ hit.allergens }}</span></div><small>{{ hybridRetrieval ? '混合分' : '相似度' }} {{ hit.score.toFixed(3) }} · 片段 {{ hit.chunk_index }}</small></article>
-          <p v-if="!result.graph_hits.length && !result.vector_hits.length" class="empty-result">没有召回结果，请先初始化或上传知识文档。</p>
+          <p v-if="!result.graph_hits.length && !result.vector_hits.length" class="empty-result">未找到本地知识，请换个问法或补充知识文档；涉及营养、过敏的问题请先确认来源。</p>
         </div>
       </aside>
 

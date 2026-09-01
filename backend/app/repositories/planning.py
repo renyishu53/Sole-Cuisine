@@ -181,6 +181,8 @@ class PlanningRepository:
                 **{
                     **{key: value for key, value in item.items() if key != "id"},
                     "category": normalize_shopping_category(item.get("category"), item.get("name", "")),
+                    # LLM output is a proposal, never a purchase confirmation.
+                    "purchased": False,
                 }
             )
             for item in shopping
@@ -208,6 +210,7 @@ class PlanningRepository:
                 "category": normalize_shopping_category(
                     shop_data.get("category"), shop_data.get("name", "")
                 ),
+                "purchased": False,
             }
             self._session.add(
                 PlanShoppingItem(plan_id=plan.id, **values)

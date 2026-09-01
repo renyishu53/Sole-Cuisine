@@ -40,6 +40,9 @@ client.interceptors.response.use(undefined, async (error: AxiosError) => {
 
 export function apiErrorMessage(reason: unknown, fallback: string): string {
   if (axios.isAxiosError(reason)) {
+    if (reason.response?.status === 503) {
+      return '数据库服务不可用，请先启动 PostgreSQL/Docker 后重试'
+    }
     if (reason.code === 'ECONNABORTED' || /timeout/i.test(reason.message)) {
       return '生成请求超时。服务仍可能在处理，请稍后刷新计划列表后重试。'
     }

@@ -8,7 +8,7 @@ from typing import Any, Protocol
 
 from langchain_core.messages import ToolMessage
 from langchain_openai import ChatOpenAI
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from app.core.config import Settings, get_settings
 from app.schemas import LLMSmokeResponse, PlanningRequest
@@ -38,6 +38,7 @@ class PlanDraft(BaseModel):
     tasks: list[TaskItem]
     budget: BudgetSummary
     conflicts: list[str]
+    suggestions: list[str] = Field(default_factory=list)
 
 
 class PlanGenerator(Protocol):
@@ -128,7 +129,9 @@ class OpenAICompatiblePlanGenerator:
             "解释文字或 Schema 之外的字段。meals 必须恰好包含 21 项（周一至周日每天早餐、午餐、晚餐各 1 项，共 7×3=21），"
             "每项必须明确填写 meal_type，且只能为 早餐、午餐、晚餐；"
             "所有 id 和 duration 必须是整数，金额必须是数字，任务 status 只能是"
-            " todo、doing 或 done。\nJSON Schema：\n"
+            " todo、doing 或 done。采购清单的 price 之和必须小于或等于预算上限；"
+            "budget.estimated 必须等于该采购清单 price 之和，不能用餐食 cost 代替，"
+            "也不能通过虚报低价或省略菜单所需食材规避预算。\nJSON Schema：\n"
             f"{json.dumps(PlanDraft.model_json_schema(), ensure_ascii=False)}"
         )
         try:
@@ -265,6 +268,11 @@ class ChatAssistant:
             system_parts.append(f"\n用户上下文：\n{context}")
         if rag_snippets:
             system_parts.append("\n知识库参考：\n" + "\n---\n".join(rag_snippets))
+        else:
+            system_parts.append(
+                "\n本轮没有检索到本地知识库参考。不要把模型自身推测表述为本项目知识库结论；"
+                "涉及营养、过敏、疾病或安全问题时，应明确说明需要进一步核实。"
+            )
 
         messages: list[tuple[str, str]] = [("system", "\n".join(system_parts))]
         if history:

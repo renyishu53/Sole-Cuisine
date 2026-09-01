@@ -6,11 +6,12 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.ai.agent_tools import build_readonly_tools, reset_workflow_tools, set_workflow_tools
 from app.ai.llm import TokenSink, token_sink
 from app.ai.workflow import SoloChefWorkflow
-from app.models import NutritionGoal, UserProfile
+from app.models import NutritionGoal, RecipeRecord, UserProfile, WeeklyPlan
 from app.repositories.feedback import FeedbackRepository
 from app.repositories.planning import PlanningRepository
 from app.schemas import (
@@ -130,6 +131,63 @@ class PlanningService:
             return None, []
         return profile.prep_time_max, list(profile.kitchenware)
 
+    @staticmethod
+    async def _load_plan_personalization(
+        session: AsyncSession | None, user_id: int
+    ) -> tuple[list[str], list[dict[str, object]]]:
+        """Load user-owned history and recipes for the next weekly plan."""
+        if session is None:
+            return [], []
+        try:
+            plans = list(
+                (
+                    await session.scalars(
+                        select(WeeklyPlan)
+                        .where(
+                            WeeklyPlan.user_id == user_id,
+                            WeeklyPlan.status == "confirmed",
+                        )
+                        .order_by(WeeklyPlan.created_at.desc(), WeeklyPlan.version.desc())
+                        .limit(2)
+                        .options(selectinload(WeeklyPlan.meals))
+                    )
+                ).all()
+            )
+            recipes = list(
+                (
+                    await session.scalars(
+                        select(RecipeRecord)
+                        .where(RecipeRecord.user_id == user_id)
+                        .order_by(
+                            RecipeRecord.is_favorite.desc(),
+                            RecipeRecord.like_count.desc(),
+                            RecipeRecord.updated_at.desc(),
+                        )
+                        .limit(12)
+                    )
+                ).all()
+            )
+        except Exception:  # noqa: BLE001 - personalization must not block planning
+            return [], []
+
+        recent_meal_names = list(
+            dict.fromkeys(
+                meal.name.strip() for plan in plans for meal in plan.meals if meal.name.strip()
+            )
+        )[:42]
+        candidate_recipes = [
+            {
+                "name": recipe.name,
+                "tags": list(recipe.tags),
+                "duration": recipe.duration,
+                "estimated_cost": recipe.estimated_cost,
+                "is_favorite": recipe.is_favorite,
+                "like_count": recipe.like_count,
+            }
+            for recipe in recipes
+        ]
+        return recent_meal_names, candidate_recipes
+
     async def generate(
         self,
         request: PlanningRequest,
@@ -144,6 +202,9 @@ class PlanningService:
             session, request.user_id
         )
         prep_time_max, kitchenware = await self._load_lifestyle_constraints(
+            session, request.user_id
+        )
+        recent_meal_names, candidate_recipes = await self._load_plan_personalization(
             session, request.user_id
         )
         goal_type = await self._load_goal_type(session, request.user_id)
@@ -191,6 +252,8 @@ class PlanningService:
                 prep_time_max=prep_time_max,
                 kitchenware=kitchenware,
                 goal_type=goal_type,
+                recent_meal_names=recent_meal_names,
+                candidate_recipes=candidate_recipes,
             )
         except asyncio.CancelledError:
             if repo is not None:

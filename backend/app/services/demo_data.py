@@ -81,7 +81,7 @@ SHOPPING = [
         quantity="6 个",
         price=8,
         source="周一 / 周三",
-        purchased=True,
+        purchased=False,
     ),
     ShoppingItem(id=2, name="番茄", category="蔬菜", quantity="3 个", price=6, source="周一"),
     ShoppingItem(id=3, name="虾仁", category="肉蛋奶", quantity="150g", price=22, source="周三"),
@@ -93,7 +93,7 @@ SHOPPING = [
         quantity="1 颗",
         price=8,
         source="周六",
-        purchased=True,
+        purchased=False,
     ),
     ShoppingItem(
         id=6, name="香菇", category="蔬菜", quantity="250g", price=10, source="周二 / 周五"

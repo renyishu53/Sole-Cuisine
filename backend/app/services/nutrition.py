@@ -271,6 +271,8 @@ def _ingredient_aliases(keyword: str) -> set[str]:
     aliases = {keyword}
     aliases.update(re.findall(r"\[([^\]]+)\]", keyword))
     aliases.update(re.findall(r"[（(]([^）)]+)[）)]", keyword))
+    if keyword == "鸡胸脯肉":
+        aliases.add("鸡胸肉")
     return {alias.strip() for alias in aliases if len(alias.strip()) >= 2}
 
 

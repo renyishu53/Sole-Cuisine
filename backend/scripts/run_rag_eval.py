@@ -166,10 +166,10 @@ def main() -> None:
     if args.offline:
         threshold = 0.6
         if result["mean_recall_at_k"] < threshold:
-            print(f"\n❌ 离线模式 Recall {result['mean_recall_at_k']} 低于门槛 {threshold}", file=sys.stderr)
+            print(f"\nOFFLINE EVAL FAILED: Recall {result['mean_recall_at_k']} < {threshold}", file=sys.stderr)
             sys.exit(1)
         else:
-            print(f"\n✅ 离线模式 Recall {result['mean_recall_at_k']} 达到门槛 {threshold}")
+            print(f"\nOFFLINE EVAL PASSED: Recall {result['mean_recall_at_k']} >= {threshold}")
 
 
 if __name__ == "__main__":

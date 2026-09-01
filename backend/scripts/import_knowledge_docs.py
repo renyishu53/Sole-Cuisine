@@ -62,7 +62,10 @@ def main() -> None:
         default=Path("backend/app/data/knowledge_docs"),
         help="知识文档根目录（递归扫描 .md）",
     )
-    parser.add_argument("--user-id", type=int, default=1, help="目标用户 ID")
+    parser.add_argument(
+        "--user-id", type=int, default=0,
+        help="目标用户 ID；内置公共知识必须使用 0，私有导入请显式传入用户 ID",
+    )
     args = parser.parse_args()
     asyncio.run(run(args.src, args.user_id))
 

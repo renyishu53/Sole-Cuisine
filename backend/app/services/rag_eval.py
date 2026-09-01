@@ -153,6 +153,42 @@ EVAL_SET: list[RagEvalCase] = [
         query="增肌晚餐高蛋白推荐",
         expected_documents=["牛肉炖蛋.md"],
     ),
+    RagEvalCase(
+        query="一人一周如何控制买菜预算并减少浪费",
+        expected_documents=["一人食材预算控制.md", "一周食材复用方案.md"],
+    ),
+    RagEvalCase(
+        query="不吃肉的增肌者有哪些高蛋白素食替代",
+        expected_documents=["高蛋白素食替代.md"],
+    ),
+    RagEvalCase(
+        query="豆腐毛豆可以替代肉类吗？大豆过敏怎么办",
+        expected_documents=["高蛋白素食替代.md", "乳糖不耐替代指南.md"],
+    ),
+    RagEvalCase(
+        query="熟食怎么分装冷藏，鸡肉和米饭能放多久",
+        expected_documents=["熟食冷藏安全.md"],
+    ),
+    RagEvalCase(
+        query="采购清单没有核销时采购进度应该怎么算",
+        expected_documents=["熟食冷藏安全.md"],
+    ),
+    RagEvalCase(
+        query="预算紧张时优先买哪些高蛋白食材",
+        expected_documents=["一人食材预算控制.md", "高蛋白素食替代.md"],
+    ),
+    RagEvalCase(
+        query="工作日提前备餐如何安排食材使用顺序",
+        expected_documents=["熟食冷藏安全.md", "一周食材复用方案.md"],
+    ),
+    RagEvalCase(
+        query="减脂期又不想浪费食材，怎样规划采购",
+        expected_documents=["一人食材预算控制.md", "低脂凉拌鸡丝.md"],
+    ),
+    RagEvalCase(
+        query="毛豆豆腐和糙米怎么搭配成高蛋白一餐",
+        expected_documents=["高蛋白素食替代.md"],
+    ),
 ]
 
 

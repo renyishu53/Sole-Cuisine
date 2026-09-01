@@ -86,7 +86,14 @@ def create_rerank_backend(settings: Settings) -> RerankBackend | None:
     try:
         model = _load_reranker(model_cls, model_ref, settings)
     except Exception as exc:
-        logger.warning("rerank 模型加载失败 ({}): {}", model_ref, type(exc).__name__)
+        if isinstance(exc, OSError) and getattr(exc, "winerror", None) == 1455:
+            logger.warning(
+                "rerank 模型未加载：Windows 分页文件不足（{}）。"
+                "当前自动退回首阶段检索；请增大系统虚拟内存后再启用 RERANK_ENABLED=true",
+                model_ref,
+            )
+        else:
+            logger.warning("rerank 模型加载失败 ({}): {}", model_ref, type(exc).__name__)
         return None
     return RerankBackend(
         model=model,

@@ -44,7 +44,8 @@ async def _bootstrap_knowledge() -> None:
     if not settings.rag_enabled or not settings.auto_bootstrap_knowledge:
         return
     try:
-        await get_knowledge_service().bootstrap(1)
+        # Built-in documents belong to the shared public knowledge scope.
+        await get_knowledge_service().bootstrap()
     except Exception:  # noqa: BLE001 - 检索底座未就绪不应阻断应用启动
         pass
 

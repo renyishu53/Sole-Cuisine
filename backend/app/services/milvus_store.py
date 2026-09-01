@@ -28,6 +28,11 @@ from app.services.documents import DEFAULT_METADATA, METADATA_FIELDS
 from app.services.embeddings import EmbeddingBackend, create_embedding_backend
 
 
+# Reserved scope for built-in/domain knowledge. User-uploaded documents keep
+# their real user_id and are never exposed through this scope.
+PUBLIC_KNOWLEDGE_USER_ID = 0
+
+
 class MilvusVectorStore:
     """Lazy Milvus adapter. Blocking client calls are moved off the event loop."""
 
@@ -287,7 +292,9 @@ class MilvusVectorStore:
         过滤采用「目标 ∪ 通用兜底桶」的包含语义——目标型文档命中对应目标，
         默认桶（maintain/通用）文档对任何目标都可见，避免过滤后召回为空。
         """
-        parts = [f"user_id == {user_id}"]
+        # Public bootstrap documents are visible to every user; private uploads
+        # remain restricted to the requesting user's own scope.
+        parts = [f"user_id in [{user_id}, {PUBLIC_KNOWLEDGE_USER_ID}]"]
         for field, value in (("goal_type", goal_type), ("meal_time", meal_time)):
             if value:
                 allowed = {value, DEFAULT_METADATA[field]}
@@ -307,7 +314,7 @@ class MilvusVectorStore:
         results = await asyncio.to_thread(
             client.query,
             collection_name=collection,
-            filter=f"user_id == {user_id}",
+            filter=f"user_id in [{user_id}, {PUBLIC_KNOWLEDGE_USER_ID}]",
             output_fields=["document_id", "document_name", "category", "chunk_index", "updated_at"],
         )
 

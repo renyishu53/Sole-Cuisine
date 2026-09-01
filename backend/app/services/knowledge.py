@@ -21,6 +21,7 @@ from app.services.embeddings import EmbeddingBackend
 from app.services.entity_extractor import extract_knowledge
 from app.services.graph_store import Neo4jGraphStore
 from app.services.milvus_store import MilvusVectorStore
+from app.services.milvus_store import PUBLIC_KNOWLEDGE_USER_ID
 from app.services.query_rewriter import QuerySpec, rewrite_query
 from app.services.reranker import RerankBackend, create_rerank_backend
 
@@ -142,7 +143,7 @@ class KnowledgeService:
 
     async def bootstrap(
         self,
-        user_id: int = 1,
+        user_id: int = PUBLIC_KNOWLEDGE_USER_ID,
         domain: dict[str, list[dict[str, object]]] | None = None,
     ) -> list[KnowledgeDocument]:
         documents = []
@@ -212,7 +213,9 @@ class KnowledgeService:
             return [], "disabled", "disabled"
         try:
             reranker = await self.ensure_reranker()
-            candidate_k = top_k * self.settings.rerank_candidate_multiplier if reranker else top_k
+            # Keep a wider first-stage pool even without reranking. The final
+            # deterministic diversification then selects top_k across documents.
+            candidate_k = top_k * max(1, self.settings.rerank_candidate_multiplier)
             hits = await self.vector_store.search(
                 query, user_id, candidate_k, goal_type=goal_type, meal_time=meal_time
             )
@@ -223,11 +226,39 @@ class KnowledgeService:
                     key=lambda pair: pair[1],
                     reverse=True,
                 )
-                hits = [hit for hit, _ in ranked[:top_k]]
-                return hits, "connected", "reranked"
-            return hits[:top_k], "connected", "disabled"
+                hits = [hit for hit, _ in ranked]
+                return self._diversify_hits(hits, top_k), "connected", "reranked"
+            return self._diversify_hits(hits, top_k), "connected", "disabled"
         except Exception as exc:
             return [], f"unavailable: {type(exc).__name__}", "disabled"
+
+    @staticmethod
+    def _diversify_hits(
+        hits: list[VectorSearchHit], top_k: int
+    ) -> list[VectorSearchHit]:
+        """Remove duplicate chunks and cap repeated documents in the final set.
+
+        A single long guide can otherwise occupy every top-k slot, reducing
+        coverage across recipes and nutrition guidance.
+        """
+        if top_k <= 0:
+            return []
+        selected: list[VectorSearchHit] = []
+        seen_chunks: set[tuple[str, int]] = set()
+        per_document: dict[str, int] = {}
+        for hit in hits:
+            chunk_key = (hit.document_id, hit.chunk_index)
+            if chunk_key in seen_chunks:
+                continue
+            seen_chunks.add(chunk_key)
+            count = per_document.get(hit.document_id, 0)
+            if count >= 2:
+                continue
+            per_document[hit.document_id] = count + 1
+            selected.append(hit)
+            if len(selected) >= top_k:
+                break
+        return selected
 
     async def retrieve_graph(
         self,
@@ -293,6 +324,9 @@ class KnowledgeService:
                 embedding=embedding.model_name,
                 rerank=bundle.rerank_status,
                 sparse=self._sparse_status(embedding, bundle.vector_status),
+                knowledge_status=(
+                    "matched" if bundle.vector_hits or bundle.graph_hits else "no_match"
+                ),
             ),
         )
 

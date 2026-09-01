@@ -64,6 +64,10 @@ class WorkflowState(TypedDict, total=False):
     nutrition_targets: dict[str, float]
     #: 用户营养目标取向（bulk/cut/maintain），注入向量检索做目标型文档过滤
     goal_type: str | None
+    #: 最近已确认计划的餐食，作为软排重约束。
+    recent_meal_names: list[str]
+    #: 用户保存的候选菜谱，收藏和点赞高的菜谱排在前面。
+    candidate_recipes: list[dict[str, object]]
     graph_hits: list[GraphSearchHit]
     vector_hits: list[VectorSearchHit]
     graph_status: str
@@ -195,6 +199,8 @@ class SoloChefWorkflow:
         prep_time_max: int | None = None,
         kitchenware: Sequence[str] = (),
         goal_type: str | None = None,
+        recent_meal_names: Sequence[str] = (),
+        candidate_recipes: Sequence[dict[str, object]] = (),
     ) -> PlanningResponse:
         graph = self._graph
         state: WorkflowState = {}
@@ -223,6 +229,8 @@ class SoloChefWorkflow:
                 "prep_time_max": prep_time_max,
                 "kitchenware": list(kitchenware),
                 "goal_type": goal_type,
+                "recent_meal_names": list(recent_meal_names),
+                "candidate_recipes": [dict(recipe) for recipe in candidate_recipes],
                 "trace": [],
                 "supervisor_round": 0,
                 "supervisor_total_dispatches": 0,
@@ -363,9 +371,12 @@ class SoloChefWorkflow:
         web_context = state.get("web_context", "")
         if web_context:
             specialist_context += web_context
+        personalization_context = self._build_personalization_context(state)
         try:
             draft = await asyncio.wait_for(
-                self._generator.generate(request, state["context"] + specialist_context),
+                self._generator.generate(
+                    request, state["context"] + specialist_context + personalization_context
+                ),
                 timeout=self._settings.plan_generation_timeout_seconds,
             )
             draft.meals = with_meal_types(draft.meals)
@@ -374,7 +385,7 @@ class SoloChefWorkflow:
             if not self._settings.ai_fallback_enabled:
                 raise
             draft = await DemoPlanGenerator().generate(
-                request, state["context"] + specialist_context
+                request, state["context"] + specialist_context + personalization_context
             )
             validate_weekly_meals(draft.meals)
             mode = f"{mode}->demo-fallback"
@@ -392,6 +403,8 @@ class SoloChefWorkflow:
             "specialists": list(latest_specialist_outputs),
             "external_research_sources": len(state.get("web_results", [])),
             "round": int(state.get("supervisor_round", 0)),
+            "recent_meals": len(state.get("recent_meal_names", [])),
+            "candidate_recipes": len(state.get("candidate_recipes", [])),
         }
         if fallback_reason:
             output["fallback_reason"] = fallback_reason
@@ -486,6 +499,35 @@ class SoloChefWorkflow:
             "conflicts": feedback.get("conflicts", []),
             "instruction": "优先修复这些校验问题，不得放宽用户硬约束。",
         }
+
+    @staticmethod
+    def _build_personalization_context(state: WorkflowState) -> str:
+        """Make individual history and user-owned recipes explicit to the generator."""
+        recent_meals = state.get("recent_meal_names", [])
+        recipes = state.get("candidate_recipes", [])
+        if not recent_meals and not recipes:
+            return (
+                "\n\n个性化要求：本周 21 餐中同名菜不得重复，"
+                "并保持蛋白质、烹饪方式和主食的多样性。"
+            )
+
+        parts = [
+            "\n\n用户个性化与多样性要求（在不违反忌口、营养、时间和预算硬约束的前提下必须遵守）：",
+            "- 本周 21 餐中同名菜不得重复；蛋白质、烹饪方式和主食应有明显变化。",
+        ]
+        if recent_meals:
+            parts.append(
+                "- 以下是用户最近已确认计划中的菜，除用户本次明确要求或"
+                "确无可行替代外，本周不要再次安排："
+                + json.dumps(recent_meals, ensure_ascii=False)
+            )
+        if recipes:
+            parts.append(
+                "- 以下是该用户自己保存的候选菜谱，优先考虑收藏或点赞高的菜谱，"
+                "但仍须保证整周不重复："
+                + json.dumps(recipes, ensure_ascii=False)
+            )
+        return "\n".join(parts)
 
     async def _supervisor_node(self, state: WorkflowState) -> dict[str, object]:
         """Dispatch only the specialists needed for the current planning round."""
@@ -809,6 +851,9 @@ class SoloChefWorkflow:
             category_reserve=domain.budget.reserve,
             nutrition_targets=nutrition_targets,
         )
+        # 周预算的权威口径是采购清单总价；餐食 cost 仅用于菜谱比较，不能与
+        # 采购金额混用，否则会生成和确认阶段得出相互矛盾的预算结论。
+        conflicts = [conflict for conflict in conflicts if conflict.dimension != "budget"]
         auto_fixes: list[str] = []
         for _ in range(2):
             soft = [conflict for conflict in conflicts if conflict.level == "soft"]
@@ -834,18 +879,55 @@ class SoloChefWorkflow:
                 category_reserve=domain.budget.reserve,
                 nutrition_targets=nutrition_targets,
             )
+            conflicts = [conflict for conflict in conflicts if conflict.dimension != "budget"]
 
         if shopping_estimated > request.budget:
-            conflicts.append(
-                PlanConflict(
-                    dimension="budget",
-                    level="hard",
-                    message=(
-                        f"采购清单估价 {shopping_estimated:.0f} 元超过预算 {request.budget:.0f} 元"
-                    ),
-                    item="采购预算",
-                )
+            can_use_budget_fallback = (
+                not self._settings.workflow_supervisor_enabled
+                or int(state.get("supervisor_round", 0))
+                >= self._settings.supervisor_max_rounds
             )
+            fallback = (
+                await self._budget_fallback_draft(
+                    request, state["context"], forbidden_terms
+                )
+                if can_use_budget_fallback
+                else None
+            )
+            if can_use_budget_fallback and fallback is not None:
+                draft = fallback
+                shopping_categories, shopping_estimated = self._shopping_budget(draft)
+                draft.budget.estimated = shopping_estimated
+                draft.budget.limit = request.budget
+                draft.budget.saved = request.budget - shopping_estimated
+                draft.budget.usage_percent = round(shopping_estimated / request.budget * 100)
+                draft.budget.categories = shopping_categories
+                conflicts = detect_conflicts(
+                    draft.meals,
+                    budget_limit=request.budget,
+                    constraints=constraints,
+                    category_limits=domain.budget.category_limits,
+                    category_limit_total=domain.budget.limit,
+                    category_reserve=domain.budget.reserve,
+                    nutrition_targets=nutrition_targets,
+                )
+                conflicts = [
+                    conflict for conflict in conflicts if conflict.dimension != "budget"
+                ]
+                auto_fixes.append(
+                    "采购估价超预算，已切换为满足当前预算的确定性备餐方案"
+                )
+            else:
+                conflicts.append(
+                    PlanConflict(
+                        dimension="budget",
+                        level="hard",
+                        message=(
+                            f"采购清单估价 {shopping_estimated:.0f} 元超过预算 {request.budget:.0f} 元"
+                        ),
+                        item="采购预算",
+                    )
+                )
 
         # 预算超限优先交给 Supervisor 重派专家修正；只有达到轮次上限后
         # 才进入人工接管，避免“能检测超预算、却永远不会自动重试”。
@@ -924,6 +1006,29 @@ class SoloChefWorkflow:
                 )
             ],
         }
+
+    @staticmethod
+    def _shopping_budget(draft: PlanDraft) -> tuple[dict[str, float], float]:
+        categories: dict[str, float] = {}
+        for item in draft.shopping:
+            categories[item.category] = round(
+                categories.get(item.category, 0.0) + float(item.price), 2
+            )
+        return categories, round(sum(categories.values()), 2)
+
+    async def _budget_fallback_draft(
+        self, request: PlanningRequest, context: str, forbidden_terms: set[str]
+    ) -> PlanDraft | None:
+        """Return the deterministic plan only when budget and hard constraints fit."""
+        fallback = await DemoPlanGenerator().generate(request, context)
+        _, estimated = self._shopping_budget(fallback)
+        if estimated > request.budget:
+            return None
+        for meal in fallback.meals:
+            searchable = " ".join((meal.name, *meal.ingredients)).lower()
+            if any(term.lower() in searchable for term in forbidden_terms):
+                return None
+        return fallback
 
     @staticmethod
     def _sources_from_state(state: WorkflowState) -> list[str]:

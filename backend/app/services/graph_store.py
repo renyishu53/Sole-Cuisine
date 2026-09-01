@@ -31,7 +31,7 @@ class Neo4jGraphStore:
         profile: dict[str, object] | None,
         domain: dict[str, list[dict[str, object]]] | None = None,
     ) -> None:
-        """同步用户画像与领域数据到 Neo4j（SoloChef 去家庭化：无日程/成员节点）。"""
+        """同步用户画像与领域数据到 Neo4j"""
         driver = self._get_driver()
         async with driver.session() as session:
             await session.run(
@@ -349,17 +349,29 @@ class Neo4jGraphStore:
         """返回用户在 Neo4j 中已有的 Document 节点名称。"""
         async with self._get_driver().session() as session:
             result = await session.run(
-                "MATCH (d:Document {user_id: $user_id}) RETURN d.name AS name",
+                "MATCH (d:Document) WHERE d.user_id IN [$user_id, 0] RETURN d.name AS name",
                 user_id=user_id,
             )
             records = await result.data()
         return [str(record["name"]) for record in records]
 
+    async def delete_document(self, user_id: int, document_name: str) -> None:
+        """删除指定作用域的文档及其孤立知识实体，供数据迁移使用。"""
+        async with self._get_driver().session() as session:
+            await session.run(
+                """
+                MATCH (d:Document {user_id: $user_id, name: $document_name})
+                DETACH DELETE d
+                """,
+                user_id=user_id,
+                document_name=document_name,
+            )
+
     async def count_entities(self, user_id: int) -> int:
         """返回用户 KnowledgeEntity 节点数量。"""
         async with self._get_driver().session() as session:
             result = await session.run(
-                "MATCH (e:KnowledgeEntity {user_id: $user_id}) RETURN count(e) AS n",
+                "MATCH (e:KnowledgeEntity) WHERE e.user_id IN [$user_id, 0] RETURN count(e) AS n",
                 user_id=user_id,
             )
             record = await result.single()
@@ -371,16 +383,28 @@ class Neo4jGraphStore:
         driver = self._get_driver()
         spec = query_spec or QuerySpec(keywords=[], entity_kinds=[], relations=[])
         cypher = """
-        MATCH (source {user_id: $user_id})-[r]->(target)
-        WHERE source:User OR source:Recipe OR source:Document
-          AND (
+        MATCH (source)-[r]->(target)
+        WITH source, r, target, properties(source) AS source_props,
+             properties(target) AS target_props
+        WHERE (source:User AND source_props['id'] = $user_id)
+           OR (NOT (source:User) AND source_props['user_id'] IN [$user_id, $public_user_id])
+        WITH source, r, target, source_props, target_props
+        WHERE (
             $search_text = ''
-            OR toLower(coalesce(source.name, source.title, '')) CONTAINS toLower($search_text)
-            OR toLower(coalesce(target.name, target.title, '')) CONTAINS toLower($search_text)
+            OR toLower(coalesce(
+                source_props['name'], source_props['title'], ''
+            )) CONTAINS toLower($search_text)
+            OR toLower(coalesce(
+                target_props['name'], target_props['title'], ''
+            )) CONTAINS toLower($search_text)
             OR size($keywords) > 0 AND ANY(
                 k IN $keywords WHERE
-                toLower(coalesce(source.name, source.title, '')) CONTAINS toLower(k)
-                OR toLower(coalesce(target.name, target.title, '')) CONTAINS toLower(k)
+                toLower(coalesce(
+                    source_props['name'], source_props['title'], ''
+                )) CONTAINS toLower(k)
+                OR toLower(coalesce(
+                    target_props['name'], target_props['title'], ''
+                )) CONTAINS toLower(k)
             )
           )
           AND (
@@ -393,10 +417,11 @@ class Neo4jGraphStore:
             OR type(r) IN $relations
             OR type(r) IN ['HAS_CONSTRAINT', 'AVOIDS']
           )
-        RETURN coalesce(source.name, source.title, '用户') AS subject,
+        RETURN coalesce(source_props['name'], source_props['title'], '用户') AS subject,
                type(r) AS relation,
-               coalesce(target.name, target.title, '') AS target,
-               coalesce(target.day, '') + ' ' + coalesce(target.time, '') AS detail
+               coalesce(target_props['name'], target_props['title'], '') AS target,
+               coalesce(target_props['day'], '') + ' '
+               + coalesce(target_props['time'], '') AS detail
         ORDER BY relation, subject
         LIMIT 40
         """
@@ -419,6 +444,7 @@ class Neo4jGraphStore:
             result = await session.run(
                 cypher,
                 user_id=user_id,
+                public_user_id=0,
                 search_text=query.strip(),
                 keywords=spec.keywords,
                 entity_kinds=spec.entity_kinds,

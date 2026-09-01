@@ -262,6 +262,8 @@ def test_plan_confirmation_writes_to_database(
     assert plan.status_code == 200
     assert plan.json()["status"] == "confirmed"
     assert len(plan.json()["meals"]) > 0
+    assert plan.json()["shopping"]
+    assert all(item["purchased"] is False for item in plan.json()["shopping"])
 
     meals = client.get("/api/v1/meals", headers=auth_headers)
     assert meals.status_code == 200

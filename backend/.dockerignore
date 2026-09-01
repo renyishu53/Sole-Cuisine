@@ -35,3 +35,7 @@ uv.lock
 
 # 文档
 *.md
+# RAG 内置知识文档必须随应用进入镜像
+!app/data/
+!app/data/knowledge_docs/
+!app/data/knowledge_docs/**/*.md

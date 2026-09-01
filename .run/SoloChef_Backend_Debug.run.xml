@@ -1,5 +1,5 @@
 <component name="ProjectRunConfigurationManager">
-  <configuration default="false" name="CasaMind Backend Debug" type="PythonConfigurationType" factoryName="Python">
+  <configuration default="false" name="SoloChef Backend Debug" type="PythonConfigurationType" factoryName="Python">
     <option name="ENV_FILES" value="$PROJECT_DIR$/.env" />
     <option name="INTERPRETER_OPTIONS" value="" />
     <option name="PARENT_ENVS" value="true" />
@@ -17,4 +17,3 @@
     <method v="2" />
   </configuration>
 </component>
-

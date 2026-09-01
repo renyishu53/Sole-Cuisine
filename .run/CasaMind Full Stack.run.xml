@@ -1,7 +1,0 @@
-<component name="ProjectRunConfigurationManager">
-  <configuration default="false" name="CasaMind Full Stack" type="CompoundRunConfigurationType">
-    <toRun name="CasaMind Frontend" type="js.build_tools.npm" />
-    <toRun name="CasaMind Backend Debug" type="PythonConfigurationType" />
-    <method v="2" />
-  </configuration>
-</component>

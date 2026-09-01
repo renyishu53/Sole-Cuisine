@@ -13,7 +13,7 @@ export interface ShoppingItem { id: number; name: string; category: string; quan
 export interface KnowledgeDocument { id: string | number; name: string; category: string; status: string; chunks: number; updated_at: string }
 export interface VectorSearchHit { document_id: string; document_name: string; category: string; content: string; chunk_index: number; score: number; goal_type?: string; meal_time?: string; allergens?: string; nutrition_focus?: string }
 export interface GraphSearchHit { subject: string; relation: string; target: string; detail: string }
-export interface RetrievalDiagnostics { vector_store: string; neo4j: string; embedding: string; rerank?: string; sparse?: string }
+export interface RetrievalDiagnostics { vector_store: string; neo4j: string; embedding: string; rerank?: string; sparse?: string; knowledge_status?: 'matched' | 'no_match' | string }
 export interface KnowledgeSearchResponse { query: string; vector_hits: VectorSearchHit[]; graph_hits: GraphSearchHit[]; elapsed_ms: number; diagnostics: RetrievalDiagnostics }
 export interface AIServiceStatus { rag_enabled: boolean; llm_mode: string; langgraph: string; vector_store: string; neo4j: string; collection: string; documents: number; chunks: number; llm_provider: string; llm_model: string; llm_configured: boolean; redis: string; celery: string; embedding: string; reranker?: string; sparse?: string }
 export interface SyncConsistencyResponse { vector_status: string; neo4j_status: string; vector_documents: number; vector_chunks: number; neo4j_documents: number; neo4j_entities: number; missing_in_neo4j: string[]; orphan_in_neo4j: string[]; consistent: boolean; notes: string[] }

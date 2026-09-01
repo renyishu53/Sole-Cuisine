@@ -35,9 +35,9 @@ RUN pip install --no-cache-dir torch --index-url ${TORCH_INDEX_URL}
 
 # 用空壳 app 包占位让 pip 可构建项目元数据并安装全部依赖，
 # 真实代码在下一层 COPY —— 改业务代码不再触发 torch 等大包重装。
-COPY pyproject.toml ./
+COPY pyproject.toml requirements.docker.txt ./
 RUN mkdir -p app && touch app/__init__.py \
-    && pip install --no-cache-dir -i ${PIP_INDEX_URL} ".[ai,rerank]" \
+    && pip install --no-cache-dir -i ${PIP_INDEX_URL} -r requirements.docker.txt \
     && rm -rf app
 
 # ── 应用代码（变更只重建此层）────────────────────────────────────────

@@ -6,7 +6,7 @@ from typing import Annotated, Any
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Body, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import Response, StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -56,6 +56,7 @@ from app.schemas import (
     RevisePreviewResponse,
     ReviseRequest,
     ShoppingItem,
+    ShoppingItemCreate,
     ShoppingPurchaseUpdate,
     WeeklyPlanDetail,
     WeeklyPlanSummary,
@@ -836,6 +837,37 @@ async def shopping(context: CurrentContext, session: SessionDep) -> list[Shoppin
     return [_shopping_response(item) for item in plan.shopping_items] if plan is not None else []
 
 
+@router.post("/shopping", response_model=ShoppingItem, status_code=status.HTTP_201_CREATED)
+async def add_shopping_item(
+    context: CurrentContext,
+    session: SessionDep,
+    payload: dict[str, Any] = Body(default={}),
+) -> ShoppingItem:
+    """Append a user-created item to the active plan without marking it purchased."""
+    if not payload:
+        raise HTTPException(status_code=status.HTTP_405_METHOD_NOT_ALLOWED, detail="采购项参数缺失")
+    request = ShoppingItemCreate.model_validate(payload)
+    repository = PlanningRepository(session)
+    plan = await repository.get_active_plan(context.user_id)
+    if plan is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="请先生成本周计划")
+    from app.models.identity import PlanShoppingItem
+
+    item = PlanShoppingItem(
+        plan_id=plan.id,
+        name=request.name,
+        category=normalize_shopping_category(request.category, request.name),
+        quantity=request.quantity,
+        price=request.price,
+        source=request.source,
+        purchased=False,
+    )
+    session.add(item)
+    await session.commit()
+    await session.refresh(item)
+    return _shopping_response(item)
+
+
 @router.patch("/shopping/{item_id}", response_model=ShoppingItem)
 async def record_shopping_purchase(
     item_id: int,
@@ -1206,8 +1238,9 @@ async def bootstrap_knowledge(
     context: OwnerContext, session: SessionDep
 ) -> list[KnowledgeDocument]:
     try:
-        domain = await _graph_domain_context(context.user_id, session)
-        documents = await knowledge_service.bootstrap(context.user_id, domain)
+        # Built-in documents are shared domain knowledge. User-specific graph
+        # context is synchronized lazily during retrieval for the current user.
+        documents = await knowledge_service.bootstrap()
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

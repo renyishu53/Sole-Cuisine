@@ -231,6 +231,24 @@ def detect_conflicts(
             )
         )
 
+    # 5. 分类预算硬约束：分类上限与预留额不能共同超过总预算。
+    # 这是计划配置本身的不可满足约束，即使当前菜单暂未用满该分类也应提示。
+    for category, limit in category_limits.items():
+        if float(limit) + float(category_reserve) > float(category_limit_total):
+            conflicts.append(
+                PlanConflict(
+                    dimension="category_limit",
+                    level="hard",
+                    message=(
+                        f"分类「{category}」上限 {float(limit):.0f} 元与预留 "
+                        f"{float(category_reserve):.0f} 元超过总预算 "
+                        f"{float(category_limit_total):.0f} 元"
+                    ),
+                    item=category,
+                    options=[],
+                )
+            )
+
     return conflicts
 
 

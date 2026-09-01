@@ -444,6 +444,16 @@ class ShoppingItem(BaseModel):
         return self
 
 
+class ShoppingItemCreate(BaseModel):
+    """手动向当前活动计划追加采购项。"""
+
+    name: str = Field(min_length=1, max_length=120)
+    category: str = Field(default="其他", max_length=40)
+    quantity: str = Field(default="1", max_length=40)
+    price: float = Field(default=0, ge=0, le=100000)
+    source: str = Field(default="用户添加", max_length=100)
+
+
 class ShoppingPurchaseUpdate(BaseModel):
     """Record procurement execution without mutating plan-derived item structure."""
 
@@ -923,6 +933,7 @@ class RetrievalDiagnostics(BaseModel):
     rerank: str = "disabled"
     # 稀疏检索状态：hybrid（稠密+稀疏双路 RRF）/ disabled（纯稠密召回）
     sparse: str = "disabled"
+    knowledge_status: str = "matched"
 
 
 class KnowledgeSearchResponse(BaseModel):

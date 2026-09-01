@@ -30,6 +30,7 @@ from app.services.conversation import SummaryStreamExtractor
 from app.services.documents import DocumentParseError, DocumentProcessor
 from app.services.embeddings import EmbeddingBackend, create_embedding_backend
 from app.services.graph_store import Neo4jGraphStore
+from app.services.knowledge import KnowledgeService
 from app.services.milvus_store import MilvusVectorStore
 
 
@@ -104,6 +105,39 @@ def test_demo_langgraph_workflow_has_parallel_specialists() -> None:
     assert response.conflicts == []
 
 
+def test_workflow_passes_user_history_and_recipes_to_planner() -> None:
+    class CapturingGenerator(DemoPlanGenerator):
+        received_context = ""
+
+        async def generate(self, request: PlanningRequest, context: str) -> PlanDraft:
+            type(self).received_context = context
+            return await super().generate(request, context)
+
+    generator = CapturingGenerator()
+    workflow = SoloChefWorkflow(knowledge=StubKnowledgeService(), generator=generator)
+
+    asyncio.run(
+        workflow.run(
+            PlanningRequest(prompt="生成本周菜单", budget=500),
+            recent_meal_names=["晚餐 番茄炒蛋"],
+            candidate_recipes=[
+                {
+                    "name": "柠檬鸡胸肉",
+                    "tags": ["快手"],
+                    "duration": 20,
+                    "estimated_cost": 18,
+                    "is_favorite": True,
+                    "like_count": 3,
+                }
+            ],
+        )
+    )
+
+    assert "晚餐 番茄炒蛋" in generator.received_context
+    assert "柠檬鸡胸肉" in generator.received_context
+    assert "本周 21 餐中同名菜不得重复" in generator.received_context
+
+
 def test_workflow_continues_when_retrieval_exceeds_time_budget() -> None:
     class SlowKnowledgeService:
         async def retrieve_graph(
@@ -150,16 +184,20 @@ def test_workflow_uses_shopping_total_as_authoritative_budget_estimate() -> None
 
     request = PlanningRequest(prompt="生成采购预算校验计划", budget=500)
     workflow = SoloChefWorkflow(
+        settings=Settings(
+            _env_file=None,
+            llm_provider="demo",
+            workflow_supervisor_enabled=False,
+        ),
         knowledge=StubKnowledgeService(),
         generator=OverBudgetGenerator(),
     )
 
     response = asyncio.run(workflow.run(request))
 
-    assert response.budget.estimated == 800
-    assert response.budget.usage_percent == 160
-    assert response.needs_manual_review is True
-    assert any("采购清单估价 800 元超过预算 500 元" in item for item in response.conflicts)
+    assert response.budget.estimated <= request.budget
+    assert response.needs_manual_review is False
+    assert any("采购估价超预算" in item for item in response.auto_fixes)
 
 
 def test_graph_search_uses_non_conflicting_search_parameter() -> None:
@@ -185,6 +223,11 @@ def test_graph_search_uses_non_conflicting_search_parameter() -> None:
 
         async def run(self, cypher: str, **kwargs: object) -> Result:
             assert "$search_text" in cypher
+            assert "source:Recipe" not in cypher
+            assert "source.title" not in cypher
+            assert "target.title" not in cypher
+            assert "source_props['id']" in cypher
+            assert "source_props['user_id']" in cypher
             calls.append(kwargs)
             return Result()
 
@@ -197,12 +240,39 @@ def test_graph_search_uses_non_conflicting_search_parameter() -> None:
     hits = asyncio.run(store.search(9, "不吃辣"))
     assert calls[0] == {
         "user_id": 9,
+        "public_user_id": 0,
         "search_text": "不吃辣",
         "keywords": [],
         "entity_kinds": [],
         "relations": [],
     }
     assert hits[0].target == "不吃辣"
+
+
+def test_public_knowledge_is_included_in_milvus_filter() -> None:
+    store = MilvusVectorStore(Settings(_env_file=None))
+    expression = store._build_filter(9, goal_type="cut")  # noqa: SLF001
+    assert "user_id in [9, 0]" in expression
+    assert "goal_type in" in expression
+
+
+def test_diversify_hits_caps_repeated_documents() -> None:
+    from app.schemas import VectorSearchHit
+    service = KnowledgeService(Settings(_env_file=None))
+    hits = [
+        VectorSearchHit(
+            document_id="doc-a", document_name="A", category="菜谱", content=str(index),
+            chunk_index=index, score=1 - index / 10,
+        )
+        for index in range(3)
+    ] + [
+        VectorSearchHit(
+            document_id="doc-b", document_name="B", category="菜谱", content="b",
+            chunk_index=0, score=0.5,
+        )
+    ]
+    selected = service._diversify_hits(hits, 3)  # noqa: SLF001
+    assert [hit.document_id for hit in selected] == ["doc-a", "doc-a", "doc-b"]
 
 
 @pytest.mark.asyncio
@@ -258,7 +328,9 @@ async def test_langgraph_resume_retries_only_pending_node() -> None:
 
     result = await workflow.run(None, run_id=run_id, resume=True)
 
-    assert len(result.trace) == 6
+    # 恢复后会保留 retrieval、supervisor、三个领域 agent、planner、validation
+    # 共 7 个已完成步骤；intent 节点仍不会重复执行。
+    assert len(result.trace) == 7
     assert result.trace[0].name == "retrieval"
     assert all(step.name != "intent" for step in result.trace)
     assert generator.calls == 2

@@ -1,4 +1,8 @@
-"""Redis connection management with optional in-process fallback for development."""
+"""Redis connection management with optional in-process fallback for development.
+Redis 连接管理，支持可选的进程内降级方案，用于开发环境。
+"""
+
+
 
 from __future__ import annotations
 

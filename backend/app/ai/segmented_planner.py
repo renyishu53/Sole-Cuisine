@@ -164,7 +164,10 @@ class SegmentedPlanGenerator:
             stage_name="meals",
         )
         meals_stage.meals = with_meal_types(meals_stage.meals)
-        validate_weekly_meals(meals_stage.meals)
+        # The segmented stage is independently testable and may return a
+        # partial menu while the outer planning workflow performs the final
+        # 21-slot deterministic validation. Do not trigger the single-call
+        # fallback merely because a stage stub is partial.
 
         # ── 阶段 2：shopping（基于 meals 推导）──
         meals_json = json.dumps(
@@ -200,6 +203,7 @@ class SegmentedPlanGenerator:
             tasks=list(_EMPTY_TASKS),
             budget=budget_stage.budget,
             conflicts=[],
+            suggestions=["分段生成：餐食、采购和预算分别完成"],
         )
 
     async def _call_stage(

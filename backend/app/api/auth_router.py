@@ -3,6 +3,7 @@ from pathlib import Path
 from secrets import token_urlsafe
 
 from fastapi import APIRouter, HTTPException, UploadFile, status
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.api.dependencies import CurrentContext, SessionDep
 from app.core.config import get_settings
@@ -228,7 +229,14 @@ async def sms_login(request: SMSLoginRequest, session: SessionDep) -> AuthSessio
 async def reset_password(request: ResetPasswordRequest, session: SessionDep) -> None:
     """Reset password via SMS verification code and revoke all sessions."""
     repository = IdentityRepository(session)
-    if await repository.get_user_by_phone(request.phone) is None:
+    try:
+        user_exists = await repository.get_user_by_phone(request.phone)
+    except SQLAlchemyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="数据库服务不可用，请先启动 PostgreSQL/Docker 后重试",
+        ) from exc
+    if user_exists is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="该手机号尚未注册")
     try:
         await SMSService(settings).verify_code(request.phone, request.code)
