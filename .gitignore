@@ -23,16 +23,26 @@ htmlcov/
 dist/
 build/
 
+# ── 包管理器缓存（任何层级，绝对不入库）──
+.pip-cache/
+.npm-cache/
+.uv-cache/
+.pnpm-store/
+
 # ── 数据库文件（SQLite 本地开发库）──
 *.db
 *.sqlite
 *.sqlite3
-backend/.uv-cache/
 
 # ── 日志 ──
 backend/.server*.log
 frontend/.server*.log
 *.log
+
+# ── 运行/调试临时产物 ──
+backend/_*.txt
+backend/debug-test.*
+backend/.pytest-tmp
 
 # ── 前端 ──
 frontend/node_modules/
